@@ -2,10 +2,11 @@
 
 ## 目标
 
-本仓库包含两类东西：
+本仓库包含三类东西：
 
 1. Git 仓库中的 Skill：用于版本管理、分享、审查和回滚；
 2. 当前用户全局目录中的 Skill：由 Codex 在不同对话中自动发现和加载。
+3. 当前用户的独立 Bridge Runtime：负责 loopback CDP、GPT 调度和结果回收。
 
 只有把 Skill 放到全局目录，才能保证换一个 Codex 对话后仍然可以使用。单纯把仓库
 clone 到任意文件夹，并不会自动完成全局安装。
@@ -23,17 +24,22 @@ clone 到任意文件夹，并不会自动完成全局安装。
 
 ```text
 %USERPROFILE%\.codex\skills\dispatch-chatgpt-bridge
+%USERPROFILE%\.codex\bridge-runtime\dispatch-chatgpt-bridge
 ```
 
 如果要安装到另一个 Codex 用户目录，可以显式指定目标：
 
 ```powershell
-.\scripts\install-global.ps1 -GlobalSkillsRoot 'D:\Codex\skills'
-.\scripts\verify-global-install.ps1 -GlobalSkillsRoot 'D:\Codex\skills'
+.\scripts\install-global.ps1 `
+  -GlobalSkillsRoot 'D:\Codex\skills' `
+  -GlobalRuntimeRoot 'D:\Codex\bridge-runtime\dispatch-chatgpt-bridge'
+.\scripts\verify-global-install.ps1 `
+  -GlobalSkillsRoot 'D:\Codex\skills' `
+  -GlobalRuntimeRoot 'D:\Codex\bridge-runtime\dispatch-chatgpt-bridge'
 ```
 
-脚本只会覆盖目标 Skill 自身的同名文件，不会删除目标目录中的其他 Skill，也不会
-触碰项目桥接运行时、对话、窗口或生成产物。
+脚本只会覆盖目标 Skill 和独立运行时自身的同名文件，不会删除其他 Skill，也不会
+发送消息、修改 GPT 对话或触碰生成产物。
 
 ## 更新
 
@@ -48,25 +54,30 @@ git pull
 开发者维护 Skill 时，应先修改并测试仓库版本，再安装到全局目录，最后用校验脚本
 确认两边文件一致。这样可以避免“Git 已更新、当前 Codex 仍加载旧副本”的错觉。
 
-## 桥接根目录仍需单独指定
+## 初始化独立运行时
 
-全局安装解决的是 Skill 的发现范围，不会替每个项目选择桥接运行时。执行桥接时，
-请使用显式项目根目录，或设置当前进程的环境变量：
-
-```powershell
-.\skills\dispatch-chatgpt-bridge\scripts\run-bridge.ps1 `
-  -Root 'C:\path\to\your\bridge-project' `
-  -Action discover
-```
-
-也可以：
+安装后运行一次：
 
 ```powershell
-$env:CODEX_BRIDGE_ROOT = 'C:\path\to\your\bridge-project'
+& "$env:USERPROFILE\.codex\bridge-runtime\dispatch-chatgpt-bridge\windows\scripts\start-chatgpt-bridge.ps1"
 ```
 
-不要把某个个人项目路径硬编码进可分享的 Skill。全局 Skill 和项目运行时分离后，
-同一份 Skill 才能服务多个项目。
+如果 Codex 已经以受验证的 loopback CDP 参数运行，脚本会复用它并写入
+`%LOCALAPPDATA%\CodexChatGPTBridge\state.json`。如果 Codex 正在运行但没有
+该端点，脚本会停止并要求明确使用 `-RestartExisting`，不会擅自关闭当前 Codex。
+从 PowerShell 7 调用时，启动器会把 Windows `Appx` 检查自动转交给
+Windows PowerShell 5.1，并保留相同参数和退出状态。
+
+初始化后直接执行：
+
+```powershell
+$runner = "$env:USERPROFILE\.codex\skills\dispatch-chatgpt-bridge\scripts\run-bridge.ps1"
+& $runner -Action discover
+& $runner -Action probe
+```
+
+只有在开发或自定义部署时才需要 `-Root` / `CODEX_BRIDGE_ROOT`。公共包装器不会
+读取旧项目变量，也不会从当前工作目录向上寻找运行时。
 
 ## 是否需要重启
 
@@ -76,5 +87,5 @@ Skill 内容，开启一个新 Codex 任务或重新读取 Skill 即可；安装
 
 ## 验证标准
 
-`verify-global-install.ps1` 会逐文件比较仓库 Skill 与全局 Skill 的 SHA-256。只有在
-输出 `PASS` 时，才认为 Git 版本与当前机器实际运行副本一致。
+`verify-global-install.ps1` 会逐文件比较仓库 Skill、独立运行时与两个全局副本的
+SHA-256。只有在输出 `PASS` 时，才认为 Git 版本与当前机器实际运行版本一致。

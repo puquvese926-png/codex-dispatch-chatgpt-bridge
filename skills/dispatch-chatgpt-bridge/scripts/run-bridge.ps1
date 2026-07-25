@@ -3,6 +3,7 @@ param(
   [ValidateSet('discover', 'probe', 'batch', 'resume', 'watch', 'approve', 'cleanup')]
   [string]$Action = 'probe',
   [string]$Root,
+  [string]$StatePath,
   [string]$InputPath,
   [string]$OutputPath,
   [ValidateRange(5000, 900000)]
@@ -24,19 +25,18 @@ function Test-BridgeRoot {
 
 function Resolve-BridgeRoot {
   param([string]$RequestedRoot)
-  foreach ($candidate in @($RequestedRoot, $env:CODEX_BRIDGE_ROOT, $env:CODEX_DREAM_SKIN_ROOT)) {
+  $installedRuntime = if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+    $null
+  } else {
+    Join-Path $env:USERPROFILE '.codex\bridge-runtime\dispatch-chatgpt-bridge'
+  }
+  $repositoryRuntime = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
+  foreach ($candidate in @($RequestedRoot, $env:CODEX_BRIDGE_ROOT, $installedRuntime, $repositoryRuntime)) {
     if (Test-BridgeRoot -Candidate $candidate) {
       return [IO.Path]::GetFullPath($candidate)
     }
   }
-  $candidatePath = [IO.Path]::GetFullPath((Get-Location).Path)
-  while ($true) {
-    if (Test-BridgeRoot -Candidate $candidatePath) { return $candidatePath }
-    $parent = [IO.Directory]::GetParent($candidatePath)
-    if ($null -eq $parent) { break }
-    $candidatePath = $parent.FullName
-  }
-  throw 'Bridge runtime root was not found. Set -Root, CODEX_BRIDGE_ROOT, or CODEX_DREAM_SKIN_ROOT.'
+  throw 'Standalone bridge runtime was not found. Install it globally, set -Root, or set CODEX_BRIDGE_ROOT.'
 }
 
 function Assert-AbsoluteBridgePath {
@@ -52,6 +52,11 @@ $resolvedRoot = Resolve-BridgeRoot -RequestedRoot $Root
 $bridgePath = Join-Path $resolvedRoot 'windows\scripts\chatgpt-bridge.mjs'
 $node = (Get-Command node -ErrorAction Stop).Source
 $arguments = @($bridgePath, $Action)
+
+if ($StatePath) {
+  Assert-AbsoluteBridgePath -Value $StatePath -Label 'StatePath'
+  $arguments += @('--state', [IO.Path]::GetFullPath($StatePath))
+}
 
 if ($Action -in @('batch', 'resume', 'watch', 'approve', 'cleanup')) {
   Assert-AbsoluteBridgePath -Value $InputPath -Label 'InputPath'

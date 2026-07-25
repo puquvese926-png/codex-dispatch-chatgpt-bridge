@@ -50,14 +50,24 @@ do not emulate a native task with a GPT window or a DOM listener.
 
 ## Locate the bridge
 
-Run `scripts/run-bridge.ps1`. Resolve the bridge runtime root in this order:
+Run `scripts/run-bridge.ps1`. The standalone runtime is installed separately from
+every project. Resolve it in this order:
 
 1. Explicit `-Root`.
 2. `CODEX_BRIDGE_ROOT`.
-3. Legacy `CODEX_DREAM_SKIN_ROOT`.
-4. Current directory or an ancestor containing `windows/scripts/chatgpt-bridge.mjs`.
+3. `%USERPROFILE%\.codex\bridge-runtime\dispatch-chatgpt-bridge`.
+4. The repository root containing this Skill during local development.
 
-Stop if no verified runtime root is found. Do not scan unrelated directories or copy the bridge implementation into the Skill.
+Stop if no verified runtime root is found. Do not scan the current directory,
+ancestor projects, legacy project variables, or unrelated folders. The bridge
+runtime and its state live under generic Codex bridge paths and must not depend on
+an image, skin, or application project.
+
+The first standalone setup runs
+`windows/scripts/start-chatgpt-bridge.ps1`. It may reuse an already verified
+loopback Codex endpoint without restarting. If Codex is running without that
+endpoint, restarting it requires explicit user authorization through
+`-RestartExisting`.
 
 ## Dispatch workflow
 
@@ -103,7 +113,8 @@ Treat every previously unrecorded bridge failure as a Skill update, not as an ep
 2. Add an exact stage label at the failing boundary; never leave a bare `Runtime.evaluate` or generic timeout when the caller can identify the operation.
 3. Add a failing regression test, implement the narrow fix, then run the targeted bridge tests and the full suite.
 4. Append the symptom, cause, safe response, fix and regression coverage to the failure playbook.
-5. Sync the project-authoritative Skill to its registered runtime copy and verify matching hashes.
+5. Sync the repository-authoritative Skill and standalone runtime to their global
+   copies and verify matching hashes.
 
 UI selector drift is a bridge failure, not a production failure. Composer and send-control checks must use bounded visible semantic selectors, require the exact job marker before clicking, and fail closed when control identity is ambiguous.
 
@@ -137,22 +148,26 @@ When a read-only resume completes a generation job, its manifest must carry the 
 
 Every resume report that participates in lifecycle merging must have its own non-empty `runId`; the resume run ID is distinct from the original submitted run and does not authorize another send.
 
-If `discover` or `probe` returns `fetch failed`, first verify that the saved loopback CDP port has no listener and that the recorded injector process is gone. Fail closed: do not run `batch`, do not guess another port, and do not close/restart an existing Codex window without explicit authorization to re-enable Dream Skin.
+If `discover` or `probe` returns `fetch failed`, first verify that the standalone
+state points to a live loopback CDP listener owned by the registered Codex package.
+Fail closed: do not run `batch`, do not guess another port, and do not close or
+restart an existing Codex window without explicit authorization. Refresh the
+standalone state only through `start-chatgpt-bridge.ps1`.
 
 Keep production and bridge repair separate. A failed recovery must not monopolize the route controller. Never resend an ambiguous job automatically; only a new explicit user authorization may create a different fresh job while the ambiguous conversation remains sealed.
 
 ## Commands
 
 ```powershell
-$runner = '<skill-root>\scripts\run-bridge.ps1'
+$runner = "$env:USERPROFILE\.codex\skills\dispatch-chatgpt-bridge\scripts\run-bridge.ps1"
 
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action discover -Root <project-root>
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action probe -Root <project-root>
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action batch -Root <project-root> -InputPath <absolute-jobs.json> -OutputPath <absolute-report.json> -AllowSend
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action resume -Root <project-root> -InputPath <absolute-resume.json> -OutputPath <absolute-report.json>
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action approve -Root <project-root> -InputPath <absolute-approve.json> -OutputPath <absolute-report.json> -AllowSend
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action watch -Root <project-root> -InputPath <absolute-watch.json> -OutputPath <absolute-report.json> -TimeoutMs 180000 -PollMs 5000
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action cleanup -Root <project-root> -InputPath <absolute-lifecycle-ledger.json> -OutputPath <absolute-cleanup-report.json> -AllowDelete
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action discover
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action probe
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action batch -InputPath <absolute-jobs.json> -OutputPath <absolute-report.json> -AllowSend
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action resume -InputPath <absolute-resume.json> -OutputPath <absolute-report.json>
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action approve -InputPath <absolute-approve.json> -OutputPath <absolute-report.json> -AllowSend
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action watch -InputPath <absolute-watch.json> -OutputPath <absolute-report.json> -TimeoutMs 180000 -PollMs 5000
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action cleanup -InputPath <absolute-lifecycle-ledger.json> -OutputPath <absolute-cleanup-report.json> -AllowDelete
 ```
 
 ## Interpret outcomes

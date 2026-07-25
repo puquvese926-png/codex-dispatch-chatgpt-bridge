@@ -1,0 +1,948 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { test } from "node:test";
+
+import {
+  browserIdFromVersion,
+  buildChatProbeExpression,
+  buildDetachedEvaluateParams,
+  buildBlobImageDataExpression,
+  buildBlobImageChunkExpression,
+  buildConversationSnapshotExpression,
+  buildHistoryDeleteStartExpression,
+  buildHistoryTitleListExpression,
+  buildHistoryTitleExpression,
+  buildHandoffApprovalFocusExpression,
+  buildHandoffApprovalSubmitExpression,
+  buildHandoffUnitsExpression,
+  buildMarkerPresenceExpression,
+  buildAttachmentAcknowledgementExpression,
+  buildAttachmentButtonExpression,
+  buildComposerFocusExpression,
+  buildComposerAvailabilityExpression,
+  buildComposerReadinessExpression,
+  buildSendClickExpression,
+  buildMainChatEntryExpression,
+  buildMainChatNewConversationExpression,
+  buildMainChatBlankExpression,
+  buildMainChatConversationIdExpression,
+  buildQuickChatPrewarmExpression,
+  buildQuickChatOpenExpression,
+  buildQuickChatRendererReadyExpression,
+  buildQuickChatOperationStatusExpression,
+  annotateBridgeStageError,
+  approvalConversationRoute,
+  classifyJobObservation,
+  conversationIdFromAppUrl,
+  isExpectedConversationAppUrl,
+  normalizeCollectedResult,
+  parseBridgeArgs,
+  quickChatWaveSize,
+  shouldRequireExpectedConversationRoute,
+  selectAppTarget,
+  selectCdpPageTargetById,
+  selectQuickChatTarget,
+  selectNewOrUniquePrewarmQuickChatTarget,
+  selectOwnedQuickChatTarget,
+  selectReusedQuickChatTarget,
+  isRetryableCdpOpenError,
+  activeCdpOpenCooldownTargets,
+  summarizeCollectedImages,
+  validateBridgeBatch,
+  validateResumeManifest,
+  validateBridgeState,
+  validateCleanupManifest,
+  validatedDebuggerUrl,
+} from "../scripts/chatgpt-bridge.mjs";
+import {
+  createEmptyHandoffCheckpoint,
+  recordDeliveredHandoff,
+  selectNextApprovedHandoff,
+  validateHandoffCheckpoint,
+  validateHandoffApprovalManifest,
+  validateHandoffWatchManifest,
+} from "../scripts/chatgpt-handoff-protocol.mjs";
+
+test("annotates bridge evaluation failures with the exact recovery stage", () => {
+  const error = annotateBridgeStageError("history-title-list", new Error("CDP command timed out: Runtime.evaluate"));
+  assert.equal(error.message, "history-title-list: CDP command timed out: Runtime.evaluate");
+  assert.equal(error.cause?.message, "CDP command timed out: Runtime.evaluate");
+});
+
+test("requires exact conversation routes except for blank marker-guarded history fallback", () => {
+  assert.equal(shouldRequireExpectedConversationRoute("generation"), true);
+  assert.equal(shouldRequireExpectedConversationRoute("direct-recovery"), true);
+  assert.equal(shouldRequireExpectedConversationRoute("history-fallback"), false);
+  assert.throws(() => shouldRequireExpectedConversationRoute("unknown"), /route mode/i);
+});
+
+test("handoff approval prefers the exact native route for local ChatGPT identities", () => {
+  assert.equal(
+    approvalConversationRoute("local-chatgpt:4c172155-0408-4417-b253-145d3e80a9d1"),
+    "native-direct",
+  );
+  assert.equal(
+    approvalConversationRoute("local:019f8955-8d91-7da1-93e3-8f3a900160c4"),
+    "main-active",
+  );
+});
+
+test("handoff approval reuses an exact active main surface before reopening a route", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function openHandoffApprovalConversation");
+  const activeMain = source.indexOf("handoff-approve-active-main", start);
+  const nativeDirect = source.indexOf("openNativeQuickChat(", start);
+  assert.ok(start >= 0 && activeMain > start && nativeDirect > start);
+  assert.ok(activeMain < nativeDirect);
+});
+
+test("native quick-chat lifecycle RPCs can be dispatched without awaiting renderer promises", () => {
+  assert.deepEqual(buildDetachedEvaluateParams("Promise.resolve(true)", true), {
+    expression: "Promise.resolve(true)",
+    awaitPromise: false,
+    returnByValue: false,
+    userGesture: true,
+  });
+});
+
+test("tracks native quick-chat lifecycle dispatch before releasing the controlling renderer", () => {
+  const conversationId = "local-chatgpt:3da06710-f874-437a-8ab1-71bc25e58afc";
+  const status = buildQuickChatOperationStatusExpression("open", conversationId);
+  assert.match(status, /__codexChatBridgeLifecycle/);
+  assert.match(status, /open:local-chatgpt:3da06710-f874-437a-8ab1-71bc25e58afc/);
+  assert.throws(() => buildQuickChatOperationStatusExpression("unknown", conversationId), /operation/i);
+});
+
+test("uses the native open completion as the fresh quick-chat lifecycle gate", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function openNativeQuickChat");
+  const nativeOpen = source.indexOf("buildQuickChatOpenExpression(", start);
+  const nativeOpenAck = source.indexOf("await evaluateAtStage(mainSession, buildQuickChatOpenExpression(", start);
+  const conversationOpen = source.indexOf("quick-chat-conversation-session-open", start);
+  assert.ok(start >= 0 && nativeOpen > start && nativeOpenAck > start && conversationOpen > start);
+  assert.ok(nativeOpenAck < conversationOpen, "native open completion must precede conversation websocket open");
+  assert.doesNotMatch(source.slice(start, conversationOpen), /renderer-ready/);
+});
+
+test("parses read-only and explicitly authorized bridge commands", () => {
+  assert.deepEqual(parseBridgeArgs(["discover"]), {
+    command: "discover",
+    allowSend: false,
+    allowDelete: false,
+    input: null,
+    output: null,
+    statePath: null,
+    timeoutMs: 180000,
+  });
+
+  assert.deepEqual(parseBridgeArgs([
+    "batch",
+    "--input", "C:\\jobs\\batch.json",
+    "--output", "C:\\jobs\\report.json",
+    "--timeout-ms", "240000",
+    "--allow-send",
+  ]), {
+    command: "batch",
+    allowSend: true,
+    allowDelete: false,
+    input: "C:\\jobs\\batch.json",
+    output: "C:\\jobs\\report.json",
+    statePath: null,
+    timeoutMs: 240000,
+  });
+
+  assert.throws(() => parseBridgeArgs(["batch", "--input", "jobs.json"]), /input path.*absolute/i);
+  assert.throws(() => parseBridgeArgs(["batch", "--input", "C:\\jobs.json", "--output", "C:\\out.json"]), /allow-send/i);
+  assert.throws(() => parseBridgeArgs(["unknown"]), /command/i);
+  assert.throws(() => parseBridgeArgs(["probe", "--unexpected"]), /unknown argument/i);
+  assert.deepEqual(parseBridgeArgs([
+    "resume",
+    "--input", "C:\\jobs\\resume.json",
+    "--output", "C:\\jobs\\recovered.json",
+  ]), {
+    command: "resume",
+    allowSend: false,
+    allowDelete: false,
+    input: "C:\\jobs\\resume.json",
+    output: "C:\\jobs\\recovered.json",
+    statePath: null,
+    timeoutMs: 180000,
+  });
+  assert.throws(() => parseBridgeArgs([
+    "resume", "--input", "C:\\in.json", "--output", "C:\\out.json", "--allow-send",
+  ]), /allow-send|send/i);
+  assert.deepEqual(parseBridgeArgs([
+    "cleanup",
+    "--input", "C:\\state\\conversations.json",
+    "--output", "C:\\reports\\cleanup.json",
+    "--allow-delete",
+  ]), {
+    command: "cleanup",
+    allowSend: false,
+    allowDelete: true,
+    input: "C:\\state\\conversations.json",
+    output: "C:\\reports\\cleanup.json",
+    statePath: null,
+    timeoutMs: 180000,
+  });
+  assert.throws(() => parseBridgeArgs([
+    "cleanup", "--input", "C:\\in.json", "--output", "C:\\out.json",
+  ]), /allow-delete|delete/i);
+  assert.deepEqual(parseBridgeArgs([
+    "watch",
+    "--input", "C:\\handoff\\watch.json",
+    "--output", "C:\\handoff\\report.json",
+    "--timeout-ms", "5000",
+    "--poll-ms", "1000",
+  ]), {
+    command: "watch",
+    allowSend: false,
+    allowDelete: false,
+    input: "C:\\handoff\\watch.json",
+    output: "C:\\handoff\\report.json",
+    statePath: null,
+    timeoutMs: 5000,
+    pollMs: 1000,
+  });
+  assert.throws(() => parseBridgeArgs([
+    "watch", "--input", "C:\\in.json", "--output", "C:\\out.json", "--allow-send",
+  ]), /read-only|allow-send|send/i);
+  assert.deepEqual(parseBridgeArgs([
+    "approve",
+    "--input", "C:\\handoff\\approve.json",
+    "--output", "C:\\handoff\\approve-report.json",
+    "--allow-send",
+  ]), {
+    command: "approve",
+    allowSend: true,
+    allowDelete: false,
+    input: "C:\\handoff\\approve.json",
+    output: "C:\\handoff\\approve-report.json",
+    statePath: null,
+    timeoutMs: 180000,
+  });
+  assert.throws(() => parseBridgeArgs([
+    "approve", "--input", "C:\\in.json", "--output", "C:\\out.json",
+  ]), /allow-send|authorization/i);
+});
+
+test("validates strict unique batch jobs without rewriting prompts", () => {
+  const source = {
+    schemaVersion: 1,
+    jobs: [
+      { id: "concept-a", prompt: "生成第一张图：保留  两个空格。" },
+      { id: "concept-b", prompt: "Generate image B\nsecond line" },
+    ],
+  };
+  const batch = validateBridgeBatch(source);
+  assert.deepEqual(batch, source);
+  assert.ok(Object.isFrozen(batch));
+  assert.ok(Object.isFrozen(batch.jobs));
+  assert.ok(Object.isFrozen(batch.jobs[0]));
+
+  const invalid = [
+    null,
+    [],
+    { schemaVersion: 2, jobs: [] },
+    { schemaVersion: 1, jobs: [] },
+    { schemaVersion: 1, jobs: [{ id: "a", prompt: "x", extra: true }] },
+    { schemaVersion: 1, jobs: [{ id: "A", prompt: "x" }] },
+    { schemaVersion: 1, jobs: [{ id: "a", prompt: "" }] },
+    { schemaVersion: 1, jobs: [{ id: "a", prompt: "x" }, { id: "a", prompt: "y" }] },
+  ];
+  for (const value of invalid) {
+    assert.throws(() => validateBridgeBatch(value), /batch|schema|jobs|job|id|prompt|duplicate/i);
+  }
+});
+
+test("validates generation batches that require fresh chats and a lifecycle ledger", () => {
+  const source = {
+    schemaVersion: 2,
+    jobType: "image-generation",
+    conversationMode: "fresh-per-job",
+    retentionDays: 7,
+    lifecycleLedgerPath: "C:\\生图项目\\state\\chatgpt-generation-conversations.json",
+    jobs: [
+      { id: "candidate-a", prompt: "生成候选 A。", references: [{ path: "C:\\refs\\a.png", sha256: "a".repeat(64) }] },
+      { id: "candidate-b", prompt: "生成候选 B。", references: [{ path: "C:\\refs\\b.jpg", sha256: "b".repeat(64) }] },
+    ],
+  };
+  assert.deepEqual(validateBridgeBatch(source), source);
+  assert.throws(() => validateBridgeBatch({ ...source, conversationMode: "reuse" }), /fresh|conversation/i);
+  assert.throws(() => validateBridgeBatch({ ...source, retentionDays: 0 }), /retention/i);
+  assert.throws(() => validateBridgeBatch({ ...source, lifecycleLedgerPath: "relative.json" }), /ledger|absolute/i);
+  assert.throws(() => validateBridgeBatch({ ...source, jobType: "text" }), /jobType|image/i);
+  assert.throws(() => validateBridgeBatch({ ...source, jobs: [{ id: "candidate-a", prompt: "x" }] }), /reference|attachment/i);
+  assert.throws(() => validateBridgeBatch({
+    ...source,
+    jobs: [{ id: "candidate-a", prompt: "x", references: [{ path: "relative.png", sha256: "a".repeat(64) }] }],
+  }), /reference|absolute/i);
+});
+
+test("attachment discovery uses visible upload controls without private APIs", () => {
+  const expression = buildAttachmentButtonExpression();
+  assert.match(expression, /Attach|添加|上传|文件/i);
+  assert.match(expression, /click/);
+  assert.doesNotMatch(expression, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
+});
+
+test("attachment acknowledgement recognizes rendered attachment cards", () => {
+  const expression = buildAttachmentAcknowledgementExpression(["reference-a.jpg", "reference-b.png"]);
+  assert.match(expression, /aria-label/);
+  assert.match(expression, /title/);
+  assert.match(expression, /alt/);
+  assert.match(expression, /reference-a\.jpg/);
+  assert.match(expression, /reference-b\.png/);
+  assert.doesNotMatch(expression, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
+});
+
+test("composer discovery tolerates ChatGPT editor and send-control selector drift", () => {
+  const focus = buildComposerFocusExpression();
+  const blank = buildComposerAvailabilityExpression(true);
+  const ready = buildComposerReadinessExpression("CODEX-BRIDGE-test-marker");
+  const send = buildSendClickExpression();
+
+  for (const expression of [focus, blank, ready]) {
+    assert.match(expression, /data-lexical-editor/);
+    assert.match(expression, /role=.textbox|role=\"textbox\"/);
+    assert.match(expression, /textarea/);
+    assert.match(expression, /getBoundingClientRect|getClientRects/);
+  }
+  assert.match(ready, /data-testid=.send-button|data-testid=\"send-button\"/);
+  assert.match(ready, /Send|发送/i);
+  assert.match(ready, /CODEX-BRIDGE-test-marker/);
+  assert.match(blank, /data-content-search-unit-key/);
+  assert.doesNotMatch(ready, /querySelector\('\[contenteditable="true"\]\[aria-label="给 ChatGPT 发消息"\]'\)/);
+  assert.match(send, /data-testid=.send-button|data-testid=\"send-button\"/);
+  assert.match(send, /Send|发送/i);
+  assert.match(send, /\.click\(\)/);
+});
+
+test("main ChatGPT fallback uses only visible new-chat and blank-surface gates", () => {
+  const entry = buildMainChatEntryExpression();
+  const newConversation = buildMainChatNewConversationExpression();
+  const blank = buildMainChatBlankExpression();
+  for (const expression of [entry, newConversation, blank]) {
+    assert.match(expression, /getBoundingClientRect|getClientRects/);
+  }
+  assert.match(entry, /聊天/);
+  assert.match(entry, /Quick chat/);
+  assert.match(entry, /role="dialog"/);
+  assert.match(newConversation, /新聊天/);
+  assert.match(newConversation, /role="dialog"/);
+  assert.match(newConversation, /header|h1|h2|h3/);
+  assert.match(blank, /role="dialog"/);
+  assert.match(blank, /data-content-search-unit-key/);
+  assert.match(blank, /querySelectorAll/);
+  assert.match(blank, /停止|Stop/);
+  assert.match(entry, /当前模式|current mode/i);
+  assert.match(newConversation, /document/);
+  assert.match(blank, /document/);
+  assert.doesNotMatch(entry + newConversation + blank, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
+});
+
+test("embedded Quick chat uses its visible DOM conversation identity and snapshot root", () => {
+  const identity = buildMainChatConversationIdExpression();
+  const snapshot = buildConversationSnapshotExpression("CODEX-BRIDGE-test-job", "main-chat");
+  assert.match(identity, /data-above-composer-conversation-id/);
+  assert.match(identity, /local-chatgpt/);
+  assert.match(identity, /data-app-action-sidebar-thread-id/);
+  assert.match(identity, /local:/);
+  assert.match(snapshot, /data-pip-obstacle="quick-chat"/);
+  assert.match(snapshot, /当前模式|current mode/i);
+});
+
+test("validates explicit read-only resume manifests", () => {
+  const manifest = {
+    schemaVersion: 1,
+    jobs: [{
+      id: "image-a",
+      conversationId: "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de",
+      marker: "CODEX-BRIDGE-c39c8a08-image-a",
+      title: "二次元背景设计",
+    }],
+  };
+  assert.deepEqual(validateResumeManifest(manifest), manifest);
+  const mainSurfaceManifest = {
+    ...manifest,
+    jobs: [{
+      ...manifest.jobs[0],
+      conversationId: "local:019f8955-8d91-7da1-93e3-8f3a900160c4",
+      surface: "chatgpt-main-chat",
+    }],
+  };
+  assert.deepEqual(validateResumeManifest(mainSurfaceManifest), mainSurfaceManifest);
+  const directManifest = {
+    ...manifest,
+    jobs: [{
+      id: manifest.jobs[0].id,
+      conversationId: manifest.jobs[0].conversationId,
+      marker: manifest.jobs[0].marker,
+    }],
+  };
+  assert.deepEqual(validateResumeManifest(directManifest), directManifest);
+  const mainManifest = {
+    ...manifest,
+    jobs: [{ ...manifest.jobs[0], surface: "chatgpt-main-chat" }],
+  };
+  assert.deepEqual(validateResumeManifest(mainManifest), mainManifest);
+  const lifecycleManifest = {
+    ...mainManifest,
+    jobType: "image-generation",
+    retentionDays: 7,
+    lifecycleLedgerPath: "C:\\Users\\HP\\Documents\\生图项目\\state\\chatgpt-generation-conversations.json",
+    jobs: [{ ...mainManifest.jobs[0], promptHash: "a".repeat(64) }],
+  };
+  assert.deepEqual(validateResumeManifest(lifecycleManifest), lifecycleManifest);
+  assert.throws(() => validateResumeManifest({
+    ...manifest,
+    jobs: [{ ...manifest.jobs[0], title: "" }],
+  }), /title|resume/i);
+  assert.throws(() => validateResumeManifest({
+    ...manifest,
+    jobs: [{ ...manifest.jobs[0], conversationId: "server-id" }],
+  }), /conversation|resume/i);
+});
+
+test("handoff watch accepts only a later exact user approval", () => {
+  const manifest = {
+    schemaVersion: 1,
+    conversationId: "local:019f8955-8d91-7da1-93e3-8f3a900160c4",
+    surface: "chatgpt-main-chat",
+    checkpointPath: "C:\\state\\bridge-handoff-checkpoint.json",
+  };
+  assert.deepEqual(validateHandoffWatchManifest(manifest), manifest);
+
+  const units = [
+    {
+      key: "turn-1:assistant",
+      role: "assistant",
+      text: `CODEX_HANDOFF
+\`\`\`json
+{"schemaVersion":1,"type":"CODEX_HANDOFF","taskId":"login-page-001","status":"proposed","objective":"实现登录页","acceptance":["测试通过"],"constraints":["不发布生产"]}
+\`\`\``,
+    },
+    { key: "turn-2:user", role: "user", text: "方案再讨论一下" },
+  ];
+  const checkpoint = createEmptyHandoffCheckpoint(manifest.conversationId);
+  assert.equal(selectNextApprovedHandoff(units, checkpoint), null);
+
+  units.push({ key: "turn-3:user", role: "user", text: "确认执行 login-page-001" });
+  const selected = selectNextApprovedHandoff(units, checkpoint);
+  assert.equal(selected.taskId, "login-page-001");
+  assert.equal(selected.objective, "实现登录页");
+  assert.match(selected.planHash, /^[a-f0-9]{64}$/);
+  assert.equal(selected.proposalUnitKey, "turn-1:assistant");
+  assert.equal(selected.approvalUnitKey, "turn-3:user");
+});
+
+test("handoff accepts one rendered assistant JSON code block after Markdown fences are stripped", () => {
+  const conversationId = "local-chatgpt:6a81b412-c16a-41f2-8912-0772fdc61256";
+  const units = [{
+    key: "turn-1:assistant",
+    role: "assistant",
+    text: "CODEX_HANDOFF\n\njson\n{\n  \"taskId\": \"rendered-task-001\"\n}",
+    codeBlocks: [JSON.stringify({
+      schemaVersion: 1,
+      type: "CODEX_HANDOFF",
+      taskId: "rendered-task-001",
+      status: "proposed",
+      objective: "验证真实渲染任务块",
+      acceptance: ["只交付一次"],
+      constraints: ["不删除对话"],
+    }, null, 2).replaceAll(" ", "\u00a0")],
+  }, {
+    key: "turn-2:user",
+    role: "user",
+    text: "CODEX_APPROVE rendered-task-001",
+    codeBlocks: [],
+  }];
+  const selected = selectNextApprovedHandoff(
+    units,
+    createEmptyHandoffCheckpoint(conversationId),
+  );
+  assert.equal(selected.taskId, "rendered-task-001");
+  assert.equal(selected.objective, "验证真实渲染任务块");
+});
+
+test("validates exact handoff approval and scopes visible UI submission to its conversation", () => {
+  const manifest = {
+    schemaVersion: 1,
+    conversationId: "local-chatgpt:4c172155-0408-4417-b253-145d3e80a9d1",
+    surface: "chatgpt-main-chat",
+    marker: "CODEX-BRIDGE-798d860e-handoff-live-conversation-20260724",
+    taskId: "live-handoff-test-20260724",
+  };
+  assert.deepEqual(validateHandoffApprovalManifest(manifest), manifest);
+  assert.throws(
+    () => validateHandoffApprovalManifest({ ...manifest, taskId: "changed task" }),
+    /taskId|approval/i,
+  );
+  const focus = buildHandoffApprovalFocusExpression(manifest.conversationId);
+  const submit = buildHandoffApprovalSubmitExpression(manifest.conversationId, manifest.taskId);
+  assert.match(focus, /data-above-composer-conversation-id/);
+  assert.match(focus, /composer-not-empty/);
+  assert.match(focus, /aria-label="给 ChatGPT 发消息"/);
+  assert.match(submit, /CODEX_APPROVE live-handoff-test-20260724/);
+  assert.match(submit, /data-above-composer-conversation-id/);
+  assert.match(submit, /aria-label\*="ChatGPT"/);
+  assert.doesNotMatch(focus + submit, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
+});
+
+test("handoff checkpoint prevents duplicate delivery and task rebinding", () => {
+  const conversationId = "local-chatgpt:6a81b412-c16a-41f2-8912-0772fdc61256";
+  const units = [
+    {
+      key: "turn-1:assistant",
+      role: "assistant",
+      text: `CODEX_HANDOFF
+\`\`\`json
+{"schemaVersion":1,"type":"CODEX_HANDOFF","taskId":"task-001","status":"proposed","objective":"执行任务","acceptance":["完成"],"constraints":[]}
+\`\`\``,
+    },
+    { key: "turn-2:user", role: "user", text: "CODEX_APPROVE task-001" },
+  ];
+  const empty = createEmptyHandoffCheckpoint(conversationId);
+  const selected = selectNextApprovedHandoff(units, empty);
+  const delivered = recordDeliveredHandoff(empty, selected, "2026-07-24T01:00:00.000Z");
+  assert.deepEqual(validateHandoffCheckpoint(delivered, conversationId), delivered);
+  assert.equal(selectNextApprovedHandoff(units, delivered), null);
+
+  const rebound = [
+    {
+      ...units[0],
+      key: "turn-3:assistant",
+      text: units[0].text.replace("执行任务", "执行另一个任务"),
+    },
+    { key: "turn-4:user", role: "user", text: "CODEX_APPROVE task-001" },
+  ];
+  assert.throws(() => selectNextApprovedHandoff(rebound, delivered), /rebound|reused/i);
+});
+
+test("handoff DOM collection is read-only and scoped to rendered conversation units", () => {
+  const expression = buildHandoffUnitsExpression();
+  const nativeExpression = buildHandoffUnitsExpression(
+    "local-chatgpt:4c172155-0408-4417-b253-145d3e80a9d1",
+  );
+  assert.match(expression, /readable/);
+  assert.match(expression, /data-content-search-unit-key/);
+  assert.match(expression, /data-pip-obstacle="quick-chat"/);
+  assert.match(expression, /当前模式|current mode/i);
+  assert.doesNotMatch(expression, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
+  assert.doesNotMatch(expression, /\.click\(|dispatchEvent/i);
+  assert.match(nativeExpression, /local-chatgpt:4c172155-0408-4417-b253-145d3e80a9d1/);
+});
+
+test("handoff watch passes its expected conversation identity into DOM collection", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function readHandoffObservation");
+  const end = source.indexOf("async function runWatch", start);
+  const observationSource = source.slice(start, end);
+  assert.match(observationSource, /buildHandoffUnitsExpression\(expectedConversationId\)/);
+  assert.doesNotMatch(observationSource, /manifest\\./);
+});
+
+test("validates exact-marker cleanup manifests", () => {
+  const manifest = {
+    schemaVersion: 1,
+    jobs: [{
+      id: "candidate-a",
+      conversationId: "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de",
+      marker: "CODEX-BRIDGE-c39c8a08-candidate-a",
+      title: "桥接生图 candidate-a",
+      artifacts: [{ path: "C:\\outputs\\candidate-a.png", sha256: "b".repeat(64), bytes: 100 }],
+    }],
+  };
+  assert.deepEqual(validateCleanupManifest(manifest), manifest);
+  assert.throws(() => validateCleanupManifest({ ...manifest, jobs: [{ ...manifest.jobs[0], title: "" }] }), /title/i);
+  assert.throws(() => validateCleanupManifest({ ...manifest, jobs: [{ ...manifest.jobs[0], artifacts: [] }] }), /artifact/i);
+});
+
+test("history title and delete expressions use visible UI and exact identity", () => {
+  const titleExpression = buildHistoryTitleExpression();
+  assert.match(titleExpression, /aria-current|aria-selected|data-state/);
+  assert.doesNotMatch(titleExpression, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
+
+  const titleListExpression = buildHistoryTitleListExpression();
+  assert.match(titleListExpression, /更多|More|菜单|menu/i);
+  assert.match(titleListExpression, /button\[aria-label\]/);
+  assert.doesNotMatch(titleListExpression, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
+
+  const markerExpression = buildMarkerPresenceExpression("CODEX-BRIDGE-c39c8a08-candidate-a");
+  assert.match(markerExpression, /data-content-search-unit-key/);
+  assert.match(markerExpression, /CODEX-BRIDGE-c39c8a08-candidate-a/);
+  assert.doesNotMatch(markerExpression, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
+
+  const deleteExpression = buildHistoryDeleteStartExpression("桥接生图 candidate-a");
+  assert.match(deleteExpression, /桥接生图 candidate-a/);
+  assert.match(deleteExpression, /更多|More|menu/i);
+  assert.doesNotMatch(deleteExpression, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
+  assert.throws(() => buildHistoryDeleteStartExpression(""), /title/i);
+});
+
+test("accepts only the standalone bridge state identity", () => {
+  const state = {
+    schemaVersion: 1,
+    platform: "windows",
+    port: 9345,
+    browserId: "browser-123",
+    codexVersion: "26.707.9564.0",
+    codexExe: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_test\\app\\ChatGPT.exe",
+    codexPackageRoot: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_test",
+    codexPackageFullName: "OpenAI.Codex_26.707.9564.0_x64__test",
+    codexPackageFamilyName: "OpenAI.Codex_test",
+    createdAt: "2026-07-25T00:00:00.000Z",
+  };
+  assert.deepEqual(validateBridgeState(state), state);
+
+  for (const value of [
+    { ...state, schemaVersion: 3 },
+    { ...state, platform: "macos" },
+    { ...state, port: 80 },
+    { ...state, browserId: "browser 123" },
+    { ...state, codexExe: "C:\\Other\\ChatGPT.exe" },
+    { ...state, codexPackageRoot: "C:\\Program Files\\WindowsApps\\Other" },
+    { ...state, createdAt: "not-a-date" },
+    { ...state, extra: true },
+  ]) {
+    assert.throws(() => validateBridgeState(value), /state|schema|platform|port|browser|package|executable|unknown/i);
+  }
+});
+
+test("rejects CDP websocket targets outside the saved loopback endpoint", () => {
+  const target = {
+    id: "page-123",
+    type: "page",
+    url: "app://-/index.html",
+    webSocketDebuggerUrl: "ws://127.0.0.1:9345/devtools/page/page-123",
+  };
+  assert.equal(validatedDebuggerUrl(target, 9345), target.webSocketDebuggerUrl);
+
+  for (const unsafe of [
+    { ...target, type: "worker" },
+    { ...target, url: "https://chatgpt.com/" },
+    { ...target, webSocketDebuggerUrl: "ws://example.com:9345/devtools/page/page-123" },
+    { ...target, webSocketDebuggerUrl: "ws://127.0.0.1:9346/devtools/page/page-123" },
+    { ...target, webSocketDebuggerUrl: "ws://127.0.0.1:9345/devtools/page/other" },
+    { ...target, webSocketDebuggerUrl: "ws://user@127.0.0.1:9345/devtools/page/page-123" },
+    { ...target, webSocketDebuggerUrl: "ws://127.0.0.1:9345/devtools/page/page-123?x=1" },
+  ]) {
+    assert.throws(() => validatedDebuggerUrl(unsafe, 9345), /CDP|target|loopback|identity/i);
+  }
+});
+
+test("pins browser and page discovery to the saved CDP identity", () => {
+  assert.equal(browserIdFromVersion({
+    webSocketDebuggerUrl: "ws://127.0.0.1:9345/devtools/browser/browser-123",
+  }, 9345), "browser-123");
+  assert.throws(() => browserIdFromVersion({
+    webSocketDebuggerUrl: "ws://127.0.0.1:9346/devtools/browser/browser-123",
+  }, 9345), /browser|loopback|identity/i);
+
+  const safe = {
+    id: "page-123",
+    type: "page",
+    title: "Codex",
+    url: "app://-/index.html",
+    webSocketDebuggerUrl: "ws://127.0.0.1:9345/devtools/page/page-123",
+  };
+  assert.deepEqual(selectAppTarget([safe], 9345), safe);
+  const quick = {
+    ...safe,
+    id: "quick-123",
+    url: "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat%2Flocal-chatgpt%253Aabc-123",
+    webSocketDebuggerUrl: "ws://127.0.0.1:9345/devtools/page/quick-123",
+  };
+  assert.deepEqual(selectAppTarget([quick, safe], 9345), safe);
+  assert.deepEqual(selectQuickChatTarget([safe, quick], 9345), quick);
+  assert.deepEqual(selectQuickChatTarget([safe, quick], 9345, "local-chatgpt:abc-123"), quick);
+  assert.equal(selectQuickChatTarget([safe], 9345), null);
+  const quickOther = {
+    ...quick,
+    id: "quick-456",
+    url: "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat%2Flocal-chatgpt%253Adef-456",
+    webSocketDebuggerUrl: "ws://127.0.0.1:9345/devtools/page/quick-456",
+  };
+  assert.deepEqual(selectQuickChatTarget([quickOther, quick], 9345, "local-chatgpt:abc-123"), quick);
+  assert.equal(selectQuickChatTarget([quickOther], 9345, "local-chatgpt:abc-123"), null);
+  const reusedPrewarm = {
+    ...quick,
+    url: "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat-prewarm",
+  };
+  assert.deepEqual(selectCdpPageTargetById([safe, reusedPrewarm], 9345, "quick-123"), reusedPrewarm);
+  assert.equal(selectCdpPageTargetById([safe], 9345, "quick-123"), null);
+  assert.throws(() => selectCdpPageTargetById([{
+    ...reusedPrewarm,
+    webSocketDebuggerUrl: "ws://127.0.0.1:9346/devtools/page/quick-123",
+  }], 9345, "quick-123"), /identity|loopback|target/i);
+  const rebuiltQuickChat = {
+    ...reusedPrewarm,
+    id: "quick-rebuilt",
+    title: "ChatGPT",
+    url: "app://-/index.html",
+    webSocketDebuggerUrl: "ws://127.0.0.1:9345/devtools/page/quick-rebuilt",
+  };
+  assert.deepEqual(selectReusedQuickChatTarget([safe, reusedPrewarm], 9345, "quick-123"), reusedPrewarm);
+  assert.deepEqual(selectReusedQuickChatTarget([safe, rebuiltQuickChat], 9345, "quick-123"), rebuiltQuickChat);
+  const initializingQuickChat = {
+    ...rebuiltQuickChat,
+    title: "",
+  };
+  assert.deepEqual(
+    selectReusedQuickChatTarget([safe, initializingQuickChat], 9345, "quick-123", "page-123"),
+    initializingQuickChat,
+  );
+  assert.equal(selectReusedQuickChatTarget([safe], 9345, "quick-123"), null);
+  assert.deepEqual(selectAppTarget([
+    { ...safe, id: "worker", type: "worker", webSocketDebuggerUrl: "ws://127.0.0.1:9345/devtools/page/worker" },
+    safe,
+  ], 9345), safe);
+  assert.throws(() => selectAppTarget([], 9345), /renderer|target/i);
+  assert.throws(() => selectAppTarget([safe, {
+    ...safe,
+    id: "page-456",
+    webSocketDebuggerUrl: "ws://127.0.0.1:9345/devtools/page/page-456",
+  }], 9345), /multiple|renderer/i);
+});
+
+test("selects the uniquely new prewarm renderer without confusing stale quick-chat windows", () => {
+  const target = (id, route) => ({
+    id,
+    title: "ChatGPT",
+    type: "page",
+    url: `app://-/index.html?initialRoute=${encodeURIComponent(route)}`,
+    webSocketDebuggerUrl: `ws://127.0.0.1:9345/devtools/page/${id}`,
+  });
+  const stale = target("stale-1", "/chatgpt/quick-chat/local-chatgpt%3A11111111-1111-4111-8111-111111111111");
+  const created = target("created-2", "/chatgpt/quick-chat-prewarm");
+  assert.equal(selectNewOrUniquePrewarmQuickChatTarget([stale, created], 9345, new Set(["stale-1"]))?.id, "created-2");
+  assert.equal(selectNewOrUniquePrewarmQuickChatTarget([created], 9345, new Set(["created-2"]))?.id, "created-2");
+  assert.throws(() => selectNewOrUniquePrewarmQuickChatTarget(
+    [target("stale-a", "/chatgpt/quick-chat-prewarm"), target("stale-b", "/chatgpt/quick-chat-prewarm")],
+    9345,
+    new Set(["stale-a", "stale-b"]),
+  ), /multiple.*prewarm/i);
+});
+
+test("reselects only an attributable quick-chat target after a websocket-open race", () => {
+  const port = 9345;
+  const expectedConversationId = "local-chatgpt:3da06710-f874-437a-8ab1-71bc25e58afc";
+  const stale = {
+    id: "A".repeat(32),
+    type: "page",
+    title: "ChatGPT",
+    url: "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat%2Flocal-chatgpt%253Astale-id",
+    webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${"A".repeat(32)}`,
+  };
+  const rebuilt = {
+    id: "B".repeat(32),
+    type: "page",
+    title: "ChatGPT",
+    url: `app://-/index.html?initialRoute=${encodeURIComponent(`/chatgpt/quick-chat/${expectedConversationId}`)}`,
+    webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${"B".repeat(32)}`,
+  };
+  const knownIds = new Set([stale.id]);
+  assert.equal(selectOwnedQuickChatTarget(
+    [stale, rebuilt], port, expectedConversationId, stale.id, knownIds, new Set([stale.id]),
+  ).id, rebuilt.id);
+  assert.equal(selectOwnedQuickChatTarget(
+    [stale], port, expectedConversationId, stale.id, knownIds, new Set([stale.id]),
+  ), null);
+  assert.throws(() => selectOwnedQuickChatTarget(
+    [rebuilt, { ...rebuilt, id: "C".repeat(32), webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${"C".repeat(32)}` }],
+    port, expectedConversationId, stale.id, knownIds, new Set([stale.id]),
+  ), /multiple|ambiguous/i);
+});
+
+test("retries only websocket-open transport failures", () => {
+  assert.equal(isRetryableCdpOpenError(new Error("CDP websocket open failed")), true);
+  assert.equal(isRetryableCdpOpenError(new Error(`CDP websocket open failed for target ${"A".repeat(32)}`)), true);
+  assert.equal(isRetryableCdpOpenError(new Error("CDP websocket open timed out")), true);
+  assert.equal(isRetryableCdpOpenError(new Error("CDP websocket closed")), false);
+  assert.equal(isRetryableCdpOpenError(new Error("Runtime.enable failed")), false);
+});
+
+test("failed renderer targets cool down temporarily instead of being excluded forever", () => {
+  const targetA = "A".repeat(32);
+  const targetB = "B".repeat(32);
+  const cooldowns = new Map([[targetA, 2000], [targetB, 999]]);
+  assert.deepEqual(activeCdpOpenCooldownTargets(cooldowns, 1000), new Set([targetA]));
+  assert.deepEqual(activeCdpOpenCooldownTargets(cooldowns, 2500), new Set());
+  assert.throws(() => activeCdpOpenCooldownTargets(new Map([["bad id", 2000]]), 1000), /target|cooldown/i);
+});
+
+test("builds a version-pinned native quick-chat open call", () => {
+  const conversationId = "local-chatgpt:3da06710-f874-437a-8ab1-71bc25e58afc";
+  const expression = buildQuickChatOpenExpression("26.707.9564.0", conversationId, {
+    x: 560,
+    y: 80,
+    width: 900,
+    height: 900,
+  });
+  assert.match(expression, /rpc-BfVaZKPC\.js/);
+  assert.match(expression, /quickChatWindow/);
+  assert.match(expression, /service\.open/);
+  assert.match(expression, /await service\.open/);
+  assert.match(expression, /3da06710-f874-437a-8ab1-71bc25e58afc/);
+  assert.doesNotMatch(expression, /cookie|localStorage|sessionStorage|indexedDB/i);
+  assert.throws(() => buildQuickChatOpenExpression("26.999.0.0", conversationId, {
+    x: 0, y: 0, width: 900, height: 900,
+  }), /unsupported|version/i);
+  assert.throws(() => buildQuickChatOpenExpression("26.707.9564.0", "local-chatgpt:../bad", {
+    x: 0, y: 0, width: 900, height: 900,
+  }), /conversation/i);
+});
+
+test("supports the current Codex quick-chat service export", () => {
+  const conversationId = "local-chatgpt:3da06710-f874-437a-8ab1-71bc25e58afc";
+  const expression = buildQuickChatOpenExpression("26.715.10079.0", conversationId, {
+    x: 560,
+    y: 80,
+    width: 900,
+    height: 900,
+  });
+  assert.match(expression, /rpc-Ci0K2syu\.js/);
+  assert.match(expression, /rpc\[\"appServices\"\]/);
+  assert.match(expression, /service\.open/);
+  assert.equal(quickChatWaveSize("26.715.10079.0", 0), 2);
+});
+
+test("keeps prewarm and renderer-ready helpers isolated from fresh production", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function openNativeQuickChat");
+  const end = source.indexOf("async function selectHistoryConversation", start);
+  const freshOpenPath = source.slice(start, end);
+  assert.doesNotMatch(freshOpenPath, /buildQuickChatPrewarmExpression|buildQuickChatRendererReadyExpression|renderer-ready/);
+  assert.throws(() => buildQuickChatPrewarmExpression("26.999.0.0"), /unsupported|version/i);
+  assert.throws(() => buildQuickChatRendererReadyExpression("26.999.0.0", "local-chatgpt:3da06710-f874-437a-8ab1-71bc25e58afc"), /unsupported|version/i);
+});
+
+test("limits native quick-chat fan-out to available client windows", () => {
+  assert.equal(quickChatWaveSize("26.707.9564.0", 0), 2);
+  assert.equal(quickChatWaveSize("26.707.9564.0", 1), 1);
+  assert.throws(() => quickChatWaveSize("26.707.9564.0", 2), /close|window|capacity/i);
+  assert.throws(() => quickChatWaveSize("26.999.0.0", 0), /unsupported|version/i);
+});
+
+test("extracts only explicit quick-chat conversation identities", () => {
+  const localUrl = "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat%2Flocal-chatgpt%253A50b66343-af73-4c20-96e1-63b4a7565329";
+  assert.equal(conversationIdFromAppUrl(localUrl), "local-chatgpt:50b66343-af73-4c20-96e1-63b4a7565329");
+  assert.equal(conversationIdFromAppUrl("app://-/index.html"), null);
+  assert.throws(() => conversationIdFromAppUrl("https://example.com/?initialRoute=%2Fchatgpt%2Fquick-chat%2Fbad"), /app|conversation/i);
+  assert.throws(() => conversationIdFromAppUrl("app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat%2F..%252Fbad"), /conversation/i);
+});
+
+test("distinguishes a prewarm route from the expected quick-chat conversation", () => {
+  const expected = "local-chatgpt:3da06710-f874-437a-8ab1-71bc25e58afc";
+  assert.equal(isExpectedConversationAppUrl(
+    "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat-prewarm",
+    expected,
+  ), false);
+  assert.equal(isExpectedConversationAppUrl(
+    "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat%2Flocal-chatgpt%253A3da06710-f874-437a-8ab1-71bc25e58afc",
+    expected,
+  ), true);
+});
+
+test("probe expression is read-only and does not inspect credentials or chat history", () => {
+  const expression = buildChatProbeExpression();
+  assert.match(expression, /聊天/);
+  assert.match(expression, /Quick chat/);
+  assert.match(expression, /当前模式|current mode/i);
+  assert.match(expression, /location\.href/);
+  assert.doesNotMatch(expression, /cookie|localStorage|sessionStorage|indexedDB/i);
+  assert.doesNotMatch(expression, /querySelectorAll\(['"]p|querySelectorAll\(['"]article/i);
+  assert.doesNotMatch(expression, /\.click\(|dispatchEvent|fetch\(/i);
+});
+
+test("snapshot expression scopes collection to rendered conversation units", () => {
+  const expression = buildConversationSnapshotExpression("BRIDGE-MARKER-A");
+  const mainExpression = buildConversationSnapshotExpression("BRIDGE-MARKER-A", "main-chat");
+  assert.match(expression, /data-content-search-unit-key/);
+  assert.match(expression, /BRIDGE-MARKER-A/);
+  assert.match(expression, /assistant/);
+  assert.match(expression, /querySelectorAll\('img'\)/);
+  assert.match(expression, /generated image|生成图像/i);
+  assert.doesNotMatch(expression, /cookie|localStorage|sessionStorage|indexedDB/i);
+  assert.doesNotMatch(expression, /fetch\(|XMLHttpRequest|querySelectorAll\(['"]p/i);
+  assert.match(mainExpression, /role="dialog"/);
+  assert.match(mainExpression, /root\.querySelectorAll/);
+});
+
+test("materializes only app-local rendered blob images", () => {
+  const expression = buildBlobImageDataExpression("blob:app://-/4d5ed762-c249-4e31-9d57-3c12e4596c06");
+  assert.match(expression, /createElement\('canvas'\)/);
+  assert.match(expression, /drawImage/);
+  assert.doesNotMatch(expression, /fetch|FileReader/);
+  assert.match(expression, /4d5ed762-c249-4e31-9d57-3c12e4596c06/);
+  assert.doesNotMatch(expression, /cookie|localStorage|sessionStorage|indexedDB/i);
+  assert.throws(() => buildBlobImageDataExpression("https://example.com/image.png"), /blob|image/i);
+  assert.throws(() => buildBlobImageDataExpression("blob:https://example.com/id"), /blob|image/i);
+  const chunk = buildBlobImageChunkExpression("blob:app://-/4d5ed762-c249-4e31-9d57-3c12e4596c06", 0);
+  assert.match(chunk, /slice/);
+  assert.match(chunk, /nextOffset|done|total/);
+  assert.throws(() => buildBlobImageChunkExpression("blob:app://-/id", -1), /offset|image/i);
+});
+
+test("classifies completed, waiting, navigated-away, and ambiguous post-submit observations", () => {
+  const base = {
+    submitted: true,
+    expectedConversationId: "conv-a",
+    currentConversationId: "conv-a",
+    composerBusy: false,
+    assistantMessageCount: 1,
+    baselineAssistantMessageCount: 0,
+    hasStopButton: false,
+    stablePolls: 2,
+  };
+  assert.equal(classifyJobObservation(base), "complete");
+  assert.equal(classifyJobObservation({ ...base, composerBusy: true, stablePolls: 0 }), "waiting");
+  assert.equal(classifyJobObservation({ ...base, hasStopButton: true, stablePolls: 0 }), "waiting");
+  assert.equal(classifyJobObservation({ ...base, currentConversationId: "conv-b" }), "unknown-after-submit");
+  assert.equal(classifyJobObservation({ ...base, currentConversationId: null }), "unknown-after-submit");
+  assert.equal(classifyJobObservation({ ...base, submitted: false }), "not-submitted");
+  assert.equal(classifyJobObservation({ ...base, assistantMessageCount: 0 }), "waiting");
+  assert.equal(classifyJobObservation({
+    ...base,
+    assistantMessageCount: 0,
+    hasGeneratedImages: true,
+  }), "complete");
+});
+
+test("normalizes only the target result and strips unsafe or non-image URLs", () => {
+  const normalized = normalizeCollectedResult({
+    conversationId: "conv-a",
+    url: "app://-/chat/conv-a",
+    assistantText: "完成。",
+    images: [
+      { src: "https://files.oaiusercontent.com/image.png", width: 1024, height: 1024, alt: "generated" },
+      { src: "data:image/png;base64,AAA=", width: 2, height: 2, alt: "inline" },
+      { src: "javascript:alert(1)", width: 1, height: 1, alt: "bad" },
+    ],
+  });
+  assert.deepEqual(normalized, {
+    conversationId: "conv-a",
+    url: "app://-/chat/conv-a",
+    assistantText: "完成。",
+    images: [
+      { src: "https://files.oaiusercontent.com/image.png", width: 1024, height: 1024, alt: "generated" },
+      { src: "data:image/png;base64,AAA=", width: 2, height: 2, alt: "inline" },
+    ],
+  });
+  assert.ok(Object.isFrozen(normalized));
+  assert.equal(normalizeCollectedResult({
+    ...normalized,
+    conversationId: "local-chatgpt:50b66343-af73-4c20-96e1-63b4a7565329",
+  }).conversationId, "local-chatgpt:50b66343-af73-4c20-96e1-63b4a7565329");
+  assert.throws(() => normalizeCollectedResult({ ...normalized, conversationId: "../bad" }), /conversation/i);
+});
+
+test("keeps image metadata in reports without embedding image bytes", () => {
+  assert.deepEqual(summarizeCollectedImages([
+    { src: "data:image/png;base64,AAA=", width: 1672, height: 941, alt: "已生成图像 1" },
+    { src: "https://files.oaiusercontent.com/image.png", width: 1024, height: 1024, alt: "generated" },
+  ]), [
+    { sourceType: "materialized-app-blob", width: 1672, height: 941, alt: "已生成图像 1" },
+    { sourceType: "remote-image", width: 1024, height: 1024, alt: "generated" },
+  ]);
+});

@@ -61,7 +61,6 @@ If the user explicitly authorizes Codex to relay that exact approval, use:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File <skill-root>\scripts\run-bridge.ps1 `
   -Action approve `
-  -Root <project-root> `
   -InputPath <absolute-approve.json> `
   -OutputPath <absolute-approve-report.json> `
   -AllowSend
@@ -87,7 +86,6 @@ Run a bounded watch:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File <skill-root>\scripts\run-bridge.ps1 `
   -Action watch `
-  -Root <project-root> `
   -InputPath <absolute-watch.json> `
   -OutputPath <absolute-report.json> `
   -TimeoutMs 180000 `
