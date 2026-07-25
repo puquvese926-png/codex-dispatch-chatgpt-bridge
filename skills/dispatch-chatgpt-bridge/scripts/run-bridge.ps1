@@ -24,7 +24,7 @@ function Test-BridgeRoot {
 
 function Resolve-BridgeRoot {
   param([string]$RequestedRoot)
-  foreach ($candidate in @($RequestedRoot, $env:CODEX_BRIDGE_ROOT)) {
+  foreach ($candidate in @($RequestedRoot, $env:CODEX_BRIDGE_ROOT, $env:CODEX_DREAM_SKIN_ROOT)) {
     if (Test-BridgeRoot -Candidate $candidate) {
       return [IO.Path]::GetFullPath($candidate)
     }
@@ -36,7 +36,7 @@ function Resolve-BridgeRoot {
     if ($null -eq $parent) { break }
     $candidatePath = $parent.FullName
   }
-  throw 'Bridge runtime root was not found. Set -Root or CODEX_BRIDGE_ROOT.'
+  throw 'Bridge runtime root was not found. Set -Root, CODEX_BRIDGE_ROOT, or CODEX_DREAM_SKIN_ROOT.'
 }
 
 function Assert-AbsoluteBridgePath {

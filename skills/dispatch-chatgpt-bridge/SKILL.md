@@ -50,13 +50,14 @@ do not emulate a native task with a GPT window or a DOM listener.
 
 ## Locate the bridge
 
-Run `scripts/run-bridge.ps1`. Resolve the bridge runtime project in this order:
+Run `scripts/run-bridge.ps1`. Resolve the bridge runtime root in this order:
 
 1. Explicit `-Root`.
 2. `CODEX_BRIDGE_ROOT`.
-3. Current directory or an ancestor containing `windows/scripts/chatgpt-bridge.mjs`.
+3. Legacy `CODEX_DREAM_SKIN_ROOT`.
+4. Current directory or an ancestor containing `windows/scripts/chatgpt-bridge.mjs`.
 
-Stop if no verified project root is found. Do not scan unrelated directories or copy the bridge implementation into the skill.
+Stop if no verified runtime root is found. Do not scan unrelated directories or copy the bridge implementation into the Skill.
 
 ## Dispatch workflow
 

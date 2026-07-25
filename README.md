@@ -27,6 +27,22 @@ Codex 任务的协作控制层。
 完整的产品定位、角色分工、使用场景和预期效果见
 [产品介绍](docs/product-overview.md)。
 
+## 全局安装（跨 Codex 对话）
+
+Skill 要跨不同 Codex 对话可用，必须安装到当前用户的全局 Skill 目录：
+
+```powershell
+.\scripts\install-global.ps1
+.\scripts\verify-global-install.ps1
+```
+
+默认安装位置是 `%USERPROFILE%\\.codex\\skills\\dispatch-chatgpt-bridge`。安装后，
+Skill 不依附某一个对话；Git 仓库只是分发和版本管理来源，真正被 Codex 自动发现的
+运行副本是全局目录中的 Skill。桥接运行时仍需通过 `-Root` 或
+`CODEX_BRIDGE_ROOT` 指向具体项目，因为“全局 Skill”不等于“固定项目根目录”。
+
+详细说明见 [全局安装与版本同步](docs/global-install.md)。
+
 ## 四条路由
 
 | 路由 | 用户术语 | 作用 |
@@ -52,6 +68,9 @@ GPT 规划 → 用户批准 → Codex 执行 → 测试验收 → 回读结果
 - `skills/dispatch-chatgpt-bridge/scripts/run-bridge.ps1`：桥接动作包装器；
 - `docs/dispatch-chatgpt-bridge-guide.md`：使用场景和触发示例；
 - `docs/product-overview.md`：面向分享和介绍的产品说明；
+- `docs/global-install.md`：跨 Codex 对话的全局安装、更新和校验；
+- `scripts/install-global.ps1`：把仓库中的 Skill 安装到当前用户全局目录；
+- `scripts/verify-global-install.ps1`：比较仓库版本和全局运行副本的 SHA-256；
 - `windows/tests/native-codex-bridge-skill-tests.mjs`：术语和原生路由回归测试。
 
 本仓库只维护 Skill、契约、文档和测试，不包含具体项目的皮肤、图片素材或业务代码。运行桥接时，通过 `-Root` 指向实际提供 loopback bridge runtime 的项目。
