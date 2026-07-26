@@ -171,13 +171,12 @@ Codex 的 Subagents / 子任务区域查看其状态，主任务最后收到摘�
 先做只读健康检查：
 
 ```powershell
-$root = '<bridge-runtime-project-root>'
-$runner = "$root\skills\dispatch-chatgpt-bridge\scripts\run-bridge.ps1"
+$runner = "$env:USERPROFILE\.codex\skills\dispatch-chatgpt-bridge\scripts\run-bridge.ps1"
 
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
-  -Action discover -Root $root
+  -Action discover
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
-  -Action probe -Root $root
+  -Action probe
 ```
 
 文字任务使用 schema v1：
@@ -222,7 +221,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
-  -Action batch -Root $root `
+  -Action batch `
   -InputPath 'C:\absolute\jobs.json' `
   -OutputPath 'C:\absolute\report.json' -AllowSend
 ```
@@ -350,9 +349,10 @@ GPT 负责设计方案，`gpt-to-codex` 把批准的计划交给主 Codex；主 
 | `skills/dispatch-chatgpt-bridge/references/bridge-contract.md` | Codex → GPT batch、resume 和生命周期合同 |
 | `skills/dispatch-chatgpt-bridge/references/handoff-contract.md` | GPT → Codex handoff 合同 |
 | `skills/dispatch-chatgpt-bridge/references/failure-playbook.md` | 故障、原因、安全响应和回归测试 |
-| `skills/dispatch-chatgpt-bridge/scripts/run-bridge.ps1` | Skill 到 runtime 项目的动作包装器 |
+| `skills/dispatch-chatgpt-bridge/scripts/run-bridge.ps1` | Skill 到独立 runtime 的动作包装器 |
 | `windows/tests/native-codex-bridge-skill-tests.mjs` | 四条路由、工具名和防混淆测试 |
-| 外部 runtime 项目 | `chatgpt-bridge.mjs`、handoff 解析和 CDP 实现 |
+| `windows/scripts/` | 独立 `chatgpt-bridge.mjs`、handoff、生命周期和 CDP 启动实现 |
+| `windows/tests/standalone-runtime-tests.mjs` | 无业务项目依赖的运行时、安装和根目录解析测试 |
 
 验证命令：
 
@@ -360,9 +360,8 @@ GPT 负责设计方案，`gpt-to-codex` 把批准的计划交给主 Codex；主 
 python -X utf8 "$env:USERPROFILE\.codex\skills\.system\skill-creator\scripts\quick_validate.py" `
   '.\skills\dispatch-chatgpt-bridge'
 
-node '.\windows\tests\native-codex-bridge-skill-tests.mjs'
+.\windows\tests\run-tests.ps1
 ```
 
 权威 Skill 位于本仓库的 `skills/dispatch-chatgpt-bridge/`。安装到 Codex
-运行环境后，还应将它与运行副本逐文件校验。外部 runtime 项目应另外运行
-自己的桥接和 CDP 全量测试。
+运行环境后，还应将 Skill 和本仓库的独立 runtime 与全局副本逐文件校验。

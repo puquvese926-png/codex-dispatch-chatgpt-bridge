@@ -50,13 +50,24 @@ do not emulate a native task with a GPT window or a DOM listener.
 
 ## Locate the bridge
 
-Run `scripts/run-bridge.ps1`. Resolve the bridge runtime project in this order:
+Run `scripts/run-bridge.ps1`. The standalone runtime is installed separately from
+every project. Resolve it in this order:
 
 1. Explicit `-Root`.
 2. `CODEX_BRIDGE_ROOT`.
-3. Current directory or an ancestor containing `windows/scripts/chatgpt-bridge.mjs`.
+3. `%USERPROFILE%\.codex\bridge-runtime\dispatch-chatgpt-bridge`.
+4. The repository root containing this Skill during local development.
 
-Stop if no verified project root is found. Do not scan unrelated directories or copy the bridge implementation into the skill.
+Stop if no verified runtime root is found. Do not scan the current directory,
+ancestor projects, legacy project variables, or unrelated folders. The bridge
+runtime and its state live under generic Codex bridge paths and must not depend on
+an image, skin, or application project.
+
+The first standalone setup runs
+`windows/scripts/start-chatgpt-bridge.ps1`. It may reuse an already verified
+loopback Codex endpoint without restarting. If Codex is running without that
+endpoint, restarting it requires explicit user authorization through
+`-RestartExisting`.
 
 ## Dispatch workflow
 
@@ -73,7 +84,9 @@ Stop if no verified project root is found. Do not scan unrelated directories or 
 6. Invoke `batch` once with `-AllowSend`. The bridge schedules up to two ChatGPT windows per wave on the pinned client version and closes only windows it created.
 7. Read the report before taking another action. Never infer success from a visible window alone.
 
-For image generation or editing, use schema v2. One job must equal one candidate and one newly created GPT chat. Attach 1–8 user-approved local PNG/JPEG/WebP references with their SHA-256 values; the bridge verifies and uploads them before sending. Set `conversationMode` to `fresh-per-job`, record a lifecycle ledger, and keep the default retention at seven days. Do not continue an edit or iteration inside the previous generation chat.
+For image generation or editing, use schema v2. One job must equal one candidate and one newly created GPT chat. Every v2 job includes a `references` array. For original `image-generation`, use `references: []`; reference-guided generation may include 1–8 user-approved local PNG/JPEG/WebP files. `image-edit` requires 1–8 references. The bridge verifies every supplied path, type, size and SHA-256 before opening a chat, and skips the attachment UI only for an empty original-generation list. Set `conversationMode` to `fresh-per-job`, record a lifecycle ledger, and keep the default retention at seven days. Do not continue an edit or iteration inside the previous generation chat.
+
+For resume, copy each job's exact per-job `surface`, `conversationId`, `marker` and `promptHash` from the original report. `surface` is mandatory and is either `chatgpt-quick-chat` or `chatgpt-main-chat`; never infer it from a `local-chatgpt:<uuid>` identity or from the report's top-level transport summary.
 
 Read [references/bridge-contract.md](references/bridge-contract.md) before creating batch or resume JSON.
 Read [references/handoff-contract.md](references/handoff-contract.md) before creating watch JSON or acting on a handoff.
@@ -102,15 +115,18 @@ Treat every previously unrecorded bridge failure as a Skill update, not as an ep
 2. Add an exact stage label at the failing boundary; never leave a bare `Runtime.evaluate` or generic timeout when the caller can identify the operation.
 3. Add a failing regression test, implement the narrow fix, then run the targeted bridge tests and the full suite.
 4. Append the symptom, cause, safe response, fix and regression coverage to the failure playbook.
-5. Sync the project-authoritative Skill to its registered runtime copy and verify matching hashes.
+5. Sync the repository-authoritative Skill and standalone runtime to their global
+   copies and verify matching hashes.
 
 UI selector drift is a bridge failure, not a production failure. Composer and send-control checks must use bounded visible semantic selectors, require the exact job marker before clicking, and fail closed when control identity is ambiguous.
 
 Renderer identity can change between discovery and WebSocket connection, and a listed renderer may temporarily reject WebSocket connections while activating. Refresh the verified loopback target list immediately before connecting, retain exact stage names and target IDs, and reconnect only to an exact or uniquely attributable task-owned renderer. Use temporary cooldowns rather than permanently excluding the only attributable renderer after fast failures. Never use a transport retry to broaden target selection.
 
-Fresh and recovery quick-chat activation uses the version-pinned native `quickChatWindow.open` call awaited to completion, verifies its returned conversation identity, refreshes `/json/list`, and then connects only to the exact conversation route. Do not make `prewarm` or manual `rendererReady` a production prerequisite without runtime proof; source-string tests are insufficient evidence of native lifecycle semantics.
+Fresh and recovery quick-chat activation uses the version-pinned native `quickChatWindow.open` lifecycle, refreshes `/json/list`, and connects only to the task-owned prewarm target. The bridge must not await the native open promise before it can observe the renderer: on the pinned client that promise waits for the Quick chat renderer's own ready event and may dispose the claimed window when that event is not observed. Instead, dispatch open with a tracked lifecycle state, keep the controlling renderer alive, wait for the exact prewarm target ID, wait for open completion, and only then create the conversation WebSocket. The official Quick chat page owns `rendererReady(conversationId)`; the bridge must not call that RPC from the main renderer or guess another conversation ID.
 
 The pinned RPC asset and service export are client-version-specific. On a client update, inspect the installed `app.asar` and verify the actual module export before adding a version mapping; newer clients may expose `quickChatWindow` under `rpc.appServices` instead of the older minified export `rpc.n`. A stale package identity in saved state must be refreshed through the official start path, never by hand-editing `state.json`.
+
+On the pinned Windows client, native `quickChatWindow.open` consumes a prewarm owned by the controlling renderer and returns without opening a window when no such prewarm exists. Fresh native dispatch must therefore call the official `quickChatWindow.prewarm`, snapshot target IDs, wait for one newly appearing or uniquely reusable prewarm target, dispatch `open` without awaiting its renderer-dependent promise, wait for that exact owned target to remain present, wait for the tracked `open` operation to fulfill, and then connect. The Quick chat page itself acknowledges its route with the official renderer-ready RPC. If the owned target or open completion fails before submission, record the exact stage and use the visible main-surface fallback; do not call renderer-ready from the retained main renderer.
 
 Some current clients render Quick chat as an embedded `[data-pip-obstacle="quick-chat"]` dialog in the retained main renderer rather than a separate CDP page. In that mode the main `app://-/index.html` URL is not a conversation identity; do not attribute it to a synthetic local conversation ID. Scope composer and snapshot reads to the visible Quick chat dialog, and after submission require marker/history evidence. If that evidence disappears and no attributable target exists, seal `unknown-after-submit` and never resend automatically.
 
@@ -118,7 +134,9 @@ The embedded Quick chat dialog exposes its real local identity on a descendant's
 
 The full integrated ChatGPT main surface may expose a Codex local thread rather than a `local-chatgpt` route. In that mode resolve the active thread from `[data-above-composer-conversation-id]` or the active `[data-app-action-sidebar-thread-id]`/`[aria-current="page"]` item and normalize it as `local:<uuid>`. Use this identity only with `surface: "chatgpt-main-chat"`; require the exact active identity before send, marker acknowledgement and collection. Never reinterpret a `local:<uuid>` thread as a native Quick chat window.
 
-If awaited `quickChatWindow.open` completes but no exact attributable target remains connectable, production may fall back only to the visible main ChatGPT surface: click `聊天`, click `新聊天`, then require a visible blank composer, zero visible conversation units, and no visible stop control. This fallback must retain the main renderer, never close a user conversation, and never treat an unknown or stale quick-chat target as interchangeable.
+If official prewarm or the detached `quickChatWindow.open` lifecycle fails before submission, production may fall back only to the visible main ChatGPT surface: click `聊天`, click `新聊天`, then require a visible blank composer, zero visible conversation units, and no visible stop control. Record the exact native failure in that job's `routing.fallbackReason`; never hide a native-to-main downgrade behind the top-level report. This fallback must retain the main renderer, never close a user conversation, and never treat an unknown or stale quick-chat target as interchangeable.
+
+The retained main ChatGPT surface is a singleton even when the native Quick chat capacity is two. If any job falls back to `chatgpt-main-chat`, collect and seal that job before another job may click `新聊天`; keep wave concurrency only for independently attributable native Quick chat windows.
 
 Main-surface readiness is scoped to the visible `[role="dialog"]` only. A dialog whose visible header is `新聊天` is already at the new-conversation gate and must not be clicked; global Codex controls or task messages must not count as ChatGPT units, composer state, or stop controls.
 
@@ -136,22 +154,28 @@ When a read-only resume completes a generation job, its manifest must carry the 
 
 Every resume report that participates in lifecycle merging must have its own non-empty `runId`; the resume run ID is distinct from the original submitted run and does not authorize another send.
 
-If `discover` or `probe` returns `fetch failed`, first verify that the saved loopback CDP port has no listener and that the recorded injector process is gone. Fail closed: do not run `batch`, do not guess another port, and do not close/restart an existing Codex window without explicit authorization to re-enable Dream Skin.
+Lifecycle entries created by current reports carry the exact per-job `surface`. A read-only recovery that makes no progress must not replace the original submitted status, run ID or report path; its separate resume report remains the audit record. CDP target IDs and `app://-/index.html` are renderer details, not durable conversation identities.
+
+If `discover` or `probe` returns `fetch failed`, first verify that the standalone
+state points to a live loopback CDP listener owned by the registered Codex package.
+Fail closed: do not run `batch`, do not guess another port, and do not close or
+restart an existing Codex window without explicit authorization. Refresh the
+standalone state only through `start-chatgpt-bridge.ps1`.
 
 Keep production and bridge repair separate. A failed recovery must not monopolize the route controller. Never resend an ambiguous job automatically; only a new explicit user authorization may create a different fresh job while the ambiguous conversation remains sealed.
 
 ## Commands
 
 ```powershell
-$runner = '<skill-root>\scripts\run-bridge.ps1'
+$runner = "$env:USERPROFILE\.codex\skills\dispatch-chatgpt-bridge\scripts\run-bridge.ps1"
 
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action discover -Root <project-root>
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action probe -Root <project-root>
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action batch -Root <project-root> -InputPath <absolute-jobs.json> -OutputPath <absolute-report.json> -AllowSend
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action resume -Root <project-root> -InputPath <absolute-resume.json> -OutputPath <absolute-report.json>
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action approve -Root <project-root> -InputPath <absolute-approve.json> -OutputPath <absolute-report.json> -AllowSend
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action watch -Root <project-root> -InputPath <absolute-watch.json> -OutputPath <absolute-report.json> -TimeoutMs 180000 -PollMs 5000
-powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action cleanup -Root <project-root> -InputPath <absolute-lifecycle-ledger.json> -OutputPath <absolute-cleanup-report.json> -AllowDelete
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action discover
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action probe
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action batch -InputPath <absolute-jobs.json> -OutputPath <absolute-report.json> -AllowSend
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action resume -InputPath <absolute-resume.json> -OutputPath <absolute-report.json>
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action approve -InputPath <absolute-approve.json> -OutputPath <absolute-report.json> -AllowSend
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action watch -InputPath <absolute-watch.json> -OutputPath <absolute-report.json> -TimeoutMs 180000 -PollMs 5000
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action cleanup -InputPath <absolute-lifecycle-ledger.json> -OutputPath <absolute-cleanup-report.json> -AllowDelete
 ```
 
 ## Interpret outcomes
@@ -194,4 +218,4 @@ Do not convert `unknown-after-submit` or `timeout-after-submit` into a new `batc
 
 ## Report to the caller
 
-Return the requested/completed counts, per-job status, report path, artifact paths and SHA-256, lifecycle ledger path, whether any job is ambiguous after submit, and any version/capacity limitation. State explicitly that no resend occurred during recovery. For cleanup, report selected/deleted counts and preserve failures for a later safe retry.
+Return the requested/completed counts, per-job status, selected surface, routing fallback reason when present, report path, artifact paths and SHA-256, lifecycle ledger path, whether any job is ambiguous after submit, and any version/capacity limitation. State explicitly that no resend occurred during recovery. For cleanup, report selected/deleted counts and preserve failures for a later safe retry.

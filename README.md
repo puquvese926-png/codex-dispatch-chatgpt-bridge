@@ -27,6 +27,24 @@ Codex 任务的协作控制层。
 完整的产品定位、角色分工、使用场景和预期效果见
 [产品介绍](docs/product-overview.md)。
 
+## 全局安装（跨 Codex 对话）
+
+Skill 要跨不同 Codex 对话可用，必须安装到当前用户的全局 Skill 目录：
+
+```powershell
+.\scripts\install-global.ps1
+.\scripts\verify-global-install.ps1
+```
+
+默认安装位置是 `%USERPROFILE%\\.codex\\skills\\dispatch-chatgpt-bridge`，独立
+运行时安装到 `%USERPROFILE%\\.codex\\bridge-runtime\\dispatch-chatgpt-bridge`。
+安装后，Skill 和运行时都不依附某一个对话或业务项目；`-Root` 与
+`CODEX_BRIDGE_ROOT` 只用于显式覆盖独立运行时位置。
+
+详细说明见 [全局安装与版本同步](docs/global-install.md)。
+本次项目解耦的原因、架构和验收结果见
+[独立 Bridge Runtime 修复报告](docs/standalone-runtime-repair-report.md)。
+
 ## 四条路由
 
 | 路由 | 用户术语 | 作用 |
@@ -52,9 +70,17 @@ GPT 规划 → 用户批准 → Codex 执行 → 测试验收 → 回读结果
 - `skills/dispatch-chatgpt-bridge/scripts/run-bridge.ps1`：桥接动作包装器；
 - `docs/dispatch-chatgpt-bridge-guide.md`：使用场景和触发示例；
 - `docs/product-overview.md`：面向分享和介绍的产品说明；
+- `docs/global-install.md`：跨 Codex 对话的全局安装、更新和校验；
+- `scripts/install-global.ps1`：把仓库中的 Skill 安装到当前用户全局目录；
+- `scripts/verify-global-install.ps1`：比较 Skill、运行时和全局副本的 SHA-256；
+- `windows/scripts/chatgpt-bridge.mjs`：独立桥接运行时；
+- `windows/scripts/start-chatgpt-bridge.ps1`：验证或启动 Codex loopback CDP 并写入独立状态；
+- `windows/tests/standalone-runtime-tests.mjs`：项目解耦、安装和启动回归测试；
+- `windows/tests/run-tests.ps1`：独立桥接全量测试入口；
 - `windows/tests/native-codex-bridge-skill-tests.mjs`：术语和原生路由回归测试。
 
-本仓库只维护 Skill、契约、文档和测试，不包含具体项目的皮肤、图片素材或业务代码。运行桥接时，通过 `-Root` 指向实际提供 loopback bridge runtime 的项目。
+本仓库同时维护 Skill、独立运行时、契约、文档和测试，不包含任何皮肤、图片素材或
+业务项目代码，也不需要从其他项目借用 `chatgpt-bridge.mjs`。
 
 ## 适合谁
 
