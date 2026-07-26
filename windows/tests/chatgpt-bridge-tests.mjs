@@ -27,6 +27,7 @@ import {
   buildMainChatBlankExpression,
   buildMainChatConversationIdExpression,
   buildQuickChatPrewarmExpression,
+  buildQuickChatOpenDispatchExpression,
   buildQuickChatOpenExpression,
   buildQuickChatRendererReadyExpression,
   buildQuickChatOperationStatusExpression,
@@ -47,6 +48,9 @@ import {
   selectReusedQuickChatTarget,
   isRetryableCdpOpenError,
   activeCdpOpenCooldownTargets,
+  buildJobRouting,
+  summarizeBatchSurface,
+  isNativeQuickChatFallbackError,
   summarizeCollectedImages,
   validateBridgeBatch,
   validateResumeManifest,
@@ -113,15 +117,69 @@ test("tracks native quick-chat lifecycle dispatch before releasing the controlli
   assert.throws(() => buildQuickChatOperationStatusExpression("unknown", conversationId), /operation/i);
 });
 
-test("uses the native open completion as the fresh quick-chat lifecycle gate", () => {
+test("uses detached open, owned target, and completion as the fresh quick-chat lifecycle gate", () => {
   const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
   const start = source.indexOf("async function openNativeQuickChat");
-  const nativeOpen = source.indexOf("buildQuickChatOpenExpression(", start);
-  const nativeOpenAck = source.indexOf("await evaluateAtStage(mainSession, buildQuickChatOpenExpression(", start);
+  const nativeOpen = source.indexOf("buildQuickChatOpenDispatchExpression(", start);
+  const nativeOpenAck = source.indexOf('waitForQuickChatOperationDispatch(mainSession, "open"', start);
+  const ownedTarget = source.indexOf("native quick-chat owned target after open", start);
+  const openCompletion = source.indexOf('waitForQuickChatOperationCompletion(mainSession, "open"', start);
   const conversationOpen = source.indexOf("quick-chat-conversation-session-open", start);
-  assert.ok(start >= 0 && nativeOpen > start && nativeOpenAck > start && conversationOpen > start);
-  assert.ok(nativeOpenAck < conversationOpen, "native open completion must precede conversation websocket open");
-  assert.doesNotMatch(source.slice(start, conversationOpen), /renderer-ready/);
+  assert.ok(start >= 0 && nativeOpen > start && nativeOpenAck > nativeOpen && ownedTarget > nativeOpenAck);
+  assert.ok(openCompletion > ownedTarget);
+  assert.ok(openCompletion < conversationOpen, "native open completion must precede conversation websocket open");
+  assert.doesNotMatch(source.slice(start, conversationOpen), /buildQuickChatRendererReadyExpression/);
+});
+
+test("fresh native quick-chat prepares an attributable prewarm before calling open", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function openNativeQuickChat");
+  const prewarm = source.indexOf("buildQuickChatPrewarmExpression(", start);
+  const prewarmTarget = source.indexOf("selectNewOrUniquePrewarmQuickChatTarget", start);
+  const nativeOpen = source.indexOf("buildQuickChatOpenDispatchExpression(", start);
+  assert.ok(start >= 0 && prewarm > start && prewarmTarget > prewarm && nativeOpen > prewarmTarget);
+  assert.ok(prewarm < prewarmTarget && prewarmTarget < nativeOpen,
+    "the official open call must consume a prewarm owned by this controlling renderer");
+});
+
+test("native open can be dispatched before the official renderer-ready acknowledgement", () => {
+  const conversationId = "local-chatgpt:3da06710-f874-437a-8ab1-71bc25e58afc";
+  const expression = buildQuickChatOpenDispatchExpression("26.715.10079.0", conversationId, {
+    x: 480,
+    y: 60,
+    width: 960,
+    height: 900,
+  });
+  assert.match(expression, /__codexChatBridgeLifecycle/);
+  assert.match(expression, /service\.open/);
+  assert.match(expression, /state: 'dispatched'/);
+  assert.match(expression, /await service\.open/);
+});
+
+test("records native-to-main fallback reasons without confusing the report surface", () => {
+  assert.deepEqual(buildJobRouting("chatgpt-quick-chat"), {
+    requestedSurface: "chatgpt-quick-chat",
+    selectedSurface: "chatgpt-quick-chat",
+    fallbackReason: null,
+  });
+  const reason = "quick-chat-conversation-session-open: No attributable CDP target became connectable";
+  assert.deepEqual(buildJobRouting("chatgpt-main-chat", reason), {
+    requestedSurface: "chatgpt-quick-chat",
+    selectedSurface: "chatgpt-main-chat",
+    fallbackReason: reason,
+  });
+  assert.equal(isNativeQuickChatFallbackError(new Error(reason)), true);
+  assert.equal(isNativeQuickChatFallbackError(new Error(
+    "native quick-chat owned target after open timed out",
+  )), true);
+  assert.equal(isNativeQuickChatFallbackError(new Error(
+    "native quick-chat open completion timed out",
+  )), true);
+  assert.equal(isNativeQuickChatFallbackError(new Error("submission acknowledgement timed out")), false);
+  assert.equal(summarizeBatchSurface([{ surface: "chatgpt-quick-chat" }]), "chatgpt-quick-chat");
+  assert.equal(summarizeBatchSurface([{ surface: "chatgpt-main-chat" }, { surface: "chatgpt-quick-chat" }]), "mixed");
+  assert.equal(summarizeBatchSurface([]), "unknown");
+  assert.throws(() => buildJobRouting("mixed"), /surface/i);
 });
 
 test("parses read-only and explicitly authorized bridge commands", () => {
@@ -279,6 +337,69 @@ test("validates generation batches that require fresh chats and a lifecycle ledg
   }), /reference|absolute/i);
 });
 
+test("allows original image generation without references while image edit still requires them", () => {
+  const originalGeneration = {
+    schemaVersion: 2,
+    jobType: "image-generation",
+    conversationMode: "fresh-per-job",
+    retentionDays: 7,
+    lifecycleLedgerPath: "C:\\state\\chatgpt-generation-conversations.json",
+    jobs: [{
+      id: "original-a",
+      prompt: "Generate one original portrait without using a reference image.",
+      references: [],
+    }],
+  };
+  const validatedGeneration = validateBridgeBatch(originalGeneration);
+  assert.deepEqual(validatedGeneration, originalGeneration);
+  assert.ok(Object.isFrozen(validatedGeneration.jobs[0].references));
+
+  const imageEdit = {
+    ...originalGeneration,
+    jobType: "image-edit",
+    jobs: [{
+      id: "edit-a",
+      prompt: "Edit the supplied reference image.",
+      references: [{ path: "C:\\refs\\edit-a.webp", sha256: "e".repeat(64) }],
+    }],
+  };
+  assert.deepEqual(validateBridgeBatch(imageEdit), imageEdit);
+  assert.throws(() => validateBridgeBatch({
+    ...imageEdit,
+    jobs: [{ ...imageEdit.jobs[0], references: [] }],
+  }), /image-edit.*1-8.*reference|reference.*1-8/i);
+  assert.throws(() => validateBridgeBatch({
+    ...imageEdit,
+    jobs: [{ id: "edit-a", prompt: "Edit the supplied reference image." }],
+  }), /image-edit.*1-8.*reference|reference.*1-8/i);
+  assert.throws(() => validateBridgeBatch({
+    ...originalGeneration,
+    jobs: [{
+      ...originalGeneration.jobs[0],
+      references: Array.from({ length: 9 }, (_, index) => ({
+        path: `C:\\refs\\generation-${index}.png`,
+        sha256: "f".repeat(64),
+      })),
+    }],
+  }), /image-generation.*0-8.*reference|reference.*0-8/i);
+});
+
+test("zero-reference generation skips attachment upload and preserves an empty reference list", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const attachmentStart = source.indexOf("async function attachJobReferences");
+  const submissionStart = source.indexOf("async function submitJob", attachmentStart);
+  const collectionStart = source.indexOf("async function collectJob", submissionStart);
+  assert.ok(attachmentStart >= 0 && submissionStart > attachmentStart && collectionStart > submissionStart);
+
+  const attachmentSource = source.slice(attachmentStart, submissionStart);
+  const noReferences = attachmentSource.indexOf("if (!job.references?.length) return;");
+  const referenceVerification = attachmentSource.indexOf("await verifyJobReferences(job);");
+  assert.ok(noReferences >= 0 && referenceVerification > noReferences);
+
+  const submissionSource = source.slice(submissionStart, collectionStart);
+  assert.match(submissionSource, /references:\s*job\.references\s*\|\|\s*\[\]/);
+});
+
 test("attachment discovery uses visible upload controls without private APIs", () => {
   const expression = buildAttachmentButtonExpression();
   assert.match(expression, /Attach|添加|上传|文件/i);
@@ -341,6 +462,18 @@ test("main ChatGPT fallback uses only visible new-chat and blank-surface gates",
   assert.doesNotMatch(entry + newConversation + blank, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
 });
 
+test("retained main-surface fallback is collected before the next job can replace its dialog", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function runBatch");
+  const end = source.indexOf("async function runResume", start);
+  const runBatchSource = source.slice(start, end);
+  assert.match(runBatchSource, /opened\.prepared\.surface\s*===\s*"chatgpt-main-chat"/);
+  assert.match(runBatchSource, /await collectJob\(session,\s*submission,\s*options\.timeoutMs\)/);
+  const immediateCollection = runBatchSource.indexOf("await collectJob(session, submission, options.timeoutMs)");
+  const deferredCollection = runBatchSource.indexOf("const collected = await Promise.all");
+  assert.ok(immediateCollection >= 0 && immediateCollection < deferredCollection);
+});
+
 test("embedded Quick chat uses its visible DOM conversation identity and snapshot root", () => {
   const identity = buildMainChatConversationIdExpression();
   const snapshot = buildConversationSnapshotExpression("CODEX-BRIDGE-test-job", "main-chat");
@@ -360,6 +493,7 @@ test("validates explicit read-only resume manifests", () => {
       conversationId: "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de",
       marker: "CODEX-BRIDGE-c39c8a08-image-a",
       title: "二次元背景设计",
+      surface: "chatgpt-quick-chat",
     }],
   };
   assert.deepEqual(validateResumeManifest(manifest), manifest);
@@ -378,6 +512,7 @@ test("validates explicit read-only resume manifests", () => {
       id: manifest.jobs[0].id,
       conversationId: manifest.jobs[0].conversationId,
       marker: manifest.jobs[0].marker,
+      surface: "chatgpt-quick-chat",
     }],
   };
   assert.deepEqual(validateResumeManifest(directManifest), directManifest);
@@ -394,6 +529,10 @@ test("validates explicit read-only resume manifests", () => {
     jobs: [{ ...mainManifest.jobs[0], promptHash: "a".repeat(64) }],
   };
   assert.deepEqual(validateResumeManifest(lifecycleManifest), lifecycleManifest);
+  assert.throws(() => validateResumeManifest({
+    ...manifest,
+    jobs: [{ ...manifest.jobs[0], surface: undefined }],
+  }), /surface|resume/i);
   assert.throws(() => validateResumeManifest({
     ...manifest,
     jobs: [{ ...manifest.jobs[0], title: "" }],
@@ -807,12 +946,15 @@ test("supports the current Codex quick-chat service export", () => {
   assert.equal(quickChatWaveSize("26.715.10079.0", 0), 2);
 });
 
-test("keeps prewarm and renderer-ready helpers isolated from fresh production", () => {
+test("leaves renderer-ready to the owned Quick chat renderer after the prewarm gate", () => {
   const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
   const start = source.indexOf("async function openNativeQuickChat");
   const end = source.indexOf("async function selectHistoryConversation", start);
   const freshOpenPath = source.slice(start, end);
-  assert.doesNotMatch(freshOpenPath, /buildQuickChatPrewarmExpression|buildQuickChatRendererReadyExpression|renderer-ready/);
+  assert.match(freshOpenPath, /buildQuickChatPrewarmExpression/);
+  assert.match(freshOpenPath, /selectCdpPageTargetById/);
+  assert.match(freshOpenPath, /selectOwnedQuickChatTarget/);
+  assert.doesNotMatch(freshOpenPath, /buildQuickChatRendererReadyExpression/);
   assert.throws(() => buildQuickChatPrewarmExpression("26.999.0.0"), /unsupported|version/i);
   assert.throws(() => buildQuickChatRendererReadyExpression("26.999.0.0", "local-chatgpt:3da06710-f874-437a-8ab1-71bc25e58afc"), /unsupported|version/i);
 });

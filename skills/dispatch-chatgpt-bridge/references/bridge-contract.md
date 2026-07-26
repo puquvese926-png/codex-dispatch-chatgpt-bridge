@@ -32,21 +32,27 @@ All image generation and image editing use:
     {
       "id": "candidate-a",
       "prompt": "完整且已批准的提示词 A",
-      "references": [
-        { "path": "C:\\absolute\\references\\camera.png", "sha256": "64-character-lowercase-sha256" }
-      ]
+      "references": []
     }
   ]
 }
 ```
 
-`jobType` is `image-generation` or `image-edit`. Every job requires 1–8 local PNG/JPEG/WebP references with approved hashes and receives a unique new conversation. Native Quick chat uses `local-chatgpt:<uuid>`; the full integrated main ChatGPT surface may use its exact active `local:<uuid>` thread identity. The bridge verifies every file before opening any chat, then attaches it through the visible file input. A later iteration is another batch and another conversation.
+`jobType` is `image-generation` or `image-edit`. Every v2 job requires an explicit `references` array and receives a unique new conversation:
+
+- Original `image-generation` uses `references: []`.
+- Reference-guided `image-generation` accepts 1–8 local PNG/JPEG/WebP references with approved hashes.
+- `image-edit` requires 1–8 local PNG/JPEG/WebP references with approved hashes.
+
+Native Quick chat uses `local-chatgpt:<uuid>`; the full integrated main ChatGPT surface may use its exact active `local:<uuid>` thread identity. Before opening any chat, the bridge verifies every supplied file's absolute path, supported type, size and SHA-256. It skips the visible attachment workflow only when an original `image-generation` job has an empty list. Empty references never weaken the fresh-conversation, prompt, lifecycle, artifact or cleanup checks. A later iteration is another batch and another conversation.
 
 Prompts are non-empty, at most 30,000 characters and preserved exactly. IDs are unique lowercase kebab-case. Unknown fields are rejected.
 
 ## Resume
 
-Resume performs no send. With a title, it opens a fresh recovery window, selects that exact visible history title and accepts the result only when the original marker is present. If a submitted job has no captured title, omit `title`: the bridge first reopens the exact original `local-chatgpt:<uuid>` read-only. If that local route no longer contains the marker, it may open a fresh blank recovery window and scan visible history rows that have their own item menu. This history fallback does not require the blank window to assume a synthetic conversation route; it must instead prove a blank composer and zero rendered conversation units before enumeration. It never returns unrelated content and accepts only the unique row whose opened conversation contains the original marker. A marker miss is `not-recovered`, never a resend.
+Resume performs no send. Every job must copy its exact per-job `surface`, `conversationId`, `marker` and `promptHash` from the original report. `surface` is mandatory: use `chatgpt-quick-chat` for a native Quick chat renderer and `chatgpt-main-chat` for the retained embedded/main surface. A `local-chatgpt:<uuid>` value can occur on either surface, so its shape is not a routing signal. The report's top-level `surface` is a command transport summary; only the per-job field is authoritative for recovery.
+
+With a title, native Quick chat recovery opens a fresh recovery window, selects that exact visible history title and accepts the result only when the original marker is present. If a submitted native Quick chat job has no captured title, omit `title`: the bridge first reopens the exact original `local-chatgpt:<uuid>` read-only. If that local route no longer contains the marker, it may open a fresh blank recovery window and scan visible history rows that have their own item menu. This history fallback does not require the blank window to assume a synthetic conversation route; it must instead prove a blank composer and zero rendered conversation units before enumeration. Main-surface recovery attaches only to the verified retained renderer and requires the exact active conversation identity plus marker. It never returns unrelated content and accepts only the unique proven conversation. A marker miss is `not-recovered`, never a resend.
 
 ```json
 {
@@ -55,6 +61,8 @@ Resume performs no send. With a title, it opens a fresh recovery window, selects
     "id": "candidate-a",
     "conversationId": "local-chatgpt:00000000-0000-4000-8000-000000000000",
     "marker": "CODEX-BRIDGE-12345678-candidate-a",
+    "promptHash": "64-character-lowercase-sha256",
+    "surface": "chatgpt-quick-chat",
     "title": "ChatGPT 历史列表中的唯一标题"
   }]
 }
@@ -68,7 +76,9 @@ Direct recovery without a captured title:
   "jobs": [{
     "id": "candidate-a",
     "conversationId": "local-chatgpt:00000000-0000-4000-8000-000000000000",
-    "marker": "CODEX-BRIDGE-12345678-candidate-a"
+    "marker": "CODEX-BRIDGE-12345678-candidate-a",
+    "promptHash": "64-character-lowercase-sha256",
+    "surface": "chatgpt-main-chat"
   }]
 }
 ```
@@ -85,7 +95,7 @@ The watch manifest contains `schemaVersion`, the pinned `conversationId`, `surfa
 
 ## Lifecycle ledger
 
-Schema-v2 batches append one entry per GPT conversation. An entry is cleanup-eligible only when:
+Schema-v2 batches append one entry per GPT conversation. Current entries preserve the per-job `surface` used for recovery. A failed read-only recovery remains in its own report and does not overwrite the original submitted status, run ID or report path in the ledger. Existing older entries without `surface` remain readable but must obtain the recovery surface from their original batch report. An entry is cleanup-eligible only when:
 
 - job type is image generation/edit;
 - status is `complete`;
@@ -124,6 +134,6 @@ Any selector, identity or hash uncertainty fails closed. Failed deletion remains
 
 ## Results
 
-Reports preserve job status, conversation ID, marker, promptHash, captured history title, assistant text metadata, image dimensions, artifact paths, bytes and SHA-256. Reports omit credentials and embedded image bytes.
+Reports preserve job status, conversation ID, marker, promptHash, per-job `surface`, routing (`requestedSurface`, `selectedSurface`, and nullable `fallbackReason`), captured history title, assistant text metadata, image dimensions, artifact paths, bytes and SHA-256. The top-level `surface` is a transport summary: `chatgpt-quick-chat`, `chatgpt-main-chat`, `mixed`, or `unknown`; it is not a durable conversation identity. Reports omit credentials and embedded image bytes.
 
 The pinned client currently permits two owned quick-chat windows per wave. Existing user windows reduce capacity and are never closed or deleted by the bridge.

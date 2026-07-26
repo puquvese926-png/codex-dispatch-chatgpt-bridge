@@ -186,8 +186,14 @@ export function validateBridgeBatch(value) {
     }
     let references;
     if (value.schemaVersion === 2) {
-      if (!Array.isArray(job.references) || job.references.length < 1 || job.references.length > 8) {
-        throw new Error(`bridge job ${job.id} references must contain 1-8 image attachments`);
+      const minimumReferences = value.jobType === "image-edit" ? 1 : 0;
+      const referenceRange = `${minimumReferences}-8`;
+      if (!Array.isArray(job.references) ||
+          job.references.length < minimumReferences ||
+          job.references.length > 8) {
+        throw new Error(
+          `bridge job ${job.id} ${value.jobType} references must contain ${referenceRange} image attachments`,
+        );
       }
       references = job.references.map((reference, index) => {
         if (!isPlainObject(reference)) throw new Error(`bridge job ${job.id} reference ${index} is invalid`);
@@ -242,8 +248,8 @@ export function validateResumeManifest(value) {
         /[\u0000-\u001f\u007f]/u.test(job.title))) {
       throw new Error(`resume job ${job.id} title is invalid`);
     }
-    if (job.surface !== undefined && job.surface !== "chatgpt-main-chat") {
-      throw new Error(`resume job ${job.id} surface is invalid`);
+    if (!["chatgpt-quick-chat", "chatgpt-main-chat"].includes(job.surface)) {
+      throw new Error(`resume job ${job.id} surface must be chatgpt-quick-chat or chatgpt-main-chat`);
     }
     if (job.promptHash !== undefined && !/^[a-f0-9]{64}$/i.test(job.promptHash)) {
       throw new Error(`resume job ${job.id} promptHash is invalid`);
@@ -496,6 +502,19 @@ export function selectOwnedQuickChatTarget(
       throw new Error(`${label} quick-chat target identities are invalid`);
     }
   }
+  if (!failedTargetIds.has(prewarmTargetId)) {
+    const ownedPrewarm = targets.find((target) => {
+      try {
+        validatedDebuggerUrl(target, port);
+        const url = new URL(target.url);
+        return target.id === prewarmTargetId && target.type === "page" &&
+          url.protocol === "app:" && url.pathname === "/index.html";
+      } catch {
+        return false;
+      }
+    });
+    if (ownedPrewarm) return ownedPrewarm;
+  }
   const candidates = targets.filter((target) => {
     try {
       validatedDebuggerUrl(target, port);
@@ -555,7 +574,7 @@ export function buildQuickChatPrewarmExpression(codexVersion) {
   })()`;
 }
 
-export function buildQuickChatOpenExpression(codexVersion, conversationId, popoverBounds) {
+function quickChatOpenSpec(codexVersion, conversationId, popoverBounds) {
   const rpcModule = QUICK_CHAT_RPC_BY_VERSION.get(codexVersion);
   if (!rpcModule) throw new Error(`Unsupported Codex version for native quick chat: ${codexVersion}`);
   const serviceExport = QUICK_CHAT_SERVICE_EXPORT_BY_VERSION.get(codexVersion);
@@ -574,12 +593,38 @@ export function buildQuickChatOpenExpression(codexVersion, conversationId, popov
   if (bounds.width < 320 || bounds.height < 320) {
     throw new Error("Quick-chat popover dimensions are too small");
   }
+  return { rpcModule, serviceExport, bounds };
+}
+
+export function buildQuickChatOpenExpression(codexVersion, conversationId, popoverBounds) {
+  const { rpcModule, serviceExport, bounds } = quickChatOpenSpec(codexVersion, conversationId, popoverBounds);
   return `(async () => {
     const rpc = await import(${JSON.stringify(rpcModule)});
     const service = rpc[${JSON.stringify(serviceExport)}]?.quickChatWindow;
     if (!service?.open) throw new Error('Quick Chat window service is unavailable');
     await service.open(${JSON.stringify({ conversationId, popoverBounds: bounds })});
     return ${JSON.stringify(conversationId)};
+  })()`;
+}
+
+export function buildQuickChatOpenDispatchExpression(codexVersion, conversationId, popoverBounds) {
+  const { rpcModule, serviceExport, bounds } = quickChatOpenSpec(codexVersion, conversationId, popoverBounds);
+  const operationKey = `open:${conversationId}`;
+  return `(() => {
+    const store = globalThis.__codexChatBridgeLifecycle ||= Object.create(null);
+    const key = ${JSON.stringify(operationKey)};
+    store[key] = { state: 'starting' };
+    Promise.resolve().then(async () => {
+      const rpc = await import(${JSON.stringify(rpcModule)});
+      const service = rpc[${JSON.stringify(serviceExport)}]?.quickChatWindow;
+      if (!service?.open) throw new Error('Quick Chat window service is unavailable');
+      store[key] = { state: 'dispatched' };
+      await service.open(${JSON.stringify({ conversationId, popoverBounds: bounds })});
+      store[key] = { state: 'fulfilled' };
+    }).catch((error) => {
+      store[key] = { state: 'rejected', message: String(error?.message || error) };
+    });
+    return key;
   })()`;
 }
 
@@ -1469,6 +1514,48 @@ export function summarizeCollectedImages(images) {
   }));
 }
 
+export function buildJobRouting(selectedSurface, fallbackReason = null) {
+  if (!['chatgpt-quick-chat', 'chatgpt-main-chat'].includes(selectedSurface)) {
+    throw new Error("selected bridge surface is invalid");
+  }
+  if (fallbackReason !== null &&
+      (typeof fallbackReason !== "string" || !fallbackReason.trim())) {
+    throw new Error("bridge fallback reason is invalid");
+  }
+  return Object.freeze({
+    requestedSurface: "chatgpt-quick-chat",
+    selectedSurface,
+    fallbackReason,
+  });
+}
+
+export function summarizeBatchSurface(jobs) {
+  if (!Array.isArray(jobs)) throw new Error("bridge job list is invalid");
+  const surfaces = new Set(jobs
+    .map((job) => job?.surface)
+    .filter((surface) => typeof surface === "string"));
+  if (surfaces.size === 1) return [...surfaces][0];
+  if (surfaces.size > 1) return "mixed";
+  return "unknown";
+}
+
+export function isNativeQuickChatFallbackError(error) {
+  if (!(error instanceof Error)) return false;
+  return [
+    "quick-chat-control-session-open",
+    "quick-chat-prewarm",
+    "native quick-chat prewarm target",
+    "quick-chat-open",
+    "quick-chat-open-dispatch",
+    "native quick-chat owned target after open",
+    "native quick-chat open completion",
+    "quick-chat-conversation-session-open",
+    "native quick-chat exact conversation target after open",
+    "native quick-chat expected conversation route",
+    "native blank ChatGPT conversation",
+  ].some((stage) => error.message.includes(stage));
+}
+
 async function readStrictJson(file) {
   const bytes = await fs.readFile(file);
   const source = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -1716,8 +1803,22 @@ async function waitForQuickChatOperationDispatch(session, operation, conversatio
     if (status?.state === "failed" || status?.state === "rejected") {
       throw new Error(`${operation} dispatch ${status.state}: ${status.message || "unknown error"}`);
     }
-    return status?.state === "dispatched" ? status : null;
+    return ["dispatched", "fulfilled"].includes(status?.state) ? status : null;
   }, 10000, `native quick-chat ${operation} dispatch acknowledgement`);
+}
+
+async function waitForQuickChatOperationCompletion(session, operation, conversationId) {
+  return waitFor(async () => {
+    const status = await evaluateAtStage(
+      session,
+      buildQuickChatOperationStatusExpression(operation, conversationId),
+      `${operation}-completion-status`,
+    );
+    if (status?.state === "failed" || status?.state === "rejected") {
+      throw new Error(`${operation} dispatch ${status.state}: ${status.message || "unknown error"}`);
+    }
+    return status?.state === "fulfilled" ? status : null;
+  }, 30000, `native quick-chat ${operation} completion`);
 }
 
 async function waitFor(check, timeoutMs, label, intervalMs = 250) {
@@ -1764,28 +1865,80 @@ async function openNativeQuickChat(discovery, conversationId, index, {
     const targets = await fetchCdpJson(discovery.state.port, "/json/list");
     return selectCdpPageTargetById(targets, discovery.state.port, discovery.target.id);
   }, discovery.state.port, "quick-chat-control-session-open");
-  let openError = null;
+  let knownTargetIds = new Set();
+  let prewarmTargetId = null;
   try {
+    const initialTargets = await fetchCdpJson(discovery.state.port, "/json/list");
+    knownTargetIds = new Set(initialTargets
+      .map((target) => target?.id)
+      .filter((targetId) => typeof targetId === "string" && CDP_ID_PATTERN.test(targetId)));
+    await evaluateAtStage(
+      mainSession,
+      buildQuickChatPrewarmExpression(discovery.state.codexVersion),
+      "quick-chat-prewarm",
+      true,
+      30000,
+    );
+    prewarmTargetId = await waitFor(async () => {
+      const targets = await fetchCdpJson(discovery.state.port, "/json/list");
+      const target = selectNewOrUniquePrewarmQuickChatTarget(
+        targets,
+        discovery.state.port,
+        knownTargetIds,
+      );
+      return target ? target.id : null;
+    }, 30000, "native quick-chat prewarm target");
     const offset = (index % 4) * 28;
-    try {
-      const openedId = await evaluateAtStage(mainSession, buildQuickChatOpenExpression(
+    const popoverBounds = { x: 480 + offset, y: 60 + offset, width: 960, height: 900 };
+    await evaluateAtStage(
+      mainSession,
+      buildQuickChatOpenDispatchExpression(
         discovery.state.codexVersion,
         conversationId,
-        { x: 480 + offset, y: 60 + offset, width: 960, height: 900 },
-      ), "quick-chat-open", true, 30000);
-      if (openedId !== conversationId) throw new Error("Native quick-chat open returned an unexpected identity");
-    } catch (error) {
-      openError = error;
-    }
+        popoverBounds,
+      ),
+      "quick-chat-open-dispatch",
+      true,
+      10000,
+    );
+    await waitForQuickChatOperationDispatch(mainSession, "open", conversationId);
+    await waitFor(async () => {
+      const targets = await fetchCdpJson(discovery.state.port, "/json/list");
+      const target = selectCdpPageTargetById(targets, discovery.state.port, prewarmTargetId);
+      return target ? target.id : null;
+    }, 30000, "native quick-chat owned target after open");
+    await waitForQuickChatOperationCompletion(mainSession, "open", conversationId);
   } finally {
     mainSession.close();
   }
 
-  const session = await openCdpSessionAtStage(async (failedTargetIds) => {
-    const targets = await fetchCdpJson(discovery.state.port, "/json/list");
-    const target = selectQuickChatTarget(targets, discovery.state.port, conversationId);
-    return target && !failedTargetIds.has(target.id) ? target : null;
-  }, discovery.state.port, `quick-chat-conversation-session-open${openError ? ` after ${openError.message}` : ""}`, 30000);
+  let observedTargets = [];
+  let session;
+  try {
+    session = await openCdpSessionAtStage(async (failedTargetIds) => {
+      const targets = await fetchCdpJson(discovery.state.port, "/json/list");
+      observedTargets = targets
+        .filter((target) => target?.type === "page" && typeof target.url === "string" && target.url.startsWith("app://"))
+        .map((target) => ({
+          id: target.id,
+          title: target.title || "",
+          url: target.url,
+          type: target.type,
+        }))
+        .slice(0, 8);
+      const target = selectOwnedQuickChatTarget(
+        targets,
+        discovery.state.port,
+        conversationId,
+        prewarmTargetId,
+        knownTargetIds,
+        failedTargetIds,
+      );
+      return target && !failedTargetIds.has(target.id) ? target : null;
+    }, discovery.state.port, "quick-chat-conversation-session-open", 30000);
+  } catch (error) {
+    throw new Error(`${error.message}; observedTargets=${JSON.stringify(observedTargets)}`, { cause: error });
+  }
   try {
     if (requireExpectedRoute) {
       await waitFor(async () => {
@@ -2519,15 +2672,41 @@ async function runBatch(options, discovery) {
         try {
           const conversationId = `local-chatgpt:${randomUUID()}`;
           let opened;
+          let fallbackReason = null;
           try {
             opened = await openNativeQuickChat(discovery, conversationId, offset + localIndex);
           } catch (error) {
-            if (!error.message.includes("quick-chat-conversation-session-open")) throw error;
+            if (!isNativeQuickChatFallbackError(error)) throw error;
+            fallbackReason = error.message;
             opened = await openMainChatConversation(discovery, conversationId);
           }
           session = opened.session;
-          sessions.set(job.id, session);
-          submissions.push(await submitJob(session, opened.prepared, job, runId));
+          const submission = {
+            ...(await submitJob(session, opened.prepared, job, runId)),
+            routing: buildJobRouting(opened.prepared.surface, fallbackReason),
+          };
+          if (opened.prepared.surface === "chatgpt-main-chat") {
+            let collected = submission;
+            if (["submitted", "unknown-after-submit"].includes(submission.status)) {
+              try {
+                collected = await collectJob(session, submission, options.timeoutMs);
+              } catch (error) {
+                collected = {
+                  ...submission,
+                  status: "unknown-after-submit",
+                  completedAt: null,
+                  result: null,
+                  error: error.message,
+                };
+              }
+            }
+            submissions.push(collected);
+            await closeOwnedQuickChat(session);
+            session = null;
+          } else {
+            sessions.set(job.id, session);
+            submissions.push(submission);
+          }
         } catch (error) {
           if (session) await closeOwnedQuickChat(session);
           sessions.delete(job.id);
@@ -2589,7 +2768,7 @@ async function runBatch(options, discovery) {
     packageFullName: discovery.state.codexPackageFullName,
     port: discovery.state.port,
     browserId: discovery.state.browserId,
-    surface: "chatgpt-quick-chat",
+    surface: summarizeBatchSurface(jobs),
     requestedJobs: batch.jobs.length,
     completedJobs: completedCount,
     error: runError,
@@ -2774,7 +2953,7 @@ async function runResume(options, discovery) {
     packageFullName: discovery.state.codexPackageFullName,
     port: discovery.state.port,
     browserId: discovery.state.browserId,
-    surface: "chatgpt-quick-chat",
+    surface: summarizeBatchSurface(jobs),
     requestedJobs: manifest.jobs.length,
     completedJobs: completedCount,
     error: runError,

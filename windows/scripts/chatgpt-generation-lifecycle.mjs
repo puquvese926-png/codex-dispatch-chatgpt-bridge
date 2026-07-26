@@ -6,6 +6,13 @@ const SHA256 = /^[a-f0-9]{64}$/iu;
 const CONVERSATION = /^(?:local-chatgpt|local):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const MARKER = /^CODEX-BRIDGE-[A-Za-z0-9-]{3,180}$/u;
 const JOB_TYPES = new Set(["image-generation", "image-edit"]);
+const SURFACES = new Set(["chatgpt-quick-chat", "chatgpt-main-chat"]);
+const REPORT_SURFACES = new Set([...SURFACES, "mixed", "unknown"]);
+const RECOVERY_NO_PROGRESS_STATUSES = new Set([
+  "not-recovered",
+  "unknown-after-submit",
+  "timeout-after-submit",
+]);
 
 function fail(message) {
   throw new Error(message);
@@ -45,7 +52,7 @@ function plusDays(value, days) {
 export function buildLifecycleEntries(reportValue, optionsValue) {
   const report = object(reportValue, "bridge report");
   const options = object(optionsValue, "lifecycle options");
-  if (report.surface !== "chatgpt-quick-chat") fail("bridge report surface is invalid");
+  if (!REPORT_SURFACES.has(report.surface)) fail("bridge report surface is invalid");
   if (!Array.isArray(report.jobs) || report.jobs.length < 1) fail("bridge report jobs are missing");
   if (!JOB_TYPES.has(options.jobType)) fail("jobType must be image-generation or image-edit");
   if (!Number.isInteger(options.retentionDays) || options.retentionDays < 1 || options.retentionDays > 90) {
@@ -63,6 +70,7 @@ export function buildLifecycleEntries(reportValue, optionsValue) {
     if (!CONVERSATION.test(conversationId)) fail(`jobs[${index}].conversationId is invalid`);
     if (seen.has(conversationId)) fail("bridge report contains duplicate conversation IDs; fresh-per-job is required");
     seen.add(conversationId);
+    if (!SURFACES.has(job.surface)) fail(`jobs[${index}].surface is invalid`);
     if (!MARKER.test(job.marker || "")) fail(`jobs[${index}].marker is invalid`);
     if (!SHA256.test(job.promptHash || "")) fail(`jobs[${index}].promptHash is invalid`);
     const artifacts = Array.isArray(job.artifacts)
@@ -78,6 +86,7 @@ export function buildLifecycleEntries(reportValue, optionsValue) {
       runId: text(report.runId, "runId"),
       jobId: text(job.id, `jobs[${index}].id`),
       jobType: options.jobType,
+      surface: job.surface,
       conversationId,
       marker: job.marker,
       historyTitle,
@@ -108,6 +117,9 @@ export function validateConversationLifecycleLedger(value) {
     if (!MARKER.test(entry.marker || "")) fail(`entries[${index}].marker is invalid`);
     if (!SHA256.test(entry.promptHash || "")) fail(`entries[${index}].promptHash is invalid`);
     if (!JOB_TYPES.has(entry.jobType)) fail(`entries[${index}].jobType is invalid`);
+    if (entry.surface !== undefined && !SURFACES.has(entry.surface)) {
+      fail(`entries[${index}].surface is invalid`);
+    }
     const artifacts = Array.isArray(entry.artifacts)
       ? entry.artifacts.map((artifact, artifactIndex) => validateArtifact(artifact, `entries[${index}].artifacts[${artifactIndex}]`))
       : [];
@@ -145,8 +157,14 @@ export function mergeLifecycleEntries(ledgerValue, newEntriesValue) {
     if (existing && existing.promptHash !== validated.promptHash) {
       fail(`conversation ${validated.conversationId} cannot be rebound to another prompt`);
     }
+    if (existing &&
+        validated.runId !== existing.runId &&
+        RECOVERY_NO_PROGRESS_STATUSES.has(validated.status)) {
+      continue;
+    }
     merged.set(validated.conversationId, existing ? {
       ...validated,
+      surface: validated.surface || existing.surface,
       userRetention: existing.userRetention,
       cleanupStatus: existing.cleanupStatus,
       deletedAt: existing.deletedAt || null,
