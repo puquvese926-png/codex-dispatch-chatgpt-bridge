@@ -562,6 +562,46 @@ test("main ChatGPT entry is idempotent when the owned chat dialog is already vis
   }
 });
 
+test("stale pressed state cannot replace a visible owned main ChatGPT root", () => {
+  let clicks = 0;
+  const visibleRect = { width: 80, height: 40 };
+  const button = {
+    disabled: false,
+    innerText: "",
+    textContent: "",
+    getAttribute(name) {
+      if (name === "aria-label") return "Quick chat";
+      if (name === "aria-pressed") return "true";
+      return null;
+    },
+    getBoundingClientRect() {
+      return visibleRect;
+    },
+    getClientRects() {
+      return [visibleRect];
+    },
+    click() {
+      clicks += 1;
+    },
+  };
+  const originalDocument = globalThis.document;
+  const originalGetComputedStyle = globalThis.getComputedStyle;
+  globalThis.document = {
+    querySelectorAll(selector) {
+      if (selector === "button, [role=\"button\"]") return [button];
+      return [];
+    },
+  };
+  globalThis.getComputedStyle = () => ({ display: "block", visibility: "visible" });
+  try {
+    assert.equal(eval(buildMainChatEntryExpression()), true);
+    assert.equal(clicks, 1);
+  } finally {
+    globalThis.document = originalDocument;
+    globalThis.getComputedStyle = originalGetComputedStyle;
+  }
+});
+
 test("main fresh preparation can reopen the entry while waiting for the new-chat gate", () => {
   const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
   const openStart = source.indexOf("async function openMainChatConversation");

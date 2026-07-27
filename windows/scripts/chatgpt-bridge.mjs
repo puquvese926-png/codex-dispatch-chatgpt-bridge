@@ -845,7 +845,7 @@ export function buildMainChatEntryExpression() {
         dialog.querySelector('[contenteditable="true"][aria-label*="ChatGPT"], textarea[data-testid="prompt-textarea"]')
       );
     }) || null;
-    if (ownedDialog || chatModeButton || button?.getAttribute('aria-pressed') === 'true') return true;
+    if (ownedDialog || chatModeButton) return true;
     if (!button) return false;
     button.click();
     return true;

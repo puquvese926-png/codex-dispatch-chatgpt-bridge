@@ -183,9 +183,10 @@ Main-surface submission and collection hold an atomic rendered lease: the exact
 conversation identity and original marker must match in the same scoped snapshot
 before acknowledgement, before any launcher action, and on every collection
 poll. The `聊天` / `Quick chat` launcher is a toggle. Its missing or stale
-`aria-pressed` value is never permission to click while the task-owned dialog is
-already visible. Collection may reopen the entry only after the current lease is
-not visible, and it must prove the same lease again before consuming a result.
+`aria-pressed` value is neither proof that the surface is open nor permission to
+click while the task-owned dialog is already visible. Collection may reopen the
+entry only after the current lease is not visible, and it must prove the same
+lease again before consuming a result.
 
 Between serial jobs, a completed main-surface dialog may unmount asynchronously.
 The next fresh preparation refreshes the idempotent launcher from inside the
