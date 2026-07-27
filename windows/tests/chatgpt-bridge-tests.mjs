@@ -562,7 +562,7 @@ test("main ChatGPT entry is idempotent when the owned chat dialog is already vis
   }
 });
 
-test("stale pressed state cannot replace a visible owned main ChatGPT root", () => {
+test("main new-chat gate accepts an aria-only localized control", () => {
   let clicks = 0;
   const visibleRect = { width: 80, height: 40 };
   const button = {
@@ -570,8 +570,7 @@ test("stale pressed state cannot replace a visible owned main ChatGPT root", () 
     innerText: "",
     textContent: "",
     getAttribute(name) {
-      if (name === "aria-label") return "Quick chat";
-      if (name === "aria-pressed") return "true";
+      if (name === "aria-label") return "新聊天";
       return null;
     },
     getBoundingClientRect() {
@@ -584,37 +583,40 @@ test("stale pressed state cannot replace a visible owned main ChatGPT root", () 
       clicks += 1;
     },
   };
-  const originalDocument = globalThis.document;
-  const originalGetComputedStyle = globalThis.getComputedStyle;
-  globalThis.document = {
+  const dialog = {
+    disabled: false,
+    getAttribute() {
+      return null;
+    },
+    getBoundingClientRect() {
+      return visibleRect;
+    },
+    getClientRects() {
+      return [visibleRect];
+    },
     querySelectorAll(selector) {
       if (selector === "button, [role=\"button\"]") return [button];
       return [];
     },
   };
+  const originalDocument = globalThis.document;
+  const originalGetComputedStyle = globalThis.getComputedStyle;
+  globalThis.document = {
+    querySelectorAll(selector) {
+      if (selector === "button, [role=\"button\"]") return [button];
+      if (selector === "[data-pip-obstacle=\"quick-chat\"]") return [dialog];
+      if (selector === "[role=\"dialog\"]") return [dialog];
+      return [];
+    },
+  };
   globalThis.getComputedStyle = () => ({ display: "block", visibility: "visible" });
   try {
-    assert.equal(eval(buildMainChatEntryExpression()), true);
+    assert.equal(eval(buildMainChatNewConversationExpression()), true);
     assert.equal(clicks, 1);
   } finally {
     globalThis.document = originalDocument;
     globalThis.getComputedStyle = originalGetComputedStyle;
   }
-});
-
-test("main fresh preparation can reopen the entry while waiting for the new-chat gate", () => {
-  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
-  const openStart = source.indexOf("async function openMainChatConversation");
-  const recoveryStart = source.indexOf("async function openMainChatSubmittedConversation", openStart);
-  const openSource = source.slice(openStart, recoveryStart);
-  const waitStart = openSource.indexOf("await waitFor(async () =>");
-  const entryInsideWait = openSource.indexOf("buildMainChatEntryExpression()", waitStart);
-  const newGateInsideWait = openSource.indexOf("buildMainChatNewConversationExpression()", waitStart);
-
-  assert.ok(waitStart >= 0);
-  assert.ok(entryInsideWait > waitStart);
-  assert.ok(newGateInsideWait > entryInsideWait);
-  assert.match(openSource, /main-chat-new-conversation-entry-refresh/);
 });
 
 test("retained main-surface fallback is collected before the next job can replace its dialog", () => {

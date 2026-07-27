@@ -871,13 +871,23 @@ export function buildMainChatNewConversationExpression() {
     if (!dialog && !chatModeButton) return false;
     const scope = dialog || document;
     const button = [...scope.querySelectorAll('button, [role="button"]')]
-      .find((node) => visible(node) && (node.innerText || node.textContent || '').trim() === '新聊天');
+      .find((node) => {
+        if (!visible(node)) return false;
+        const labels = [
+          node.getAttribute('aria-label'),
+          node.getAttribute('title'),
+          node.innerText,
+          node.textContent
+        ].filter(Boolean).map((value) => value.trim());
+        return labels.some((value) => /^(?:新聊天|New chat)$/iu.test(value));
+      });
     if (button) {
       button.click();
       return true;
     }
     return [...scope.querySelectorAll('header, h1, h2, h3')]
-      .some((node) => visible(node) && (node.innerText || node.textContent || '').trim() === '新聊天');
+      .some((node) => visible(node) &&
+        /^(?:新聊天|New chat)$/iu.test((node.innerText || node.textContent || '').trim()));
   })()`;
 }
 
@@ -2093,25 +2103,13 @@ async function openMainChatConversation(discovery, conversationId) {
   }, discovery.state.port, "main-chat-session-open");
   session.ownsWindow = false;
   try {
-    let lastEntryRefreshAt = 0;
-    await waitFor(async () => {
-      const now = Date.now();
-      if (now - lastEntryRefreshAt >= 1000) {
-        await evaluateAtStage(
-          session,
-          buildMainChatEntryExpression(),
-          "main-chat-new-conversation-entry-refresh",
-          true,
-        );
-        lastEntryRefreshAt = now;
-      }
-      return evaluateAtStage(
-        session,
-        buildMainChatNewConversationExpression(),
-        "main-chat-new-conversation-click",
-        true,
-      );
-    }, 10000, "main ChatGPT new conversation control");
+    await evaluateAtStage(session, buildMainChatEntryExpression(), "main-chat-entry-open", true);
+    await waitFor(async () => evaluateAtStage(
+      session,
+      buildMainChatNewConversationExpression(),
+      "main-chat-new-conversation-click",
+      true,
+    ), 10000, "main ChatGPT new conversation control");
     const prepared = await waitFor(async () => {
       const url = await currentRendererUrl(session);
       const ready = await evaluateAtStage(session, buildMainChatBlankExpression(), "main-chat-blank-readiness");
