@@ -179,6 +179,14 @@ the capability to unknown.
 
 The default generation collection window is 600,000 ms. Values remain bounded to 5,000–900,000 ms. A `timeout-after-submit` is a valid durable outcome, not a pre-submit failure: content may have been sent and the exact job must remain sealed for read-only resume.
 
+Main-surface submission and collection hold an atomic rendered lease: the exact
+conversation identity and original marker must match in the same scoped snapshot
+before acknowledgement, before any launcher action, and on every collection
+poll. The `聊天` / `Quick chat` launcher is a toggle. Its missing or stale
+`aria-pressed` value is never permission to click while the task-owned dialog is
+already visible. Collection may reopen the entry only after the current lease is
+not visible, and it must prove the same lease again before consuming a result.
+
 The pinned client currently permits two owned Quick Chat windows per wave only
 when `-ExperimentalQuickChat` is explicitly selected and the current route plan
 allows an attempt. Existing user windows reduce capacity and are never closed or

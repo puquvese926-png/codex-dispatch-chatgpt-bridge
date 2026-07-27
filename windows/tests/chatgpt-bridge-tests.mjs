@@ -505,6 +505,63 @@ test("main ChatGPT fallback uses only visible new-chat and blank-surface gates",
   assert.doesNotMatch(entry + newConversation + blank, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
 });
 
+test("main ChatGPT entry is idempotent when the owned chat dialog is already visible", () => {
+  let clicks = 0;
+  const visibleRect = { width: 800, height: 600 };
+  const button = {
+    disabled: false,
+    innerText: "Quick chat",
+    textContent: "Quick chat",
+    getAttribute(name) {
+      if (name === "aria-label") return "Quick chat";
+      return null;
+    },
+    getBoundingClientRect() {
+      return visibleRect;
+    },
+    getClientRects() {
+      return [visibleRect];
+    },
+    click() {
+      clicks += 1;
+    },
+  };
+  const dialog = {
+    disabled: false,
+    getAttribute() {
+      return null;
+    },
+    getBoundingClientRect() {
+      return visibleRect;
+    },
+    getClientRects() {
+      return [visibleRect];
+    },
+    querySelector(selector) {
+      if (selector === "[data-above-composer-conversation-id]") return {};
+      return null;
+    },
+  };
+  const originalDocument = globalThis.document;
+  const originalGetComputedStyle = globalThis.getComputedStyle;
+  globalThis.document = {
+    querySelectorAll(selector) {
+      if (selector === "button, [role=\"button\"]") return [button];
+      if (selector === "[data-pip-obstacle=\"quick-chat\"]") return [dialog];
+      if (selector === "[role=\"dialog\"]") return [dialog];
+      return [];
+    },
+  };
+  globalThis.getComputedStyle = () => ({ display: "block", visibility: "visible" });
+  try {
+    assert.equal(eval(buildMainChatEntryExpression()), true);
+    assert.equal(clicks, 0);
+  } finally {
+    globalThis.document = originalDocument;
+    globalThis.getComputedStyle = originalGetComputedStyle;
+  }
+});
+
 test("retained main-surface fallback is collected before the next job can replace its dialog", () => {
   const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
   const start = source.indexOf("async function runBatch");
@@ -519,6 +576,26 @@ test("retained main-surface fallback is collected before the next job can replac
   const collectionEntry = source.indexOf("main-chat-collection-entry-open", collectStart);
   const navigate = source.indexOf("await navigateToConversation", collectStart);
   assert.ok(collectionEntry >= 0 && collectionEntry < navigate);
+});
+
+test("main collection verifies the submitted lease before touching the entry toggle", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const submitStart = source.indexOf("async function submitJob");
+  const collectStart = source.indexOf("async function collectJob", submitStart);
+  const closeStart = source.indexOf("async function closeOwnedQuickChat", collectStart);
+  const submitSource = source.slice(submitStart, collectStart);
+  const collectSource = source.slice(collectStart, closeStart);
+
+  assert.match(submitSource, /buildMainChatSubmissionLeaseExpression/);
+  assert.match(collectSource, /main-chat-current-submission-lease/);
+  const lease = collectSource.indexOf("buildMainChatSubmissionLeaseExpression");
+  const entry = collectSource.indexOf("buildMainChatEntryExpression");
+  assert.ok(lease >= 0 && entry > lease);
+  assert.doesNotMatch(
+    collectSource,
+    /currentConversationId\s*=\s*submission\.surface\s*===\s*"chatgpt-main-chat"\s*\?\s*submission\.conversationId/,
+  );
+  assert.match(collectSource, /main-chat-collection-lease-lost/);
 });
 
 test("product batch defaults to a long image-generation window and writes durable progress", () => {

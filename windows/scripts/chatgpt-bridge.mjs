@@ -837,9 +837,17 @@ export function buildMainChatEntryExpression() {
         .filter(Boolean).join(' ').trim();
       return visible(node) && /(?:当前模式|current mode)\\s*[:：]?\\s*ChatGPT/iu.test(label);
     });
-    if (!button) return Boolean(chatModeButton);
-    const dialogOpen = [...document.querySelectorAll('[role="dialog"]')].some(visible);
-    if (button.getAttribute('aria-pressed') !== 'true' || !dialogOpen) button.click();
+    const quickChatDialog = [...document.querySelectorAll('[data-pip-obstacle="quick-chat"]')].find(visible) || null;
+    const ownedDialog = quickChatDialog || [...document.querySelectorAll('[role="dialog"]')].find((dialog) => {
+      if (!visible(dialog)) return false;
+      return Boolean(
+        dialog.querySelector('[data-above-composer-conversation-id]') ||
+        dialog.querySelector('[contenteditable="true"][aria-label*="ChatGPT"], textarea[data-testid="prompt-textarea"]')
+      );
+    }) || null;
+    if (ownedDialog || chatModeButton) return true;
+    if (!button) return false;
+    button.click();
     return true;
   })()`;
 }
@@ -1124,6 +1132,24 @@ export function buildConversationSnapshotExpression(marker, surface = "quick-cha
       assistantText: latest?.text || '',
       images,
     };
+  })()`;
+}
+
+export function buildMainChatSubmissionLeaseExpression(conversationId, marker) {
+  if (!LOCAL_CHATGPT_ID_PATTERN.test(conversationId) && !LOCAL_THREAD_ID_PATTERN.test(conversationId)) {
+    throw new Error("main ChatGPT submission lease conversation identity is invalid");
+  }
+  if (typeof marker !== "string" || !marker || marker.length > 200 || /[\u0000-\u001f\u007f]/u.test(marker)) {
+    throw new Error("main ChatGPT submission lease marker is invalid");
+  }
+  return `(() => {
+    const expectedConversationId = ${JSON.stringify(conversationId)};
+    const conversationId = ${buildMainChatConversationIdExpression()};
+    if (conversationId !== expectedConversationId) {
+      return { conversationId, snapshot: null };
+    }
+    const snapshot = ${buildConversationSnapshotExpression(marker, "main-chat")};
+    return { conversationId, snapshot };
   })()`;
 }
 
@@ -2262,12 +2288,20 @@ async function submitJob(session, prepared, job, runId) {
   };
   try {
     const acknowledged = await waitFor(async () => {
-      const currentId = submission.surface === "chatgpt-main-chat" ?
-        submission.conversationId : conversationIdFromAppUrl(await currentRendererUrl(session));
+      if (submission.surface === "chatgpt-main-chat") {
+        const lease = await evaluateAtStage(
+          session,
+          buildMainChatSubmissionLeaseExpression(submission.conversationId, marker),
+          "main-chat-submission-acknowledgement",
+        );
+        return lease?.conversationId === prepared.conversationId && lease.snapshot?.markerPresent ?
+          lease.snapshot : null;
+      }
+      const currentId = conversationIdFromAppUrl(await currentRendererUrl(session));
       if (currentId !== prepared.conversationId) return null;
       const snapshot = await session.evaluate(buildConversationSnapshotExpression(
         marker,
-        submission.surface === "chatgpt-main-chat" ? "main-chat" : "quick-chat",
+        "quick-chat",
       ));
       return snapshot?.markerPresent ? snapshot : null;
     }, 10000, `submission acknowledgement for ${job.id}`);
@@ -2285,11 +2319,14 @@ async function submitJob(session, prepared, job, runId) {
 async function navigateToConversation(session, submission) {
   if (submission.surface === "chatgpt-main-chat") {
     return waitFor(async () => {
-      const identity = await session.evaluate(buildMainChatConversationIdExpression());
-      if (identity !== submission.conversationId) return null;
-      const snapshot = await session.evaluate(buildConversationSnapshotExpression(submission.marker, "main-chat"));
-      return snapshot?.markerPresent ? snapshot : null;
-    }, 15000, `main ChatGPT conversation navigation for ${submission.id}`);
+      const lease = await evaluateAtStage(
+        session,
+        buildMainChatSubmissionLeaseExpression(submission.conversationId, submission.marker),
+        "main-chat-post-submit-lease-read",
+      );
+      return lease?.conversationId === submission.conversationId && lease.snapshot?.markerPresent ?
+        lease.snapshot : null;
+    }, 15000, `main-chat-post-submit-lease for ${submission.id}`);
   }
   const currentId = conversationIdFromAppUrl(await currentRendererUrl(session));
   if (currentId !== submission.conversationId) {
@@ -2311,12 +2348,20 @@ async function navigateToConversation(session, submission) {
 
 async function collectJob(session, submission, timeoutMs) {
   if (submission.surface === "chatgpt-main-chat") {
-    await evaluateAtStage(
+    const currentLease = await evaluateAtStage(
       session,
-      buildMainChatEntryExpression(),
-      "main-chat-collection-entry-open",
-      true,
+      buildMainChatSubmissionLeaseExpression(submission.conversationId, submission.marker),
+      "main-chat-current-submission-lease",
     );
+    if (currentLease?.conversationId !== submission.conversationId ||
+        !currentLease.snapshot?.markerPresent) {
+      await evaluateAtStage(
+        session,
+        buildMainChatEntryExpression(),
+        "main-chat-collection-entry-open",
+        true,
+      );
+    }
   }
   await navigateToConversation(session, submission);
   const deadline = Date.now() + timeoutMs;
@@ -2324,12 +2369,23 @@ async function collectJob(session, submission, timeoutMs) {
   let previousSignature = null;
   while (Date.now() < deadline) {
     const currentUrl = await currentRendererUrl(session);
-    const currentConversationId = submission.surface === "chatgpt-main-chat" ?
-      submission.conversationId : conversationIdFromAppUrl(currentUrl);
-    const snapshot = await session.evaluate(buildConversationSnapshotExpression(
-      submission.marker,
-      submission.surface === "chatgpt-main-chat" ? "main-chat" : "quick-chat",
-    ));
+    let currentConversationId;
+    let snapshot;
+    if (submission.surface === "chatgpt-main-chat") {
+      const lease = await evaluateAtStage(
+        session,
+        buildMainChatSubmissionLeaseExpression(submission.conversationId, submission.marker),
+        "main-chat-collection-lease",
+      );
+      currentConversationId = lease?.conversationId || null;
+      snapshot = lease?.snapshot || null;
+    } else {
+      currentConversationId = conversationIdFromAppUrl(currentUrl);
+      snapshot = await session.evaluate(buildConversationSnapshotExpression(
+        submission.marker,
+        "quick-chat",
+      ));
+    }
     const signature = JSON.stringify({ text: snapshot?.assistantText || "", images: snapshot?.images || [] });
     stablePolls = signature === previousSignature ? stablePolls + 1 : 0;
     previousSignature = signature;
@@ -2345,7 +2401,10 @@ async function collectJob(session, submission, timeoutMs) {
       stablePolls,
     });
     if (classification === "unknown-after-submit") {
-      return { ...submission, status: classification, completedAt: null, result: null };
+      const error = submission.surface === "chatgpt-main-chat" ?
+        `main-chat-collection-lease-lost for ${submission.id}` :
+        `conversation identity changed during collection for ${submission.id}`;
+      return { ...submission, status: classification, completedAt: null, result: null, error };
     }
     if (classification === "complete") {
       const images = await materializeRenderedImages(session, snapshot.images || []);

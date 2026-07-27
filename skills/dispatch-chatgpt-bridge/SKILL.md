@@ -164,6 +164,8 @@ Some clients keep the integrated ChatGPT surface active in the main renderer wit
 
 Main-surface post-submit acknowledgement and collection must use the same dialog-scoped rendered-unit/image snapshot. A global Codex `停止` button or Codex message unit is never evidence that the ChatGPT generation is still busy.
 
+The main ChatGPT entry control is a toggle, not an idempotent open command. If the exact task-owned dialog is already visible, never click that control again merely because `aria-pressed` is absent. After send, preserve one atomic lease consisting of the exact conversation identity plus original marker: verify it before any entry-control action and on every collection poll. Reopen the entry only when that lease is not currently visible, then require the same lease again before collecting.
+
 Image generation uses a ten-minute default collection window (`-TimeoutMs 600000`) because server-side image rendering can outlast a short text-task timeout. The caller may set another bounded value up to fifteen minutes. A timeout remains `timeout-after-submit`: content may already have been sent, the conversation is sealed, and the bridge never resends it.
 
 Every mutating batch writes a durable progress sidecar beside the requested report as `<report>.progress.json`. It is updated before submission, immediately after submission, after each collection result, and at finalization. It contains only task identity, status, timestamps, routing and artifact metadata; it never contains the prompt body or credentials. If an outer shell times out while the bridge child continues, read this sidecar and do not start another batch. Use `-Detach` when the caller cannot keep a synchronous parent process alive.
