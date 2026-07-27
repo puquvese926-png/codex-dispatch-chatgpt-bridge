@@ -19,6 +19,13 @@ import {
   validateHandoffApprovalManifest,
   validateHandoffWatchManifest,
 } from "./chatgpt-handoff-protocol.mjs";
+import {
+  acquireBridgeControllerLock,
+  buildDispatchPlan,
+  readQuickChatHealth,
+  recordQuickChatHealth,
+  releaseBridgeControllerLock,
+} from "./chatgpt-bridge-product-control.mjs";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 const ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -57,6 +64,7 @@ const defaultStatePath = path.join(
   "CodexChatGPTBridge",
   "state.json",
 );
+export const DEFAULT_TIMEOUT_MS = 600000;
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value) &&
@@ -86,6 +94,59 @@ function requireAbsolute(value, label) {
   return path.win32.normalize(value);
 }
 
+export function batchProgressPath(reportPath) {
+  return `${requireAbsolute(reportPath, "report path")}.progress.json`;
+}
+
+function progressJob(value) {
+  const job = isPlainObject(value) ? value : {};
+  return {
+    id: typeof job.id === "string" ? job.id : "unknown",
+    promptHash: typeof job.promptHash === "string" ? job.promptHash : null,
+    marker: typeof job.marker === "string" ? job.marker : null,
+    conversationId: typeof job.conversationId === "string" ? job.conversationId : null,
+    surface: typeof job.surface === "string" ? job.surface : null,
+    status: typeof job.status === "string" ? job.status : "pending",
+    submittedAt: typeof job.submittedAt === "string" ? job.submittedAt : null,
+    completedAt: typeof job.completedAt === "string" ? job.completedAt : null,
+    historyTitle: typeof job.historyTitle === "string" ? job.historyTitle : null,
+    routing: isPlainObject(job.routing) ? {
+      requestedSurface: job.routing.requestedSurface || null,
+      selectedSurface: job.routing.selectedSurface || null,
+      fallbackReason: job.routing.fallbackReason || null,
+    } : null,
+    artifactCount: Array.isArray(job.artifacts) ? job.artifacts.length : 0,
+    error: typeof job.error === "string" ? job.error : null,
+  };
+}
+
+export function buildBatchProgress(value) {
+  if (!isPlainObject(value)) throw new Error("batch progress must be an object");
+  const jobs = Array.isArray(value.jobs) ? value.jobs.map(progressJob) : [];
+  const state = value.state || "running";
+  if (!["running", "complete", "failed"].includes(state)) {
+    throw new Error("batch progress state is invalid");
+  }
+  const reportPath = requireAbsolute(value.reportPath, "report path");
+  return {
+    schemaVersion: 1,
+    command: "batch",
+    state,
+    runId: value.runId,
+    reportPath,
+    progressPath: batchProgressPath(reportPath),
+    startedAt: value.startedAt,
+    updatedAt: value.updatedAt || new Date().toISOString(),
+    requestedJobs: Number.isInteger(value.requestedJobs) ? value.requestedJobs : jobs.length,
+    submittedJobs: jobs.filter((job) => Boolean(job.submittedAt)).length,
+    completedJobs: jobs.filter((job) => job.status === "complete").length,
+    currentJobId: value.currentJobId || null,
+    dispatchPlan: isPlainObject(value.dispatchPlan) ? value.dispatchPlan : null,
+    error: value.error || null,
+    jobs,
+  };
+}
+
 export function parseBridgeArgs(argv) {
   if (!Array.isArray(argv) || !argv.length) throw new Error("A bridge command is required");
   const options = {
@@ -95,21 +156,26 @@ export function parseBridgeArgs(argv) {
     input: null,
     output: null,
     statePath: null,
-    timeoutMs: 180000,
+    experimentalQuickChat: false,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
   };
-  if (!["discover", "probe", "batch", "resume", "watch", "approve", "cleanup"].includes(options.command)) {
+  if (!["discover", "probe", "plan", "batch", "resume", "watch", "approve", "cleanup"].includes(options.command)) {
     throw new Error(`Unknown bridge command: ${options.command}`);
   }
   for (let index = 1; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--allow-send") options.allowSend = true;
     else if (argument === "--allow-delete") options.allowDelete = true;
+    else if (argument === "--experimental-quick-chat") options.experimentalQuickChat = true;
     else if (argument === "--input") options.input = argv[++index];
     else if (argument === "--output") options.output = argv[++index];
     else if (argument === "--state") options.statePath = argv[++index];
     else if (argument === "--timeout-ms") options.timeoutMs = Number(argv[++index]);
     else if (argument === "--poll-ms") options.pollMs = Number(argv[++index]);
     else throw new Error(`Unknown argument: ${argument}`);
+  }
+  if (options.experimentalQuickChat && !["plan", "batch"].includes(options.command)) {
+    throw new Error(`${options.command} does not accept experimental Quick Chat`);
   }
   if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 5000 || options.timeoutMs > 900000) {
     throw new Error("timeout-ms must be an integer between 5000 and 900000");
@@ -123,11 +189,14 @@ export function parseBridgeArgs(argv) {
     throw new Error(`${options.command} does not accept --poll-ms`);
   }
   if (options.statePath !== null) options.statePath = requireAbsolute(options.statePath, "state path");
-  if (["batch", "resume", "watch", "approve", "cleanup"].includes(options.command)) {
+  if (["plan", "batch", "resume", "watch", "approve", "cleanup"].includes(options.command)) {
     options.input = requireAbsolute(options.input, "input path");
     options.output = requireAbsolute(options.output, "output path");
     if (["batch", "approve"].includes(options.command) && !options.allowSend) {
       throw new Error(`${options.command} requires explicit --allow-send authorization`);
+    }
+    if (options.command === "plan" && options.allowSend) {
+      throw new Error("plan is read-only and does not accept --allow-send");
     }
     if (options.command === "resume" && options.allowSend) {
       throw new Error("resume is read-only and does not accept --allow-send");
@@ -144,7 +213,8 @@ export function parseBridgeArgs(argv) {
     if (options.command === "cleanup" && options.allowSend) {
       throw new Error("cleanup does not accept --allow-send");
     }
-  } else if (options.input !== null || options.output !== null || options.allowSend || options.allowDelete) {
+  } else if (options.input !== null || options.output !== null || options.allowSend ||
+      options.allowDelete || options.experimentalQuickChat) {
     throw new Error(`${options.command} does not accept batch mutation arguments`);
   }
   return options;
@@ -1514,16 +1584,23 @@ export function summarizeCollectedImages(images) {
   }));
 }
 
-export function buildJobRouting(selectedSurface, fallbackReason = null) {
+export function buildJobRouting(
+  selectedSurface,
+  fallbackReason = null,
+  requestedSurface = "chatgpt-quick-chat",
+) {
   if (!['chatgpt-quick-chat', 'chatgpt-main-chat'].includes(selectedSurface)) {
     throw new Error("selected bridge surface is invalid");
+  }
+  if (!['chatgpt-quick-chat', 'chatgpt-main-chat'].includes(requestedSurface)) {
+    throw new Error("requested bridge surface is invalid");
   }
   if (fallbackReason !== null &&
       (typeof fallbackReason !== "string" || !fallbackReason.trim())) {
     throw new Error("bridge fallback reason is invalid");
   }
   return Object.freeze({
-    requestedSurface: "chatgpt-quick-chat",
+    requestedSurface,
     selectedSurface,
     fallbackReason,
   });
@@ -1537,6 +1614,14 @@ export function summarizeBatchSurface(jobs) {
   if (surfaces.size === 1) return [...surfaces][0];
   if (surfaces.size > 1) return "mixed";
   return "unknown";
+}
+
+export function summarizeBatchError(runError, jobs) {
+  if (!Array.isArray(jobs)) throw new Error("bridge job list is invalid");
+  const jobErrors = jobs
+    .filter((job) => job?.status !== "complete")
+    .map((job) => `${job.id}: ${job.status}${job.error ? ` (${job.error})` : ""}`);
+  return [...new Set([runError, ...jobErrors].filter((value) => typeof value === "string" && value.trim()))].join("; ") || null;
 }
 
 export function isNativeQuickChatFallbackError(error) {
@@ -1560,6 +1645,19 @@ async function readStrictJson(file) {
   const bytes = await fs.readFile(file);
   const source = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   return JSON.parse(source);
+}
+
+async function assertNoRunningBatchProgress(progressPath) {
+  try {
+    const progress = await readStrictJson(progressPath);
+    if (progress?.state === "running") {
+      throw new Error(`batch progress is already running: ${progress.runId || "unknown run"}`);
+    }
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    if (error instanceof SyntaxError) throw new Error(`batch progress is invalid: ${progressPath}`);
+    throw error;
+  }
 }
 
 async function fetchCdpJson(port, resource) {
@@ -2003,12 +2101,24 @@ async function openMainChatSubmittedConversation(discovery, conversationId, mark
   session.ownsWindow = false;
   try {
     await evaluateAtStage(session, buildMainChatEntryExpression(), "main-chat-recovery-entry-open", true);
-    await waitFor(async () => {
-      const identity = await session.evaluate(buildMainChatConversationIdExpression());
-      if (identity !== conversationId) return null;
-      const snapshot = await session.evaluate(buildConversationSnapshotExpression(marker, "main-chat"));
-      return snapshot?.markerPresent ? snapshot : null;
-    }, 30000, "main ChatGPT submitted marker");
+    let directError = null;
+    try {
+      await waitFor(async () => {
+        const identity = await session.evaluate(buildMainChatConversationIdExpression());
+        if (identity !== conversationId) return null;
+        const snapshot = await session.evaluate(buildConversationSnapshotExpression(marker, "main-chat"));
+        return snapshot?.markerPresent ? snapshot : null;
+      }, 15000, "main ChatGPT submitted marker");
+    } catch (error) {
+      directError = error;
+    }
+    if (directError) {
+      await discoverHistoryConversation(session, {
+        id: "main-recovery",
+        conversationId,
+        marker,
+      }, "main-chat");
+    }
     return {
       session,
       prepared: {
@@ -2023,7 +2133,7 @@ async function openMainChatSubmittedConversation(discovery, conversationId, mark
   }
 }
 
-async function selectHistoryConversation(session, job) {
+async function selectHistoryConversation(session, job, surface = "quick-chat") {
   await waitFor(async () => session.evaluate(`(() => [...document.querySelectorAll('button')]
     .some((button) => button.getAttribute('aria-label') === ${JSON.stringify(job.title)}))()`),
   10000, `ChatGPT history title for ${job.id}`);
@@ -2036,12 +2146,16 @@ async function selectHistoryConversation(session, job) {
   })()`, true);
   if (!clicked) throw new Error(`ChatGPT history title did not open for ${job.id}`);
   return waitFor(async () => {
-    const snapshot = await session.evaluate(buildConversationSnapshotExpression(job.marker));
+    if (surface === "main-chat") {
+      const identity = await session.evaluate(buildMainChatConversationIdExpression());
+      if (identity !== job.conversationId) return null;
+    }
+    const snapshot = await session.evaluate(buildConversationSnapshotExpression(job.marker, surface));
     return snapshot?.markerPresent ? snapshot : null;
   }, 20000, `ChatGPT history marker for ${job.id}`);
 }
 
-async function discoverHistoryConversation(session, job) {
+async function discoverHistoryConversation(session, job, surface = "quick-chat") {
   const titles = await evaluateAtStage(session, buildHistoryTitleListExpression(), "history-title-list");
   if (!Array.isArray(titles) || titles.some((title) => typeof title !== "string")) {
     throw new Error(`ChatGPT history title list is invalid for ${job.id}`);
@@ -2056,12 +2170,27 @@ async function discoverHistoryConversation(session, job) {
     })()`, `history-row-open:${title}`, true);
     if (!clicked) continue;
     try {
-      const found = await waitFor(async () => evaluateAtStage(
-        session,
-        buildMarkerPresenceExpression(job.marker),
-        `history-marker-scan:${title}`,
-      ),
-        3000, `ChatGPT history marker scan for ${job.id}`);
+      const found = await waitFor(async () => {
+        if (surface === "main-chat") {
+          const identity = await evaluateAtStage(
+            session,
+            buildMainChatConversationIdExpression(),
+            `history-conversation-identity:${title}`,
+          );
+          if (identity !== job.conversationId) return null;
+          const snapshot = await evaluateAtStage(
+            session,
+            buildConversationSnapshotExpression(job.marker, "main-chat"),
+            `history-marker-scan:${title}`,
+          );
+          return snapshot?.markerPresent ? snapshot : null;
+        }
+        return evaluateAtStage(
+          session,
+          buildMarkerPresenceExpression(job.marker),
+          `history-marker-scan:${title}`,
+        );
+      }, 3000, `ChatGPT history marker scan for ${job.id}`);
       if (found) return title;
     } catch {}
   }
@@ -2181,6 +2310,14 @@ async function navigateToConversation(session, submission) {
 }
 
 async function collectJob(session, submission, timeoutMs) {
+  if (submission.surface === "chatgpt-main-chat") {
+    await evaluateAtStage(
+      session,
+      buildMainChatEntryExpression(),
+      "main-chat-collection-entry-open",
+      true,
+    );
+  }
   await navigateToConversation(session, submission);
   const deadline = Date.now() + timeoutMs;
   let stablePolls = 0;
@@ -2646,20 +2783,108 @@ async function recordGenerationLifecycle(batch, report, reportPath) {
   return { path: batch.lifecycleLedgerPath, recordedEntries: entries.length };
 }
 
+async function recordGenerationCheckpoint(batch, runId, jobs, reportPath) {
+  if (batch.schemaVersion !== 2) return null;
+  const retainedJobs = jobs.filter((job) => job?.conversationId && job?.surface && job?.submittedAt);
+  if (!retainedJobs.length) return null;
+  return recordGenerationLifecycle(batch, {
+    runId,
+    surface: summarizeBatchSurface(retainedJobs),
+    jobs: retainedJobs,
+  }, reportPath);
+}
+
+async function inspectDispatchPlan(options, discovery, batch) {
+  const probe = await probeBridge(discovery);
+  const targets = await fetchCdpJson(discovery.state.port, "/json/list");
+  const occupiedQuickChatWindows = targets.filter((target) => {
+    try { return conversationIdFromAppUrl(target.url) !== null; } catch { return false; }
+  }).length;
+  const quickChatHealth = await readQuickChatHealth(discovery.statePath, {
+    browserId: discovery.state.browserId,
+    codexVersion: discovery.state.codexVersion,
+  });
+  return buildDispatchPlan({
+    requestedJobs: batch.jobs.length,
+    timeoutMs: options.timeoutMs,
+    mainChatAvailable: Boolean(probe.probe?.chatEntry),
+    experimentalQuickChat: options.experimentalQuickChat,
+    quickChatLimit: QUICK_CHAT_WINDOW_LIMIT_BY_VERSION.get(discovery.state.codexVersion) || 0,
+    occupiedQuickChatWindows,
+    quickChatHealth,
+  });
+}
+
+async function runPlan(options, discovery) {
+  const batch = validateBridgeBatch(await readStrictJson(options.input));
+  if (batch.schemaVersion === 2) {
+    await Promise.all(batch.jobs.map((job) => verifyJobReferences(job)));
+  }
+  const dispatchPlan = await inspectDispatchPlan(options, discovery, batch);
+  const report = {
+    schemaVersion: 1,
+    pass: dispatchPlan.selectedMode !== "unavailable",
+    command: "plan",
+    plannedAt: new Date().toISOString(),
+    codexVersion: discovery.state.codexVersion,
+    packageFullName: discovery.state.codexPackageFullName,
+    port: discovery.state.port,
+    browserId: discovery.state.browserId,
+    requestedJobs: batch.jobs.length,
+    timeoutMs: options.timeoutMs,
+    dispatchPlan,
+  };
+  await writeJsonAtomically(options.output, report);
+  return report;
+}
+
 async function runBatch(options, discovery) {
   const batch = validateBridgeBatch(await readStrictJson(options.input));
   if (batch.schemaVersion === 2) {
     await Promise.all(batch.jobs.map((job) => verifyJobReferences(job)));
   }
+  const dispatchPlan = await inspectDispatchPlan(options, discovery, batch);
+  if (dispatchPlan.selectedMode === "unavailable") {
+    throw new Error(dispatchPlan.userNotice);
+  }
   const runId = randomUUID();
   const startedAt = new Date().toISOString();
   const jobs = [];
   let runError = null;
-  const initialTargets = await fetchCdpJson(discovery.state.port, "/json/list");
-  const occupiedWindows = initialTargets.filter((target) => {
-    try { return conversationIdFromAppUrl(target.url) !== null; } catch { return false; }
-  }).length;
-  const waveSize = quickChatWaveSize(discovery.state.codexVersion, occupiedWindows);
+  const progressPath = batchProgressPath(options.output);
+  await assertNoRunningBatchProgress(progressPath);
+  let progressJobs = batch.jobs.map((job) => ({
+    id: job.id,
+    promptHash: createHash("sha256").update(job.prompt, "utf8").digest("hex"),
+    marker: bridgeMarker(runId, job.id),
+    status: "pending",
+  }));
+  let currentJobId = null;
+  let nativeQuickChatDisabledReason = null;
+  const persistBatchProgress = async (state = "running", error = null) => {
+    await writeJsonAtomically(progressPath, buildBatchProgress({
+      runId,
+      reportPath: options.output,
+      startedAt,
+      updatedAt: new Date().toISOString(),
+      state,
+      requestedJobs: batch.jobs.length,
+      currentJobId,
+      dispatchPlan,
+      error,
+      jobs: progressJobs,
+    }));
+  };
+  const updateProgressJob = (job) => {
+    progressJobs = progressJobs.map((existing) => existing.id === job.id ? {
+      ...existing,
+      ...job,
+    } : existing);
+  };
+  await persistBatchProgress();
+  const waveSize = dispatchPlan.quickChat.attempt ? dispatchPlan.concurrency : 1;
+  const requestedSurface = dispatchPlan.quickChat.attempt ?
+    "chatgpt-quick-chat" : "chatgpt-main-chat";
 
   for (let offset = 0; offset < batch.jobs.length; offset += waveSize) {
     const wave = batch.jobs.slice(offset, offset + waveSize);
@@ -2669,22 +2894,66 @@ async function runBatch(options, discovery) {
       for (let localIndex = 0; localIndex < wave.length; localIndex += 1) {
         const job = wave[localIndex];
         let session = null;
+        currentJobId = job.id;
+        updateProgressJob({ id: job.id, status: "preparing" });
         try {
           const conversationId = `local-chatgpt:${randomUUID()}`;
           let opened;
           let fallbackReason = null;
-          try {
-            opened = await openNativeQuickChat(discovery, conversationId, offset + localIndex);
-          } catch (error) {
-            if (!isNativeQuickChatFallbackError(error)) throw error;
-            fallbackReason = error.message;
+          if (!dispatchPlan.quickChat.attempt) {
             opened = await openMainChatConversation(discovery, conversationId);
+          } else if (nativeQuickChatDisabledReason) {
+            fallbackReason = `${nativeQuickChatDisabledReason}; native Quick chat disabled for the remainder of this batch`;
+            opened = await openMainChatConversation(discovery, conversationId);
+          } else {
+            try {
+              opened = await openNativeQuickChat(discovery, conversationId, offset + localIndex);
+              await recordQuickChatHealth(discovery.statePath, {
+                browserId: discovery.state.browserId,
+                codexVersion: discovery.state.codexVersion,
+              }, {
+                status: "healthy",
+                reason: "owned Quick Chat target opened successfully",
+              });
+            } catch (error) {
+              if (!isNativeQuickChatFallbackError(error)) throw error;
+              nativeQuickChatDisabledReason = error.message;
+              fallbackReason = error.message;
+              await recordQuickChatHealth(discovery.statePath, {
+                browserId: discovery.state.browserId,
+                codexVersion: discovery.state.codexVersion,
+              }, {
+                status: "unhealthy",
+                reason: error.message,
+              });
+              opened = await openMainChatConversation(discovery, conversationId);
+            }
           }
           session = opened.session;
+          updateProgressJob({
+            id: job.id,
+            conversationId: opened.prepared.conversationId,
+            surface: opened.prepared.surface,
+            status: "prepared",
+            routing: buildJobRouting(opened.prepared.surface, fallbackReason, requestedSurface),
+          });
+          await persistBatchProgress();
           const submission = {
             ...(await submitJob(session, opened.prepared, job, runId)),
-            routing: buildJobRouting(opened.prepared.surface, fallbackReason),
+            routing: buildJobRouting(opened.prepared.surface, fallbackReason, requestedSurface),
           };
+          updateProgressJob(submission);
+          await persistBatchProgress();
+          try {
+            await recordGenerationCheckpoint(batch, runId, [submission], options.output);
+          } catch (error) {
+            runError = `${runError ? `${runError}; ` : ""}Lifecycle checkpoint failed at ${job.id}: ${error.message}`;
+            updateProgressJob({
+              id: job.id,
+              error: `lifecycle checkpoint: ${error.message}`,
+            });
+            await persistBatchProgress("running", error.message);
+          }
           if (opened.prepared.surface === "chatgpt-main-chat") {
             let collected = submission;
             if (["submitted", "unknown-after-submit"].includes(submission.status)) {
@@ -2701,6 +2970,15 @@ async function runBatch(options, discovery) {
               }
             }
             submissions.push(collected);
+            updateProgressJob(collected);
+            await persistBatchProgress();
+            try {
+              await recordGenerationCheckpoint(batch, runId, [collected], options.output);
+            } catch (error) {
+              runError = `${runError ? `${runError}; ` : ""}Lifecycle checkpoint failed at ${job.id}: ${error.message}`;
+              updateProgressJob({ id: job.id, error: `lifecycle checkpoint: ${error.message}` });
+              await persistBatchProgress("running", error.message);
+            }
             await closeOwnedQuickChat(session);
             session = null;
           } else {
@@ -2719,6 +2997,8 @@ async function runBatch(options, discovery) {
             result: null,
             error: error.message,
           });
+          updateProgressJob(submissions.at(-1));
+          await persistBatchProgress("running", error.message);
           runError = `${runError ? `${runError}; ` : ""}Submission failed at ${job.id}: ${error.message}`;
         }
       }
@@ -2739,6 +3019,17 @@ async function runBatch(options, discovery) {
         }
       }));
       jobs.push(...collected);
+      for (const collectedJob of collected) updateProgressJob(collectedJob);
+      await persistBatchProgress();
+      for (const collectedJob of collected) {
+        try {
+          await recordGenerationCheckpoint(batch, runId, [collectedJob], options.output);
+        } catch (error) {
+          runError = `${runError ? `${runError}; ` : ""}Lifecycle checkpoint failed at ${collectedJob.id}: ${error.message}`;
+          updateProgressJob({ id: collectedJob.id, error: `lifecycle checkpoint: ${error.message}` });
+        }
+      }
+      await persistBatchProgress("running", runError);
     } finally {
       await Promise.all([...sessions.values()].map((session) => closeOwnedQuickChat(session)));
     }
@@ -2755,8 +3046,10 @@ async function runBatch(options, discovery) {
       } : null,
       artifacts,
     };
+    updateProgressJob(jobs[index]);
   }
   const completedCount = jobs.filter((job) => job.status === "complete").length;
+  const reportError = summarizeBatchError(runError, jobs);
   const report = {
     schemaVersion: 1,
     pass: completedCount === batch.jobs.length,
@@ -2769,9 +3062,13 @@ async function runBatch(options, discovery) {
     port: discovery.state.port,
     browserId: discovery.state.browserId,
     surface: summarizeBatchSurface(jobs),
+    runState: "complete",
+    timeoutMs: options.timeoutMs,
+    progressPath,
+    dispatchPlan,
     requestedJobs: batch.jobs.length,
     completedJobs: completedCount,
-    error: runError,
+    error: reportError,
     jobs,
     generationPolicy: batch.schemaVersion === 2 ? {
       jobType: batch.jobType,
@@ -2786,6 +3083,8 @@ async function runBatch(options, discovery) {
     report.lifecycle = lifecycle;
     await writeJsonAtomically(options.output, report);
   }
+  currentJobId = null;
+  await persistBatchProgress("complete", reportError);
   return report;
 }
 
@@ -3110,6 +3409,20 @@ async function probeBridge(discovery) {
   }
 }
 
+async function runWithBridgeController(options, discovery, operation) {
+  const lease = await acquireBridgeControllerLock({
+    statePath: discovery.statePath,
+    command: options.command,
+    outputPath: options.output,
+    browserId: discovery.state.browserId,
+  });
+  try {
+    return await operation();
+  } finally {
+    await releaseBridgeControllerLock(lease);
+  }
+}
+
 async function main() {
   const options = parseBridgeArgs(process.argv.slice(2));
   const discovery = await discoverBridge(options);
@@ -3121,8 +3434,16 @@ async function main() {
     console.log(JSON.stringify(await probeBridge(discovery), null, 2));
     return;
   }
+  if (options.command === "plan") {
+    console.log(JSON.stringify(await runPlan(options, discovery), null, 2));
+    return;
+  }
   if (options.command === "resume") {
-    console.log(JSON.stringify(await runResume(options, discovery), null, 2));
+    console.log(JSON.stringify(await runWithBridgeController(
+      options,
+      discovery,
+      () => runResume(options, discovery),
+    ), null, 2));
     return;
   }
   if (options.command === "watch") {
@@ -3130,14 +3451,26 @@ async function main() {
     return;
   }
   if (options.command === "approve") {
-    console.log(JSON.stringify(await runApprove(options, discovery), null, 2));
+    console.log(JSON.stringify(await runWithBridgeController(
+      options,
+      discovery,
+      () => runApprove(options, discovery),
+    ), null, 2));
     return;
   }
   if (options.command === "cleanup") {
-    console.log(JSON.stringify(await runCleanup(options, discovery), null, 2));
+    console.log(JSON.stringify(await runWithBridgeController(
+      options,
+      discovery,
+      () => runCleanup(options, discovery),
+    ), null, 2));
     return;
   }
-  console.log(JSON.stringify(await runBatch(options, discovery), null, 2));
+  console.log(JSON.stringify(await runWithBridgeController(
+    options,
+    discovery,
+    () => runBatch(options, discovery),
+  ), null, 2));
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);

@@ -79,3 +79,22 @@ test("maps 子智能体 to ephemeral workers and 子代理 to durable Codex conv
   assert.doesNotMatch(skill, /子代理.*歧义|Do not silently interpret “子代理”/s);
   assert.doesNotMatch(native, /“子代理” is ambiguous|子代理.*二选一/i);
 });
+
+test("ChatGPT product route plans before send and keeps Quick Chat experimental", async () => {
+  const skill = await fs.readFile(path.join(skillRoot, "SKILL.md"), "utf8");
+  const contract = await fs.readFile(
+    path.join(skillRoot, "references", "bridge-contract.md"),
+    "utf8",
+  );
+  const guide = await fs.readFile(
+    path.join(projectRoot, "docs", "dispatch-chatgpt-bridge-guide.md"),
+    "utf8",
+  );
+
+  for (const source of [skill, contract, guide]) {
+    assert.match(source, /plan/);
+    assert.match(source, /serial-main-chat|串行/);
+    assert.match(source, /ExperimentalQuickChat|实验/i);
+    assert.match(source, /全局控制锁|controller\s+lock/i);
+  }
+});

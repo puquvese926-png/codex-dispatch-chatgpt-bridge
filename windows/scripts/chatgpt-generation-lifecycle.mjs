@@ -80,6 +80,7 @@ export function buildLifecycleEntries(reportValue, optionsValue) {
       : [];
     const historyTitle = typeof job.historyTitle === "string" && job.historyTitle.trim() ? job.historyTitle.trim() : null;
     const completeAndMaterialized = job.status === "complete" && artifacts.length > 0 && job.completedAt;
+    const submittedAt = job.submittedAt ? date(job.submittedAt, `jobs[${index}].submittedAt`) : null;
     const completedAt = job.completedAt ? date(job.completedAt, `jobs[${index}].completedAt`) : null;
     return [{
       schemaVersion: 1,
@@ -91,6 +92,7 @@ export function buildLifecycleEntries(reportValue, optionsValue) {
       marker: job.marker,
       historyTitle,
       promptHash: job.promptHash.toLowerCase(),
+      submittedAt,
       status: text(job.status, `jobs[${index}].status`),
       completedAt,
       reportPath: path.win32.normalize(reportPath),
@@ -165,6 +167,7 @@ export function mergeLifecycleEntries(ledgerValue, newEntriesValue) {
     merged.set(validated.conversationId, existing ? {
       ...validated,
       surface: validated.surface || existing.surface,
+      submittedAt: validated.submittedAt || existing.submittedAt || null,
       userRetention: existing.userRetention,
       cleanupStatus: existing.cleanupStatus,
       deletedAt: existing.deletedAt || null,

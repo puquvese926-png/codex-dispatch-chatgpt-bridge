@@ -21,6 +21,7 @@ const report = {
       marker: "CODEX-BRIDGE-c39c8a08-candidate-a",
       promptHash: "a".repeat(64),
       references: [],
+      submittedAt: "2026-07-01T00:00:05.000Z",
       completedAt: "2026-07-01T00:00:00.000Z",
       artifacts: [{ path: "C:\\outputs\\candidate-a.png", sha256: "b".repeat(64), bytes: 100 }],
     },
@@ -54,8 +55,19 @@ const entries = buildLifecycleEntries(report, {
 assert.equal(entries.length, 2);
 assert.notEqual(entries[0].conversationId, entries[1].conversationId);
 assert.equal(entries[0].surface, "chatgpt-main-chat");
+assert.equal(entries[0].submittedAt, "2026-07-01T00:00:05.000Z");
 assert.equal(entries[0].cleanupEligibility, "eligible-after-retention");
 assert.equal(entries[1].cleanupEligibility, "blocked-ambiguous-result");
+
+const recoveryWithoutSubmittedAt = structuredClone(entries[0]);
+recoveryWithoutSubmittedAt.runId = "run-002";
+recoveryWithoutSubmittedAt.status = "complete";
+recoveryWithoutSubmittedAt.submittedAt = null;
+const preservedSubmittedAt = mergeLifecycleEntries(
+  { schemaVersion: 1, entries: [entries[0]] },
+  [recoveryWithoutSubmittedAt],
+);
+assert.equal(preservedSubmittedAt.entries[0].submittedAt, "2026-07-01T00:00:05.000Z");
 
 const mixedSurfaceReport = structuredClone(report);
 mixedSurfaceReport.surface = "mixed";

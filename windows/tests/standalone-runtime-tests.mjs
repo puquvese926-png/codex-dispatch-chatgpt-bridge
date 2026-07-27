@@ -53,6 +53,97 @@ test("repository bundles a generic bridge runtime with no Dream Skin state depen
   }));
 });
 
+test("runner supports an explicit detached mode with a durable progress path", () => {
+  const source = readFileSync(runnerScript, "utf8");
+  assert.match(source, /'plan'/);
+  assert.match(source, /\[switch\]\$ExperimentalQuickChat/);
+  assert.match(source, /\[switch\]\$Detach/);
+  assert.match(source, /Start-Process/);
+  assert.match(source, /WindowStyle Hidden/);
+  assert.match(source, /progress\.json/);
+  assert.match(source, /stdoutPath/);
+  assert.match(source, /stderrPath/);
+});
+
+test("runner exposes a read-only route plan and makes Quick Chat opt-in", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-plan-"));
+  try {
+    const fakeRuntime = path.join(temporaryRoot, "runtime");
+    const fakeScript = path.join(fakeRuntime, "windows", "scripts", "chatgpt-bridge.mjs");
+    mkdirSync(path.dirname(fakeScript), { recursive: true });
+    writeFileSync(
+      fakeScript,
+      "console.log(JSON.stringify({ argv: process.argv.slice(2) }));\n",
+      "utf8",
+    );
+    const inputPath = path.join(temporaryRoot, "input.json");
+    const outputPath = path.join(temporaryRoot, "plan.json");
+    writeFileSync(inputPath, "{}\n", "utf8");
+    const result = spawnSync("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      runnerScript,
+      "-Root",
+      fakeRuntime,
+      "-Action",
+      "plan",
+      "-InputPath",
+      inputPath,
+      "-OutputPath",
+      outputPath,
+      "-ExperimentalQuickChat",
+    ], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const invocation = JSON.parse(result.stdout);
+    assert.equal(invocation.argv[0], "plan");
+    assert.equal(invocation.argv.includes("--experimental-quick-chat"), true);
+    assert.equal(invocation.argv.includes("--allow-send"), false);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("detached runner returns a launch record without waiting for the child", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-detach-"));
+  try {
+    const fakeRuntime = path.join(temporaryRoot, "runtime");
+    const fakeScript = path.join(fakeRuntime, "windows", "scripts", "chatgpt-bridge.mjs");
+    mkdirSync(path.dirname(fakeScript), { recursive: true });
+    writeFileSync(fakeScript, "setTimeout(() => process.exit(0), 1500);\n", "utf8");
+    const inputPath = path.join(temporaryRoot, "input.json");
+    const outputPath = path.join(temporaryRoot, "report.json");
+    writeFileSync(inputPath, "{}\n", "utf8");
+    const result = spawnSync("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      runnerScript,
+      "-Root",
+      fakeRuntime,
+      "-Action",
+      "batch",
+      "-InputPath",
+      inputPath,
+      "-OutputPath",
+      outputPath,
+      "-Detach",
+      "-AllowSend",
+    ], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const launch = JSON.parse(result.stdout);
+    assert.equal(launch.pass, true);
+    assert.equal(launch.state, "running");
+    assert.equal(launch.reportPath, outputPath);
+    assert.equal(launch.progressPath, `${outputPath}.progress.json`);
+    assert.ok(Number.isInteger(launch.pid) && launch.pid > 0);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("global runner ignores legacy Dream Skin roots and selects the installed standalone runtime", () => {
   const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-runner-"));
   try {
@@ -127,6 +218,15 @@ test("global installer deploys both the Skill and standalone runtime", () => {
     );
     assert.equal(
       existsSync(path.join(globalRuntimeRoot, "windows", "scripts", "chatgpt-bridge.mjs")),
+      true,
+    );
+    assert.equal(
+      existsSync(path.join(
+        globalRuntimeRoot,
+        "windows",
+        "scripts",
+        "chatgpt-bridge-product-control.mjs",
+      )),
       true,
     );
   } finally {

@@ -4,6 +4,24 @@
 
 Bridge jobs must be self-contained. GPT chats cannot read local paths; the calling Codex agent attaches or otherwise supplies user-authorized visual inputs through the supported visible workflow and keeps local file operations, validation and project edits in Codex.
 
+The integrated ChatGPT route is a version-gated UI adapter. Production defaults
+to the verified `serial-main-chat` mode. Native Quick Chat is disabled unless the
+caller explicitly passes `-ExperimentalQuickChat`; it is an opportunistic
+parallel route, not guaranteed capacity.
+
+Before a mutating batch, `plan` validates the same manifest and references,
+performs the current read-only probe, reads the session-scoped Quick Chat health
+cache, and writes a route decision containing:
+
+- `selectedMode` and `selectedSurface`;
+- effective concurrency and number of waves;
+- per-job timeout and serial worst-case collection time;
+- whether Quick Chat will be attempted and why;
+- a user-facing notice that must be shown before sending.
+
+`batch` recomputes this plan immediately before submission and embeds it in the
+progress sidecar and final report. A stale plan never authorizes a send.
+
 ## Generic batch schema v1
 
 Use for independent text, review or transformation jobs:
@@ -52,7 +70,7 @@ Prompts are non-empty, at most 30,000 characters and preserved exactly. IDs are 
 
 Resume performs no send. Every job must copy its exact per-job `surface`, `conversationId`, `marker` and `promptHash` from the original report. `surface` is mandatory: use `chatgpt-quick-chat` for a native Quick chat renderer and `chatgpt-main-chat` for the retained embedded/main surface. A `local-chatgpt:<uuid>` value can occur on either surface, so its shape is not a routing signal. The report's top-level `surface` is a command transport summary; only the per-job field is authoritative for recovery.
 
-With a title, native Quick chat recovery opens a fresh recovery window, selects that exact visible history title and accepts the result only when the original marker is present. If a submitted native Quick chat job has no captured title, omit `title`: the bridge first reopens the exact original `local-chatgpt:<uuid>` read-only. If that local route no longer contains the marker, it may open a fresh blank recovery window and scan visible history rows that have their own item menu. This history fallback does not require the blank window to assume a synthetic conversation route; it must instead prove a blank composer and zero rendered conversation units before enumeration. Main-surface recovery attaches only to the verified retained renderer and requires the exact active conversation identity plus marker. It never returns unrelated content and accepts only the unique proven conversation. A marker miss is `not-recovered`, never a resend.
+With a title, native Quick chat recovery opens a fresh recovery window, selects that exact visible history title and accepts the result only when the original marker is present. If a submitted native Quick chat job has no captured title, omit `title`: the bridge first reopens the exact original `local-chatgpt:<uuid>` read-only. If that local route no longer contains the marker, it may open a fresh blank recovery window and scan visible history rows that have their own item menu. This history fallback does not require the blank window to assume a synthetic conversation route; it must instead prove a blank composer and zero rendered conversation units before enumeration. Main-surface recovery attaches only to the verified retained renderer, tries the exact active conversation identity plus marker, and may then scan visible titled history rows with the same exact identity and marker guard. It never returns unrelated content and accepts only the unique proven conversation. A marker miss is `not-recovered`, never a resend.
 
 ```json
 {
@@ -126,6 +144,7 @@ Any selector, identity or hash uncertainty fails closed. Failed deletion remains
 | --- | ---: | ---: | --- |
 | `discover` | No | No | none |
 | `probe` | No | No | none |
+| `plan` | No | No | none; requires the intended batch manifest |
 | `batch` | Yes | Creates new chats | `-AllowSend` |
 | `resume` | No | No | `-AllowSend` forbidden |
 | `watch` | No | No | exact later user approval inside the pinned conversation; `-AllowSend` forbidden |
@@ -134,6 +153,34 @@ Any selector, identity or hash uncertainty fails closed. Failed deletion remains
 
 ## Results
 
-Reports preserve job status, conversation ID, marker, promptHash, per-job `surface`, routing (`requestedSurface`, `selectedSurface`, and nullable `fallbackReason`), captured history title, assistant text metadata, image dimensions, artifact paths, bytes and SHA-256. The top-level `surface` is a transport summary: `chatgpt-quick-chat`, `chatgpt-main-chat`, `mixed`, or `unknown`; it is not a durable conversation identity. Reports omit credentials and embedded image bytes.
+Reports preserve job status, conversation ID, marker, promptHash, per-job `surface`, `submittedAt`, routing (`requestedSurface`, `selectedSurface`, and nullable `fallbackReason`), captured history title, assistant text metadata, image dimensions, artifact paths, bytes and SHA-256. The top-level `surface` is a transport summary: `chatgpt-quick-chat`, `chatgpt-main-chat`, `mixed`, or `unknown`; it is not a durable conversation identity. Reports omit credentials and embedded image bytes.
 
-The pinned client currently permits two owned quick-chat windows per wave. Existing user windows reduce capacity and are never closed or deleted by the bridge.
+Plan reports and final batch reports preserve the full `dispatchPlan`. Final
+batch reports also preserve `runState: "complete"`, the effective `timeoutMs`,
+and `progressPath`. During execution, the sidecar at `progressPath` records
+`state: "running"`, `currentJobId`, the dispatch plan, submitted/completed
+counts, per-job identity, `submittedAt`, status, routing and artifact counts. It
+is the durable status source when an outer shell returns before the bridge child
+finishes. `-Detach` intentionally starts that child hidden and returns the
+report, progress and log paths without waiting.
+
+Every `batch`, `resume`, `approve`, and `cleanup` obtains one atomic controller
+lock beside the standalone bridge state. The lock is shared across all report
+paths and records only process/control metadata. A live owner blocks the second
+controller; a dead owner can be reclaimed only after the operating system proves
+that PID absent. Invalid lock state fails closed. The same-report progress guard
+remains an additional idempotency check.
+
+Quick Chat health is cached beside the standalone state for fifteen minutes and
+is scoped to the exact Codex version plus CDP browser identity. A failure in one
+experimental batch prevents later batches in that session from repeating the
+same native wait. Browser restart, client version change, or cache expiry returns
+the capability to unknown.
+
+The default generation collection window is 600,000 ms. Values remain bounded to 5,000–900,000 ms. A `timeout-after-submit` is a valid durable outcome, not a pre-submit failure: content may have been sent and the exact job must remain sealed for read-only resume.
+
+The pinned client currently permits two owned Quick Chat windows per wave only
+when `-ExperimentalQuickChat` is explicitly selected and the current route plan
+allows an attempt. Existing user windows reduce capacity and are never closed or
+deleted by the bridge. The production default remains one serial main-surface
+job at a time.

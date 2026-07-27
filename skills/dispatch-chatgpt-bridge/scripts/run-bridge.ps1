@@ -1,17 +1,19 @@
 [CmdletBinding()]
 param(
-  [ValidateSet('discover', 'probe', 'batch', 'resume', 'watch', 'approve', 'cleanup')]
+  [ValidateSet('discover', 'probe', 'plan', 'batch', 'resume', 'watch', 'approve', 'cleanup')]
   [string]$Action = 'probe',
   [string]$Root,
   [string]$StatePath,
   [string]$InputPath,
   [string]$OutputPath,
   [ValidateRange(5000, 900000)]
-  [int]$TimeoutMs = 180000,
+  [int]$TimeoutMs = 600000,
   [ValidateRange(250, 30000)]
   [int]$PollMs = 5000,
   [switch]$AllowSend,
-  [switch]$AllowDelete
+  [switch]$AllowDelete,
+  [switch]$ExperimentalQuickChat,
+  [switch]$Detach
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,7 +60,7 @@ if ($StatePath) {
   $arguments += @('--state', [IO.Path]::GetFullPath($StatePath))
 }
 
-if ($Action -in @('batch', 'resume', 'watch', 'approve', 'cleanup')) {
+if ($Action -in @('plan', 'batch', 'resume', 'watch', 'approve', 'cleanup')) {
   Assert-AbsoluteBridgePath -Value $InputPath -Label 'InputPath'
   Assert-AbsoluteBridgePath -Value $OutputPath -Label 'OutputPath'
   $arguments += @('--input', [IO.Path]::GetFullPath($InputPath))
@@ -67,12 +69,24 @@ if ($Action -in @('batch', 'resume', 'watch', 'approve', 'cleanup')) {
   if ($Action -eq 'watch') {
     $arguments += @('--poll-ms', "$PollMs")
   }
-} elseif ($InputPath -or $OutputPath -or $AllowSend -or $AllowDelete) {
+} elseif ($InputPath -or $OutputPath -or $AllowSend -or $AllowDelete -or
+    $ExperimentalQuickChat -or $Detach) {
   throw "$Action does not accept mutation paths or authorization switches."
 }
 
 if ($Action -ne 'cleanup' -and $AllowDelete) {
   throw "$Action does not accept -AllowDelete."
+}
+
+if ($ExperimentalQuickChat) {
+  if ($Action -notin @('plan', 'batch')) {
+    throw "$Action does not accept -ExperimentalQuickChat."
+  }
+  $arguments += '--experimental-quick-chat'
+}
+
+if ($Detach -and $Action -notin @('batch', 'resume', 'watch')) {
+  throw "$Action does not support -Detach."
 }
 
 if ($Action -in @('batch', 'approve')) {
@@ -82,10 +96,37 @@ if ($Action -in @('batch', 'approve')) {
   throw 'Resume is read-only and does not accept -AllowSend.'
 } elseif ($Action -eq 'watch' -and $AllowSend) {
   throw 'Watch is read-only and does not accept -AllowSend.'
+} elseif ($Action -eq 'plan' -and $AllowSend) {
+  throw 'Plan is read-only and does not accept -AllowSend.'
 } elseif ($Action -eq 'cleanup') {
   if (-not $AllowDelete) { throw 'Cleanup requires explicit -AllowDelete authorization.' }
   if ($AllowSend) { throw 'Cleanup does not accept -AllowSend.' }
   $arguments += '--allow-delete'
+}
+
+if ($Detach) {
+  $stdoutPath = "$OutputPath.stdout.log"
+  $stderrPath = "$OutputPath.stderr.log"
+  $quotedArguments = $arguments | ForEach-Object {
+    '"' + ([string]$_).Replace('"', '\\"') + '"'
+  }
+  $child = Start-Process -FilePath $node `
+    -ArgumentList $quotedArguments `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput $stdoutPath `
+    -RedirectStandardError $stderrPath `
+    -PassThru
+  [ordered]@{
+    pass = $true
+    command = $Action
+    state = 'running'
+    pid = $child.Id
+    reportPath = [IO.Path]::GetFullPath($OutputPath)
+    progressPath = "$([IO.Path]::GetFullPath($OutputPath)).progress.json"
+    stdoutPath = [IO.Path]::GetFullPath($stdoutPath)
+    stderrPath = [IO.Path]::GetFullPath($stderrPath)
+  } | ConvertTo-Json -Compress
+  exit 0
 }
 
 & $node @arguments

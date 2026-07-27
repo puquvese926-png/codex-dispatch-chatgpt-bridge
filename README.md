@@ -20,6 +20,10 @@ Codex 任务的协作控制层。
 - 把临时并行工作与固定长期任务分开管理；
 - 让 GPT 负责规划、创意和提示词，Codex 负责本地执行与验收；
 - 支持 GPT 生图任务的独立会话、参考图校验、产物回收和生命周期记录；
+- 在发送前给出明确的串行/实验并行计划、并发数和最坏等待时间；
+- 默认使用主 ChatGPT 串行模式，Quick Chat 仅在显式实验开关下启用；
+- 支持长时间生图的持久进度检查点和 detached runner，外层等待超时也不会丢失任务状态；
+- 使用跨报告路径的全局控制锁，阻止多个进程同时抢占同一个 ChatGPT 主界面；
 - 让 GPT 通过严格的 `CODEX_HANDOFF` 把经过用户批准的计划交给 Codex；
 - 防止把可见 UI 卡片、最新窗口或模糊任务名称误当成可靠目标；
 - 为失败、断连、提交状态不明和恢复过程提供统一处置规则。
@@ -74,8 +78,10 @@ GPT 规划 → 用户批准 → Codex 执行 → 测试验收 → 回读结果
 - `scripts/install-global.ps1`：把仓库中的 Skill 安装到当前用户全局目录；
 - `scripts/verify-global-install.ps1`：比较 Skill、运行时和全局副本的 SHA-256；
 - `windows/scripts/chatgpt-bridge.mjs`：独立桥接运行时；
+- `windows/scripts/chatgpt-bridge-product-control.mjs`：路由计划、能力缓存和全局控制锁；
 - `windows/scripts/start-chatgpt-bridge.ps1`：验证或启动 Codex loopback CDP 并写入独立状态；
 - `windows/tests/standalone-runtime-tests.mjs`：项目解耦、安装和启动回归测试；
+- `windows/tests/chatgpt-bridge-product-control-tests.mjs`：产品路由和控制平面回归测试；
 - `windows/tests/run-tests.ps1`：独立桥接全量测试入口；
 - `windows/tests/native-codex-bridge-skill-tests.mjs`：术语和原生路由回归测试。
 

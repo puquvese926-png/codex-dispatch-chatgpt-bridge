@@ -51,6 +51,10 @@ import {
   buildJobRouting,
   summarizeBatchSurface,
   isNativeQuickChatFallbackError,
+  DEFAULT_TIMEOUT_MS,
+  batchProgressPath,
+  buildBatchProgress,
+  summarizeBatchError,
   summarizeCollectedImages,
   validateBridgeBatch,
   validateResumeManifest,
@@ -190,7 +194,8 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: null,
     output: null,
     statePath: null,
-    timeoutMs: 180000,
+    experimentalQuickChat: false,
+    timeoutMs: 600000,
   });
 
   assert.deepEqual(parseBridgeArgs([
@@ -206,6 +211,7 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\jobs\\batch.json",
     output: "C:\\jobs\\report.json",
     statePath: null,
+    experimentalQuickChat: false,
     timeoutMs: 240000,
   });
 
@@ -224,7 +230,8 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\jobs\\resume.json",
     output: "C:\\jobs\\recovered.json",
     statePath: null,
-    timeoutMs: 180000,
+    experimentalQuickChat: false,
+    timeoutMs: 600000,
   });
   assert.throws(() => parseBridgeArgs([
     "resume", "--input", "C:\\in.json", "--output", "C:\\out.json", "--allow-send",
@@ -241,7 +248,8 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\state\\conversations.json",
     output: "C:\\reports\\cleanup.json",
     statePath: null,
-    timeoutMs: 180000,
+    experimentalQuickChat: false,
+    timeoutMs: 600000,
   });
   assert.throws(() => parseBridgeArgs([
     "cleanup", "--input", "C:\\in.json", "--output", "C:\\out.json",
@@ -259,6 +267,7 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\handoff\\watch.json",
     output: "C:\\handoff\\report.json",
     statePath: null,
+    experimentalQuickChat: false,
     timeoutMs: 5000,
     pollMs: 1000,
   });
@@ -277,11 +286,45 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\handoff\\approve.json",
     output: "C:\\handoff\\approve-report.json",
     statePath: null,
-    timeoutMs: 180000,
+    experimentalQuickChat: false,
+    timeoutMs: 600000,
   });
   assert.throws(() => parseBridgeArgs([
     "approve", "--input", "C:\\in.json", "--output", "C:\\out.json",
   ]), /allow-send|authorization/i);
+  assert.deepEqual(parseBridgeArgs([
+    "plan",
+    "--input", "C:\\jobs\\batch.json",
+    "--output", "C:\\jobs\\plan.json",
+  ]), {
+    command: "plan",
+    allowSend: false,
+    allowDelete: false,
+    input: "C:\\jobs\\batch.json",
+    output: "C:\\jobs\\plan.json",
+    statePath: null,
+    experimentalQuickChat: false,
+    timeoutMs: 600000,
+  });
+  assert.equal(parseBridgeArgs([
+    "plan",
+    "--input", "C:\\jobs\\batch.json",
+    "--output", "C:\\jobs\\plan.json",
+    "--experimental-quick-chat",
+  ]).experimentalQuickChat, true);
+  assert.equal(parseBridgeArgs([
+    "batch",
+    "--input", "C:\\jobs\\batch.json",
+    "--output", "C:\\jobs\\report.json",
+    "--experimental-quick-chat",
+    "--allow-send",
+  ]).experimentalQuickChat, true);
+  assert.throws(() => parseBridgeArgs([
+    "resume",
+    "--input", "C:\\jobs\\resume.json",
+    "--output", "C:\\jobs\\report.json",
+    "--experimental-quick-chat",
+  ]), /experimental.*Quick Chat|quick chat/i);
 });
 
 test("validates strict unique batch jobs without rewriting prompts", () => {
@@ -472,6 +515,85 @@ test("retained main-surface fallback is collected before the next job can replac
   const immediateCollection = runBatchSource.indexOf("await collectJob(session, submission, options.timeoutMs)");
   const deferredCollection = runBatchSource.indexOf("const collected = await Promise.all");
   assert.ok(immediateCollection >= 0 && immediateCollection < deferredCollection);
+  const collectStart = source.indexOf("async function collectJob");
+  const collectionEntry = source.indexOf("main-chat-collection-entry-open", collectStart);
+  const navigate = source.indexOf("await navigateToConversation", collectStart);
+  assert.ok(collectionEntry >= 0 && collectionEntry < navigate);
+});
+
+test("product batch defaults to a long image-generation window and writes durable progress", () => {
+  assert.equal(DEFAULT_TIMEOUT_MS, 600000);
+  assert.equal(
+    batchProgressPath("C:\\reports\\batch.json"),
+    "C:\\reports\\batch.json.progress.json",
+  );
+  const progress = buildBatchProgress({
+    runId: "run-progress",
+    reportPath: "C:\\reports\\batch.json",
+    startedAt: "2026-07-27T00:00:00.000Z",
+    updatedAt: "2026-07-27T00:01:00.000Z",
+    state: "running",
+    requestedJobs: 2,
+    currentJobId: "shot-1",
+    jobs: [
+      {
+        id: "shot-1",
+        promptHash: "a".repeat(64),
+        marker: "CODEX-BRIDGE-run-progress-shot-1",
+        conversationId: "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de",
+        surface: "chatgpt-main-chat",
+        submittedAt: "2026-07-27T00:00:30.000Z",
+        status: "submitted",
+      },
+      {
+        id: "shot-2",
+        promptHash: "b".repeat(64),
+        marker: "CODEX-BRIDGE-run-progress-shot-2",
+        status: "pending",
+      },
+    ],
+  });
+  assert.equal(progress.state, "running");
+  assert.equal(progress.currentJobId, "shot-1");
+  assert.equal(progress.submittedJobs, 1);
+  assert.equal(progress.completedJobs, 0);
+  assert.equal(progress.jobs[0].conversationId, "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de");
+  assert.equal(progress.jobs[1].status, "pending");
+  assert.equal(
+    summarizeBatchError(null, [{ id: "shot-1", status: "timeout-after-submit" }]),
+    "shot-1: timeout-after-submit",
+  );
+});
+
+test("batch fallback trips a per-batch native Quick chat circuit breaker and persists checkpoints", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function runBatch");
+  const end = source.indexOf("async function runResume", start);
+  const runBatchSource = source.slice(start, end);
+  assert.match(runBatchSource, /nativeQuickChatDisabledReason/);
+  assert.match(runBatchSource, /batchProgressPath\(options\.output\)/);
+  assert.match(runBatchSource, /await persistBatchProgress\(/);
+  assert.match(runBatchSource, /buildBatchProgress\(/);
+  assert.match(runBatchSource, /recordGenerationCheckpoint\(/);
+  assert.match(runBatchSource, /assertNoRunningBatchProgress\(/);
+  const beforeSubmit = runBatchSource.indexOf("await persistBatchProgress");
+  const submit = runBatchSource.indexOf("await submitJob", beforeSubmit);
+  assert.ok(beforeSubmit >= 0 && submit > beforeSubmit);
+});
+
+test("production batch uses a precomputed route plan, persistent health, and the global controller", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  assert.match(source, /chatgpt-bridge-product-control\.mjs/);
+  assert.match(source, /buildDispatchPlan/);
+  assert.match(source, /readQuickChatHealth/);
+  assert.match(source, /recordQuickChatHealth/);
+  assert.match(source, /acquireBridgeControllerLock/);
+  assert.match(source, /releaseBridgeControllerLock/);
+  const runBatchStart = source.indexOf("async function runBatch");
+  const runBatchEnd = source.indexOf("async function runResume", runBatchStart);
+  const runBatchSource = source.slice(runBatchStart, runBatchEnd);
+  assert.match(runBatchSource, /dispatchPlan/);
+  assert.match(runBatchSource, /quickChat\.attempt/);
 });
 
 test("embedded Quick chat uses its visible DOM conversation identity and snapshot root", () => {
@@ -483,6 +605,17 @@ test("embedded Quick chat uses its visible DOM conversation identity and snapsho
   assert.match(identity, /local:/);
   assert.match(snapshot, /data-pip-obstacle="quick-chat"/);
   assert.match(snapshot, /当前模式|current mode/i);
+});
+
+test("main-surface recovery falls back to marker- and identity-guarded history scanning", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function openMainChatSubmittedConversation");
+  const end = source.indexOf("async function selectHistoryConversation", start);
+  const recovery = source.slice(start, end);
+  assert.match(recovery, /main ChatGPT submitted marker/);
+  assert.match(recovery, /discoverHistoryConversation\(session/);
+  assert.match(recovery, /main-chat/);
+  assert.match(recovery, /15000/);
 });
 
 test("validates explicit read-only resume manifests", () => {
