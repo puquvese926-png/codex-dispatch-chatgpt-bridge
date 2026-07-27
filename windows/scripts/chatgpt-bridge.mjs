@@ -845,7 +845,7 @@ export function buildMainChatEntryExpression() {
         dialog.querySelector('[contenteditable="true"][aria-label*="ChatGPT"], textarea[data-testid="prompt-textarea"]')
       );
     }) || null;
-    if (ownedDialog || chatModeButton) return true;
+    if (ownedDialog || chatModeButton || button?.getAttribute('aria-pressed') === 'true') return true;
     if (!button) return false;
     button.click();
     return true;
@@ -2093,13 +2093,25 @@ async function openMainChatConversation(discovery, conversationId) {
   }, discovery.state.port, "main-chat-session-open");
   session.ownsWindow = false;
   try {
-    await evaluateAtStage(session, buildMainChatEntryExpression(), "main-chat-entry-open", true);
-    await waitFor(async () => evaluateAtStage(
-      session,
-      buildMainChatNewConversationExpression(),
-      "main-chat-new-conversation-click",
-      true,
-    ), 10000, "main ChatGPT new conversation control");
+    let lastEntryRefreshAt = 0;
+    await waitFor(async () => {
+      const now = Date.now();
+      if (now - lastEntryRefreshAt >= 1000) {
+        await evaluateAtStage(
+          session,
+          buildMainChatEntryExpression(),
+          "main-chat-new-conversation-entry-refresh",
+          true,
+        );
+        lastEntryRefreshAt = now;
+      }
+      return evaluateAtStage(
+        session,
+        buildMainChatNewConversationExpression(),
+        "main-chat-new-conversation-click",
+        true,
+      );
+    }, 10000, "main ChatGPT new conversation control");
     const prepared = await waitFor(async () => {
       const url = await currentRendererUrl(session);
       const ready = await evaluateAtStage(session, buildMainChatBlankExpression(), "main-chat-blank-readiness");

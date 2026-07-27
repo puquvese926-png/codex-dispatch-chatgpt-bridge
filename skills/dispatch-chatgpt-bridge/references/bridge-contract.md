@@ -187,6 +187,12 @@ poll. The `聊天` / `Quick chat` launcher is a toggle. Its missing or stale
 already visible. Collection may reopen the entry only after the current lease is
 not visible, and it must prove the same lease again before consuming a result.
 
+Between serial jobs, a completed main-surface dialog may unmount asynchronously.
+The next fresh preparation refreshes the idempotent launcher from inside the
+bounded `新聊天` wait, no more than once per second, so an unmount between the
+entry and new-chat checks can recover. No prompt may be inserted until that
+fresh gate again proves a blank surface and exact conversation identity.
+
 The pinned client currently permits two owned Quick Chat windows per wave only
 when `-ExperimentalQuickChat` is explicitly selected and the current route plan
 allows an attempt. Existing user windows reduce capacity and are never closed or

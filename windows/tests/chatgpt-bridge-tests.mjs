@@ -562,6 +562,21 @@ test("main ChatGPT entry is idempotent when the owned chat dialog is already vis
   }
 });
 
+test("main fresh preparation can reopen the entry while waiting for the new-chat gate", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const openStart = source.indexOf("async function openMainChatConversation");
+  const recoveryStart = source.indexOf("async function openMainChatSubmittedConversation", openStart);
+  const openSource = source.slice(openStart, recoveryStart);
+  const waitStart = openSource.indexOf("await waitFor(async () =>");
+  const entryInsideWait = openSource.indexOf("buildMainChatEntryExpression()", waitStart);
+  const newGateInsideWait = openSource.indexOf("buildMainChatNewConversationExpression()", waitStart);
+
+  assert.ok(waitStart >= 0);
+  assert.ok(entryInsideWait > waitStart);
+  assert.ok(newGateInsideWait > entryInsideWait);
+  assert.match(openSource, /main-chat-new-conversation-entry-refresh/);
+});
+
 test("retained main-surface fallback is collected before the next job can replace its dialog", () => {
   const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
   const start = source.indexOf("async function runBatch");
