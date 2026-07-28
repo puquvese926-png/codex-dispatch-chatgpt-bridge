@@ -209,6 +209,20 @@ or `local:<uuid>`. Composer and send must be unique descendants of that same
 owner. A global active sidebar identity, an earlier Codex composer, another
 dialog, or a second matching owner cannot authorize submission.
 
+For jobs with references, the attachment button, file input,
+`DOM.setFileInputFiles` node and acknowledgement poll use that same prepared
+surface and conversation identity. The bridge resolves exactly one visible
+attachment control and exactly one `input[type="file"]` inside the leased owner;
+it obtains the input through a CDP remote object followed by `DOM.requestNode`,
+then releases the remote object on both success and failure. Attachment
+acknowledgement inspects only that owner's `input.files` and visible
+labels/cards, and every expected basename must be proven there while the
+identity/Quick Chat route remains current. A portal input outside the exact
+owner, zero or multiple controls/inputs, or any identity drift fails closed
+before send. Original generation with `references: []` skips all attachment
+UI/CDP calls; this paragraph does not claim snapshot or approval root
+isolation.
+
 The send expression rechecks exact identity, same-root composer marker and
 same-root send ownership atomically before clicking. A returned `clicked: false`
 is durable `not-submitted`. Once the bridge enters that click-capable

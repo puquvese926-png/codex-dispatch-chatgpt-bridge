@@ -1574,29 +1574,61 @@ export function buildMarkerPresenceExpression(marker) {
   })()`;
 }
 
-export function buildAttachmentButtonExpression() {
+export function buildAttachmentButtonExpression(surface, conversationId) {
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
-    if (document.querySelector('input[type="file"]')) return { inputPresent: true, clicked: false };
-    const controls = [...document.querySelectorAll('button, [role="button"]')];
-    const attach = controls.find((node) => /Attach|Add files|Upload|添加|附加|上传|文件/i.test(
-      node.getAttribute('aria-label') || node.getAttribute('title') || node.innerText || node.textContent || ''));
-    if (!attach) return { inputPresent: false, clicked: false };
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return { inputPresent: false, clicked: false, ...resolved };
+    const inputs = [...resolved.root.querySelectorAll('input[type="file"]')];
+    if (inputs.length > 1) {
+      return { inputPresent: false, clicked: false, reason: 'file-input-count', inputCount: inputs.length };
+    }
+    if (inputs.length === 1) return { inputPresent: true, clicked: false };
+    const controls = [...resolved.root.querySelectorAll('button, [role="button"]')]
+      .filter(visible)
+      .filter((node) => /Attach|Add files|Upload|添加|附加|上传|文件/iu.test(
+        node.getAttribute('aria-label') || node.getAttribute('title') ||
+        node.innerText || node.textContent || ''));
+    if (controls.length !== 1) {
+      return { inputPresent: false, clicked: false, reason: 'attach-control-count', controlCount: controls.length };
+    }
+    const attach = controls[0];
     attach.click();
     return { inputPresent: false, clicked: true };
   })()`;
 }
 
-export function buildAttachmentAcknowledgementExpression(expectedNames) {
+export function buildAttachmentInputExpression(surface, conversationId) {
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
+  return `(() => {
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return null;
+    const inputs = [...resolved.root.querySelectorAll('input[type="file"]')];
+    return inputs.length === 1 ? inputs[0] : null;
+  })()`;
+}
+
+export function buildAttachmentAcknowledgementExpression(surface, conversationId, expectedNames) {
+  validateSubmissionExpressionInput(surface, conversationId);
   if (!Array.isArray(expectedNames) || !expectedNames.length || expectedNames.some((name) =>
     typeof name !== "string" || !name.trim() || name.length > 255 || /[\u0000-\u001f\u007f]/u.test(name))) {
     throw new Error("attachment acknowledgement names are invalid");
   }
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
     const expected = ${JSON.stringify(expectedNames)};
-    const input = document.querySelector('input[type="file"]');
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return false;
+    const inputs = [...resolved.root.querySelectorAll('input[type="file"]')];
+    if (inputs.length !== 1) return false;
+    const input = inputs[0];
     const selected = input ? [...input.files].map((file) => file.name) : [];
-    const body = document.body.innerText || '';
-    const renderedLabels = [...document.querySelectorAll('[aria-label], [title], img[alt]')]
+    const body = resolved.root.innerText || '';
+    const renderedLabels = [...resolved.root.querySelectorAll('[aria-label], [title], img[alt]')]
+      .filter(visible)
       .flatMap((node) => [
         node.getAttribute('aria-label') || '',
         node.getAttribute('title') || '',
@@ -2045,6 +2077,20 @@ class CdpSession {
     return response.result?.value;
   }
 
+  async evaluateRemoteObject(expression, userGesture = false, timeoutMs = 10000) {
+    const response = await this.send("Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: false,
+      userGesture,
+    }, timeoutMs);
+    if (response.exceptionDetails) {
+      const detail = response.exceptionDetails.exception?.description || response.exceptionDetails.text;
+      throw new Error(`Renderer evaluation failed: ${detail}`);
+    }
+    return response.result;
+  }
+
   async evaluateDetached(expression, userGesture = false, timeoutMs = 10000) {
     const response = await this.send(
       "Runtime.evaluate",
@@ -2114,6 +2160,14 @@ export function annotateBridgeStageError(stage, error) {
 async function evaluateAtStage(session, expression, stage, userGesture = false, timeoutMs = 10000) {
   try {
     return await session.evaluate(expression, userGesture, timeoutMs);
+  } catch (error) {
+    throw annotateBridgeStageError(stage, error);
+  }
+}
+
+async function evaluateRemoteObjectAtStage(session, expression, stage, userGesture = false, timeoutMs = 10000) {
+  try {
+    return await session.evaluateRemoteObject(expression, userGesture, timeoutMs);
   } catch (error) {
     throw annotateBridgeStageError(stage, error);
   }
@@ -2445,26 +2499,67 @@ async function verifyJobReferences(job) {
   }
 }
 
-async function attachJobReferences(session, job) {
+export async function requestExactAttachmentInputNode(session, prepared) {
+  validatePreparedSubmission(prepared);
+  const remote = await evaluateRemoteObjectAtStage(
+    session,
+    buildAttachmentInputExpression(prepared.surface, prepared.conversationId),
+    "attachment-file-input-resolve",
+  );
+  const objectId = remote?.objectId;
+  if (typeof objectId !== "string" || !objectId) {
+    throw new Error("exact ChatGPT attachment file input was not resolved");
+  }
+  let requestError = null;
+  try {
+    const requested = await session.send("DOM.requestNode", { objectId });
+    if (!requested?.nodeId) throw new Error("exact ChatGPT attachment file input node is unavailable");
+    return requested.nodeId;
+  } catch (error) {
+    requestError = error;
+    throw error;
+  } finally {
+    try {
+      await session.send("Runtime.releaseObject", { objectId });
+    } catch (releaseError) {
+      if (!requestError) throw annotateBridgeStageError("attachment-file-input-release", releaseError);
+    }
+  }
+}
+
+async function attachJobReferences(session, prepared, job) {
+  validatePreparedSubmission(prepared);
   if (!job.references?.length) return;
   await verifyJobReferences(job);
-  await session.evaluate(buildAttachmentButtonExpression(), true);
-  await waitFor(async () => session.evaluate("Boolean(document.querySelector('input[type=\"file\"]'))"),
-    5000, `attachment input for ${job.id}`);
-  const documentNode = await session.send("DOM.getDocument", { depth: 1, pierce: true });
-  const selected = await session.send("DOM.querySelector", {
-    nodeId: documentNode.root.nodeId,
-    selector: "input[type=file]",
-  });
-  if (!selected?.nodeId) throw new Error(`attachment input node is unavailable for ${job.id}`);
+  const buttonState = await session.evaluate(buildAttachmentButtonExpression(
+    prepared.surface,
+    prepared.conversationId,
+  ), true);
+  if (!buttonState?.inputPresent && !buttonState?.clicked) {
+    throw new Error(`ChatGPT attachment control was not uniquely resolved for ${job.id}: ${buttonState?.reason || "unknown"}`);
+  }
+  await waitFor(async () => {
+    const state = await session.evaluate(buildAttachmentButtonExpression(
+      prepared.surface,
+      prepared.conversationId,
+    ));
+    return state?.inputPresent ? state : null;
+  }, 5000, `attachment input for ${job.id}`);
+  const nodeId = await requestExactAttachmentInputNode(session, prepared);
   await session.send("DOM.setFileInputFiles", {
-    nodeId: selected.nodeId,
+    nodeId,
     files: job.references.map((reference) => reference.path),
   });
   const expectedNames = job.references.map((reference) => path.basename(reference.path));
-  await waitFor(async () => session.evaluate(buildAttachmentAcknowledgementExpression(expectedNames)),
+  await waitFor(async () => session.evaluate(buildAttachmentAcknowledgementExpression(
+    prepared.surface,
+    prepared.conversationId,
+    expectedNames,
+  )),
     15000, `reference attachment acknowledgement for ${job.id}`);
 }
+
+export { attachJobReferences };
 
 function validatePreparedSubmission(prepared) {
   if (!isPlainObject(prepared)) throw new Error("prepared submission is invalid");
@@ -2530,7 +2625,7 @@ async function submitJob(session, prepared, job, runId) {
   validatePreparedSubmission(prepared);
   const marker = bridgeMarker(runId, job.id);
   const effectivePrompt = `${job.prompt}\n\n任务追踪标记：${marker}。不要在回答中复述该标记。`;
-  await attachJobReferences(session, job);
+  await attachJobReferences(session, prepared, job);
   const composerFocused = await session.evaluate(buildComposerFocusExpression(
     prepared.surface,
     prepared.conversationId,

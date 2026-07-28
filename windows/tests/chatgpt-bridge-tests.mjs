@@ -82,6 +82,7 @@ function createDomElement(tagName, {
   children = [],
   text = "",
   value,
+  files = [],
   visible = true,
   disabled = false,
 } = {}) {
@@ -94,6 +95,7 @@ function createDomElement(tagName, {
     textContent: text,
     innerText: text,
     disabled,
+    files,
     visible,
     clickCount: 0,
     getAttribute(name) {
@@ -215,13 +217,13 @@ function createSendButton(attributes = {}) {
   });
 }
 
-function createExactDialog(conversationId, composer, send) {
+function createExactDialog(conversationId, composer, send, extraChildren = []) {
   const rawIdentity = conversationId.startsWith("local-chatgpt:") ?
     `chatgpt:${conversationId}` :
     conversationId.slice("local:".length);
   const identityRoot = createDomElement("div", {
     attributes: { "data-above-composer-conversation-id": rawIdentity },
-    children: [composer, send],
+    children: [...extraChildren, composer, send],
   });
   return createDomElement("div", {
     attributes: { role: "dialog", "data-pip-obstacle": "quick-chat" },
@@ -607,20 +609,223 @@ test("zero-reference generation skips attachment upload and preserves an empty r
 });
 
 test("attachment discovery uses visible upload controls without private APIs", () => {
-  const expression = buildAttachmentButtonExpression();
+  const expression = buildAttachmentButtonExpression("chatgpt-main-chat", EXACT_CHATGPT_ID);
   assert.match(expression, /Attach|添加|上传|文件/i);
   assert.match(expression, /click/);
   assert.doesNotMatch(expression, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
 });
 
 test("attachment acknowledgement recognizes rendered attachment cards", () => {
-  const expression = buildAttachmentAcknowledgementExpression(["reference-a.jpg", "reference-b.png"]);
+  const expression = buildAttachmentAcknowledgementExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    ["reference-a.jpg", "reference-b.png"],
+  );
   assert.match(expression, /aria-label/);
   assert.match(expression, /title/);
   assert.match(expression, /alt/);
   assert.match(expression, /reference-a\.jpg/);
   assert.match(expression, /reference-b\.png/);
   assert.doesNotMatch(expression, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
+});
+
+test("attachment button ignores an earlier Codex attach control", () => {
+  const codexAttach = createDomElement("button", {
+    attributes: { "aria-label": "Add files" },
+  });
+  const codexComposer = createComposer();
+  const codexRoot = createDomElement("main", {
+    children: [codexAttach, codexComposer],
+  });
+  const chatAttach = createDomElement("button", {
+    attributes: { "aria-label": "添加文件" },
+  });
+  const chatComposer = createComposer();
+  const chatSend = createSendButton();
+  const chatRoot = createExactDialog(EXACT_CHATGPT_ID, chatComposer, chatSend, [chatAttach]);
+  const harness = createDomHarness([codexRoot, chatRoot]);
+
+  const result = harness.evaluate(buildAttachmentButtonExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  ));
+
+  assert.equal(result.clicked, true);
+  assert.equal(codexAttach.clickCount, 0);
+  assert.equal(chatAttach.clickCount, 1);
+});
+
+test("file input resolves only inside the exact leased ChatGPT root", () => {
+  const codexInput = createDomElement("input", {
+    attributes: { type: "file" },
+  });
+  const codexComposer = createComposer();
+  const codexRoot = createDomElement("main", {
+    children: [codexInput, codexComposer],
+  });
+  const chatInput = createDomElement("input", {
+    attributes: { type: "file" },
+  });
+  const chatRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [chatInput],
+  );
+  const harness = createDomHarness([codexRoot, chatRoot]);
+
+  const selected = harness.evaluate(bridgeRuntime.buildAttachmentInputExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  ));
+
+  assert.equal(selected, chatInput);
+  assert.notEqual(selected, codexInput);
+});
+
+test("zero or multiple exact-root file inputs fail before DOM.setFileInputFiles", () => {
+  const zeroInputRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+  );
+  const zeroHarness = createDomHarness([zeroInputRoot]);
+  assert.equal(zeroHarness.evaluate(bridgeRuntime.buildAttachmentInputExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  )), null);
+
+  const inputA = createDomElement("input", { attributes: { type: "file" } });
+  const inputB = createDomElement("input", { attributes: { type: "file" } });
+  const multipleRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [inputA, inputB],
+  );
+  const multipleHarness = createDomHarness([multipleRoot]);
+  assert.equal(multipleHarness.evaluate(bridgeRuntime.buildAttachmentInputExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  )), null);
+});
+
+test("attachment acknowledgement ignores identical filenames outside the exact root", () => {
+  const exactInput = createDomElement("input", {
+    attributes: { type: "file" },
+    files: [],
+  });
+  const exactRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [exactInput, createDomElement("div", { attributes: { title: "other.png" } })],
+  );
+  const outsideCard = createDomElement("div", {
+    attributes: { title: "same.png" },
+  });
+  const harness = createDomHarness([exactRoot, outsideCard]);
+
+  const result = harness.evaluate(bridgeRuntime.buildAttachmentAcknowledgementExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    ["same.png"],
+  ));
+
+  assert.equal(result, false);
+});
+
+test("attachment acknowledgement fails after conversation identity or Quick Chat route changes", () => {
+  const mainInput = createDomElement("input", {
+    attributes: { type: "file" },
+    files: [{ name: "same.png" }],
+  });
+  const mainRoot = createExactDialog(
+    "local-chatgpt:77777777-7777-4777-8777-777777777777",
+    createComposer(),
+    createSendButton(),
+    [mainInput],
+  );
+  const mainHarness = createDomHarness([mainRoot]);
+  assert.equal(mainHarness.evaluate(bridgeRuntime.buildAttachmentAcknowledgementExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    ["same.png"],
+  )), false);
+
+  const quickInput = createDomElement("input", {
+    attributes: { type: "file" },
+    files: [{ name: "same.png" }],
+  });
+  const quickHarness = createDomHarness([quickInput], {
+    href: quickChatAppUrl("local-chatgpt:88888888-8888-4888-8888-888888888888"),
+  });
+  assert.equal(quickHarness.evaluate(bridgeRuntime.buildAttachmentAcknowledgementExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+    ["same.png"],
+  )), false);
+});
+
+test("remote attachment input object is released after DOM.requestNode success and failure", async () => {
+  const prepared = {
+    surface: "chatgpt-main-chat",
+    conversationId: EXACT_CHATGPT_ID,
+  };
+  const successCalls = [];
+  const successSession = {
+    async evaluateRemoteObject() {
+      successCalls.push("evaluateRemoteObject");
+      return { objectId: "remote-success" };
+    },
+    async send(method, params) {
+      successCalls.push([method, params]);
+      if (method === "DOM.requestNode") return { nodeId: 123 };
+      return {};
+    },
+  };
+  assert.equal(
+    await bridgeRuntime.requestExactAttachmentInputNode(successSession, prepared),
+    123,
+  );
+  assert.deepEqual(successCalls.map((entry) => Array.isArray(entry) ? entry[0] : entry), [
+    "evaluateRemoteObject",
+    "DOM.requestNode",
+    "Runtime.releaseObject",
+  ]);
+
+  const failureCalls = [];
+  const failureSession = {
+    async evaluateRemoteObject() {
+      failureCalls.push("evaluateRemoteObject");
+      return { objectId: "remote-failure" };
+    },
+    async send(method) {
+      failureCalls.push(method);
+      if (method === "DOM.requestNode") throw new Error("requestNode failed");
+      return {};
+    },
+  };
+  await assert.rejects(
+    bridgeRuntime.requestExactAttachmentInputNode(failureSession, prepared),
+    /requestNode failed/,
+  );
+  assert.deepEqual(failureCalls, ["evaluateRemoteObject", "DOM.requestNode", "Runtime.releaseObject"]);
+});
+
+test("zero-reference generation performs no attachment UI or CDP calls", async () => {
+  let calls = 0;
+  const session = {
+    async evaluate() { calls += 1; },
+    async evaluateRemoteObject() { calls += 1; },
+    async send() { calls += 1; },
+  };
+  await bridgeRuntime.attachJobReferences(
+    session,
+    { surface: "chatgpt-main-chat", conversationId: EXACT_CHATGPT_ID },
+    { references: [] },
+  );
+  assert.equal(calls, 0);
 });
 
 test("composer focus selects only the exact leased ChatGPT root", () => {
