@@ -83,6 +83,19 @@ function refreshDeployedRuntimeEntry(skills, runtime) {
   }
 }
 
+function rewriteManifestPair(skills, runtime, mutate) {
+  const manifestPaths = [
+    path.join(skills, "dispatch-chatgpt-bridge", "deployment-manifest.json"),
+    path.join(runtime, "deployment-manifest.json"),
+  ];
+  const manifests = manifestPaths.map((manifestPath) => JSON.parse(readFileSync(manifestPath, "utf8")));
+  for (const manifest of manifests) mutate(manifest);
+  for (let index = 0; index < manifests.length; index += 1) {
+    manifests[index].manifestHash = manifestHash(manifests[index]);
+    writeFileSync(manifestPaths[index], `${JSON.stringify(canonicalize(manifests[index]))}\n`, "utf8");
+  }
+}
+
 function treeSnapshot(root) {
   const entries = [];
   function visit(directory, relative = "") {
@@ -533,6 +546,182 @@ test("runner rejects missing, corrupt, path-bound and managed-file drift before 
       assert.equal(existsSync(marker), false, scenario);
       assert.equal(existsSync(output), false, scenario);
     }
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("runner and verify reject every non-normalized managed path before reading outside the deployment root", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-managed-paths-"));
+  try {
+    const cases = [
+      { name: "parent-forward", skill: "../outside", runtime: "windows/scripts/../outside" },
+      { name: "parent-backslash", skill: "..\\outside", runtime: "windows/scripts/..\\outside" },
+      { name: "drive-absolute", skill: "C:\\outside\\file", runtime: "windows/scripts/C:\\outside" },
+      { name: "dot-segment", skill: "nested/./file", runtime: "windows/scripts/nested/./file" },
+      { name: "empty-segment", skill: "nested//file", runtime: "windows/scripts/nested//file" },
+      { name: "leading-slash", skill: "/outside", runtime: "windows/scripts/outside" },
+      { name: "trailing-slash", skill: "nested/file/", runtime: "windows/scripts/outside" },
+      { name: "runtime-prefix", skill: "SKILL.md", runtime: "not-windows-scripts/file" },
+    ];
+    for (const testCase of cases) {
+      const caseRoot = path.join(temporaryRoot, testCase.name);
+      const skills = path.join(caseRoot, "skills");
+      const runtime = path.join(caseRoot, "runtime");
+      assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+      const external = path.join(caseRoot, "outside");
+      writeFileSync(external, "DO_NOT_READ_EXTERNAL_CONTENT", "utf8");
+      rewriteManifestPair(skills, runtime, (manifest) => {
+        manifest.managedFiles.skill[0].path = testCase.skill;
+        manifest.managedFiles.runtime[0].path = testCase.runtime;
+      });
+      const marker = path.join(caseRoot, "node-called.txt");
+      const fakeBin = makeFakeNode(caseRoot, marker);
+      const input = path.join(caseRoot, "input.json");
+      const output = path.join(caseRoot, "output.json");
+      writeFileSync(input, "{}\n", "utf8");
+      const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+      const result = runPowerShell(runner, [
+        "-Root", runtime, "-Action", "plan", "-InputPath", input, "-OutputPath", output,
+      ], { PATH: `${fakeBin};${process.env.PATH}` });
+      assert.notEqual(result.status, 0, testCase.name);
+      assert.match(result.stderr + result.stdout, /Bridge consistency gate failed before Node\/CDP/);
+      assert.doesNotMatch(result.stderr + result.stdout, /DO_NOT_READ_EXTERNAL_CONTENT/);
+      assert.equal(existsSync(marker), false, testCase.name);
+      assert.equal(existsSync(output), false, testCase.name);
+      const verification = runPowerShell(verifyScript, installArgs(skills, runtime));
+      assert.notEqual(verification.status, 0, testCase.name);
+      assert.doesNotMatch(verification.stderr + verification.stdout, /DO_NOT_READ_EXTERNAL_CONTENT/);
+    }
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("manifest rejects case-insensitive duplicate managed paths with a deterministic error", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-case-duplicate-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    rewriteManifestPair(skills, runtime, (manifest) => {
+      const skillEntry = manifest.managedFiles.skill[0];
+      const runtimeEntry = manifest.managedFiles.runtime[0];
+      manifest.managedFiles.skill.push({ path: skillEntry.path.toUpperCase(), sha256: skillEntry.sha256 });
+      manifest.managedFiles.runtime.push({ path: runtimeEntry.path.toUpperCase(), sha256: runtimeEntry.sha256 });
+    });
+    const result = runPowerShell(verifyScript, installArgs(skills, runtime));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr + result.stdout, /duplicate/i);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("manifest rejects weak or mistyped version, commit, schema and transaction fields", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-schema-"));
+  try {
+    const cases = [
+      { name: "semver", mutate: (manifest) => { manifest.bridgeVersion = "v0.5"; } },
+      { name: "protocol-type", mutate: (manifest) => { manifest.protocolVersion = 2; } },
+      { name: "commit-status", mutate: (manifest) => { manifest.sourceCommit = "not-a-commit"; manifest.sourceCommitStatus = "exact-clean"; } },
+      { name: "transaction-id", mutate: (manifest) => { manifest.transactionId = "not-a-transaction"; } },
+      { name: "schema-type", mutate: (manifest) => { manifest.schemaVersion = "1"; } },
+      { name: "unknown-field", mutate: (manifest) => { manifest.unexpected = "reject-me"; } },
+    ];
+    for (const testCase of cases) {
+      const caseRoot = path.join(temporaryRoot, testCase.name);
+      const skills = path.join(caseRoot, "skills");
+      const runtime = path.join(caseRoot, "runtime");
+      assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+      rewriteManifestPair(skills, runtime, testCase.mutate);
+      const result = runPowerShell(verifyScript, installArgs(skills, runtime));
+      assert.notEqual(result.status, 0, testCase.name);
+      assert.match(result.stderr + result.stdout, /invalid|missing|unknown|duplicate|schema|version|commit|transaction/i, testCase.name);
+    }
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("journal recovery refuses unknown state or typed corruption without deleting residue", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-journal-schema-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    mkdirSync(skills, { recursive: true });
+    const id = "a".repeat(32);
+    const journal = {
+      schemaVersion: 1,
+      transactionId: id,
+      state: "unknown-state",
+      journalPath: path.join(skills, `.dispatch-chatgpt-bridge-install-${id}.journal.json`),
+      skillTarget: path.join(skills, "dispatch-chatgpt-bridge"),
+      runtimeTarget: runtime,
+      skillStage: path.join(skills, `.dispatch-chatgpt-bridge-stage-skill-${id}`),
+      runtimeStage: path.join(temporaryRoot, `.dispatch-chatgpt-bridge-stage-runtime-${id}`),
+      skillBackup: path.join(skills, `.dispatch-chatgpt-bridge-backup-skill-${id}`),
+      runtimeBackup: path.join(temporaryRoot, `.dispatch-chatgpt-bridge-backup-runtime-${id}`),
+      skillQuarantine: path.join(skills, `.dispatch-chatgpt-bridge-quarantine-skill-${id}`),
+      runtimeQuarantine: path.join(temporaryRoot, `.dispatch-chatgpt-bridge-quarantine-runtime-${id}`),
+      manifestHash: "0".repeat(64),
+      skillOriginallyPresent: false,
+      runtimeOriginallyPresent: false,
+    };
+    mkdirSync(journal.skillStage, { recursive: true });
+    mkdirSync(journal.runtimeStage, { recursive: true });
+    writeFileSync(path.join(journal.skillStage, "sentinel.txt"), "keep-me", "utf8");
+    writeFileSync(path.join(journal.runtimeStage, "sentinel.txt"), "keep-me", "utf8");
+    writeFileSync(journal.journalPath, `${JSON.stringify(journal)}\n`, "utf8");
+    const result = runPowerShell(installScript, installArgs(skills, runtime));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr + result.stdout, /state|journal|invalid|refus/i);
+    assert.equal(existsSync(journal.journalPath), true);
+    assert.equal(existsSync(path.join(journal.skillStage, "sentinel.txt")), true);
+    assert.equal(existsSync(path.join(journal.runtimeStage, "sentinel.txt")), true);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("journal recovery rejects a non-boolean originally-present field before deleting residue", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-journal-types-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    mkdirSync(skills, { recursive: true });
+    const id = "b".repeat(32);
+    const journalPath = path.join(skills, `.dispatch-chatgpt-bridge-install-${id}.journal.json`);
+    const skillStage = path.join(skills, `.dispatch-chatgpt-bridge-stage-skill-${id}`);
+    const runtimeStage = path.join(temporaryRoot, `.dispatch-chatgpt-bridge-stage-runtime-${id}`);
+    const journal = {
+      schemaVersion: 1,
+      transactionId: id,
+      state: "prepared",
+      journalPath,
+      skillTarget: path.join(skills, "dispatch-chatgpt-bridge"),
+      runtimeTarget: runtime,
+      skillStage,
+      runtimeStage,
+      skillBackup: path.join(skills, `.dispatch-chatgpt-bridge-backup-skill-${id}`),
+      runtimeBackup: path.join(temporaryRoot, `.dispatch-chatgpt-bridge-backup-runtime-${id}`),
+      skillQuarantine: path.join(skills, `.dispatch-chatgpt-bridge-quarantine-skill-${id}`),
+      runtimeQuarantine: path.join(temporaryRoot, `.dispatch-chatgpt-bridge-quarantine-runtime-${id}`),
+      manifestHash: "0".repeat(64),
+      skillOriginallyPresent: "false",
+      runtimeOriginallyPresent: false,
+    };
+    mkdirSync(skillStage, { recursive: true });
+    mkdirSync(runtimeStage, { recursive: true });
+    writeFileSync(path.join(skillStage, "sentinel.txt"), "keep-me", "utf8");
+    writeFileSync(path.join(runtimeStage, "sentinel.txt"), "keep-me", "utf8");
+    writeFileSync(journalPath, `${JSON.stringify(journal)}\n`, "utf8");
+    const result = runPowerShell(installScript, installArgs(skills, runtime));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr + result.stdout, /boolean|journal|invalid|refus/i);
+    assert.equal(existsSync(journalPath), true);
+    assert.equal(existsSync(path.join(skillStage, "sentinel.txt")), true);
+    assert.equal(existsSync(path.join(runtimeStage, "sentinel.txt")), true);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }

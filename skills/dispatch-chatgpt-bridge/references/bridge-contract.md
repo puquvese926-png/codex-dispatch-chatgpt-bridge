@@ -352,6 +352,21 @@ must be byte-equivalent after canonicalization. Extra files under either target
 are preserved and ignored; they are never used to satisfy a managed entry or
 overwritten as part of an upgrade.
 
+Every managed path is a strict normalized forward-slash relative path: no
+backslashes, drive/UNC prefixes, colon, NUL, leading/trailing slash, empty
+segment, `.` or `..` segment, Windows-invalid filename character or trailing
+dot/space is accepted. Runtime entries must start with the exact
+`windows/scripts/` prefix. Before any `Join-Path`, the same validator is used by
+manifest shape validation and inventory resolution. Paths are sorted with ordinal
+comparers, and case-insensitive Windows duplicates are rejected explicitly rather
+than delegated to locale-sensitive sorting.
+
+The manifest schema is strict for version/protocol/commit/status/transaction
+types and known keys. A clean exact status, dirty status or Git-status-unavailable
+status requires a lowercase 40-hex commit; unavailable requires the literal
+`unavailable`. Invalid or unknown fields fail before target tree reads, Node or
+CDP.
+
 `sourceCommitStatus=exact-clean` means the recorded Git HEAD was read from a
 clean worktree. `dirty-worktree` means the HEAD is only provenance and the file
 hashes are authoritative; `unavailable` means Git could not provide a commit.
@@ -364,6 +379,11 @@ residue. On failure it restores the old pair. A journal left by process death is
 recovered only when its transaction ID, parent, prefix, target and manifest are
 verified; unknown/corrupt residue is refused, not blindly deleted. The next
 install is the recovery command. It does not restart Codex.
+
+Journal recovery also requires schema version 1, one of the known transaction
+states, strict absolute path/string fields, a lowercase manifest hash and real
+JSON booleans for the original-target flags. Unknown state, wrong field type or
+malformed path leaves the journal and all staging/backup residue untouched.
 
 Before Node, CDP, UI mutation or business output, `run-bridge.ps1` requires the
 current Skill manifest and selected Runtime manifest to match in canonical hash,

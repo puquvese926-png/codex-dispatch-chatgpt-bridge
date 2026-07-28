@@ -167,8 +167,8 @@ function Get-TransactionPaths {
 
 function Assert-JournalPaths {
     param([Parameter(Mandatory = $true)][object]$Journal)
+    Assert-InstallJournalShape -Journal $Journal
     $id = [string]$Journal.transactionId
-    if ($id -notmatch '^[0-9a-f]{32}$') { throw 'Install journal transaction ID is invalid; refusing recovery.' }
     Assert-OwnedJournalPath -Path $Journal.journalPath -TransactionId $id | Out-Null
     Assert-OwnedSiblingPath -Path $Journal.skillStage -Parent $skillsParent -Prefix '.dispatch-chatgpt-bridge-stage-skill-' -TransactionId $id | Out-Null
     Assert-OwnedSiblingPath -Path $Journal.runtimeStage -Parent $runtimeParent -Prefix '.dispatch-chatgpt-bridge-stage-runtime-' -TransactionId $id | Out-Null
@@ -179,6 +179,32 @@ function Assert-JournalPaths {
     if ((ConvertTo-BridgeAbsolutePath -Path $Journal.skillTarget -Label 'journal Skill target') -ne $targetSkillRoot -or
         (ConvertTo-BridgeAbsolutePath -Path $Journal.runtimeTarget -Label 'journal Runtime target') -ne $targetRuntimeRoot) {
         throw 'Install journal targets do not match this invocation; refusing recovery.'
+    }
+}
+
+function Assert-InstallJournalShape {
+    param([Parameter(Mandatory = $true)][object]$Journal)
+    Assert-BridgeObjectKeys -Object $Journal -Allowed @(
+        'schemaVersion', 'transactionId', 'state', 'journalPath', 'skillTarget', 'runtimeTarget',
+        'skillStage', 'runtimeStage', 'skillBackup', 'runtimeBackup', 'skillQuarantine',
+        'runtimeQuarantine', 'manifestHash', 'skillOriginallyPresent', 'runtimeOriginallyPresent'
+    ) -Label 'Install journal'
+    if (-not (Test-JsonInteger -Value $Journal.schemaVersion) -or [int64]$Journal.schemaVersion -ne 1) {
+        throw 'Install journal schemaVersion is invalid; refusing recovery.'
+    }
+    $id = Assert-StrictText -Value $Journal.transactionId -Label 'Install journal transactionId'
+    if ($id -notmatch '^[0-9a-f]{32}$') { throw 'Install journal transaction ID is invalid; refusing recovery.' }
+    $state = Assert-StrictText -Value $Journal.state -Label 'Install journal state'
+    if ($state -notin @('prepared', 'backed-up-skill', 'skill-switched', 'backed-up-runtime', 'runtime-switched', 'rollback-required', 'committed')) {
+        throw "Install journal state is unknown: $state"
+    }
+    foreach ($field in @('journalPath', 'skillTarget', 'runtimeTarget', 'skillStage', 'runtimeStage', 'skillBackup', 'runtimeBackup', 'skillQuarantine', 'runtimeQuarantine')) {
+        Assert-StrictText -Value $Journal.$field -Label "Install journal $field" | Out-Null
+    }
+    $manifestHash = Assert-StrictText -Value $Journal.manifestHash -Label 'Install journal manifestHash'
+    if ($manifestHash -notmatch '^[0-9a-f]{64}$') { throw 'Install journal manifestHash is invalid; refusing recovery.' }
+    foreach ($field in @('skillOriginallyPresent', 'runtimeOriginallyPresent')) {
+        if ($Journal.$field -isnot [bool]) { throw "Install journal $field must be a JSON boolean; refusing recovery." }
     }
 }
 
@@ -232,18 +258,46 @@ function Recover-InstallJournals {
         try { $journal = Get-Content -LiteralPath $journalFile.FullName -Raw | ConvertFrom-Json }
         catch { throw "Install journal is corrupt; refusing recovery: $($journalFile.FullName)" }
         Assert-JournalPaths -Journal $journal
-        $skillOwned = Test-OwnInstalledTarget -Target $targetSkillRoot -ExpectedHash ([string]$journal.manifestHash)
-        $runtimeOwned = Test-OwnInstalledTarget -Target $targetRuntimeRoot -ExpectedHash ([string]$journal.manifestHash)
-        if ($skillOwned -and $runtimeOwned) {
-            Remove-OwnedSiblingPath -Path $journal.skillStage -Parent $skillsParent -Prefix '.dispatch-chatgpt-bridge-stage-skill-' -TransactionId $journal.transactionId
-            Remove-OwnedSiblingPath -Path $journal.runtimeStage -Parent $runtimeParent -Prefix '.dispatch-chatgpt-bridge-stage-runtime-' -TransactionId $journal.transactionId
-            Remove-OwnedSiblingPath -Path $journal.skillBackup -Parent $skillsParent -Prefix '.dispatch-chatgpt-bridge-backup-skill-' -TransactionId $journal.transactionId
-            Remove-OwnedSiblingPath -Path $journal.runtimeBackup -Parent $runtimeParent -Prefix '.dispatch-chatgpt-bridge-backup-runtime-' -TransactionId $journal.transactionId
-        } else {
-            Restore-InstallTransaction -Journal $journal
+        $state = [string]$journal.state
+        $journalRemoved = $false
+        switch ($state) {
+            'prepared' {
+                foreach ($residue in @(
+                    @{ path = $journal.skillBackup; parent = $skillsParent; prefix = '.dispatch-chatgpt-bridge-backup-skill-' },
+                    @{ path = $journal.runtimeBackup; parent = $runtimeParent; prefix = '.dispatch-chatgpt-bridge-backup-runtime-' },
+                    @{ path = $journal.skillQuarantine; parent = $skillsParent; prefix = '.dispatch-chatgpt-bridge-quarantine-skill-' },
+                    @{ path = $journal.runtimeQuarantine; parent = $runtimeParent; prefix = '.dispatch-chatgpt-bridge-quarantine-runtime-' }
+                )) {
+                    if (Test-Path -LiteralPath $residue.path) { throw "Prepared install journal has unexpected switched residue; refusing recovery: $($residue.path)" }
+                }
+                Remove-OwnedSiblingPath -Path $journal.skillStage -Parent $skillsParent -Prefix '.dispatch-chatgpt-bridge-stage-skill-' -TransactionId $journal.transactionId
+                Remove-OwnedSiblingPath -Path $journal.runtimeStage -Parent $runtimeParent -Prefix '.dispatch-chatgpt-bridge-stage-runtime-' -TransactionId $journal.transactionId
+            }
+            'runtime-switched' {
+                $skillOwned = Test-OwnInstalledTarget -Target $targetSkillRoot -ExpectedHash ([string]$journal.manifestHash)
+                $runtimeOwned = Test-OwnInstalledTarget -Target $targetRuntimeRoot -ExpectedHash ([string]$journal.manifestHash)
+                if ($skillOwned -and $runtimeOwned) {
+                    Remove-CommittedTransactionResidue -Journal $journal
+                    $journalRemoved = $true
+                } else {
+                    Restore-InstallTransaction -Journal $journal
+                }
+            }
+            'committed' {
+                $skillOwned = Test-OwnInstalledTarget -Target $targetSkillRoot -ExpectedHash ([string]$journal.manifestHash)
+                $runtimeOwned = Test-OwnInstalledTarget -Target $targetRuntimeRoot -ExpectedHash ([string]$journal.manifestHash)
+                if (-not ($skillOwned -and $runtimeOwned)) {
+                    throw 'Committed install journal does not own both target trees; refusing recovery.'
+                }
+                Remove-CommittedTransactionResidue -Journal $journal
+                $journalRemoved = $true
+            }
+            default { Restore-InstallTransaction -Journal $journal }
         }
-        Assert-OwnedJournalPath -Path $journal.journalPath -TransactionId $journal.transactionId | Out-Null
-        Remove-Item -LiteralPath $journal.journalPath -Force
+        if (-not $journalRemoved) {
+            Assert-OwnedJournalPath -Path $journal.journalPath -TransactionId $journal.transactionId | Out-Null
+            Remove-Item -LiteralPath $journal.journalPath -Force
+        }
     }
 }
 
