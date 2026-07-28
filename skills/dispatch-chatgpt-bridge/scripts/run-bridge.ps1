@@ -22,6 +22,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Machine-readable runner output must be byte-stable when PowerShell 5.1 is
+# launched without a console or with stdout redirected. Do this before any
+# discovery, manifest diagnostics, JSON conversion, or error is emitted.
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
+
 $skillRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'deployment-manifest.ps1')
 

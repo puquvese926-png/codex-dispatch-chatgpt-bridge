@@ -14,6 +14,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
 $portWasExplicit = $PSBoundParameters.ContainsKey('Port')
 
 if ($PSVersionTable.PSEdition -ne 'Desktop') {

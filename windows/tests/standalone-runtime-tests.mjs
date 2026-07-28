@@ -1746,8 +1746,7 @@ test("two concurrent detached launches with one output path still keep token-bou
 
 test("direct detached Node preserves spaces ampersands and percent signs without cmd expansion", () => {
   const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-quoting-"));
-  let childPid = null;
-  let wrapperPid = null;
+  const childPids = [];
   try {
     const specialRoot = path.join(temporaryRoot, "桥接 & percent %");
     const skills = path.join(specialRoot, "skills & %");
@@ -1756,26 +1755,32 @@ test("direct detached Node preserves spaces ampersands and percent signs without
     assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
     makeDetachedReportRuntime(runtime, 1200);
     refreshDeployedRuntimeEntry(skills, runtime);
-    const inputPath = path.join(specialRoot, "input & percent %.json");
-    const outputPath = path.join(specialRoot, "report & percent %.json");
     mkdirSync(specialRoot, { recursive: true });
-    writeFileSync(inputPath, "{}\n", "utf8");
     const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
-    const launched = runDetachedRunner(runner, runtime, "batch", inputPath, outputPath, launchRoot, ["-AllowSend"]);
-    assertPowerShellSuccess(launched);
-    const launch = JSON.parse(launched.stdout);
-    childPid = launch.pid;
-    wrapperPid = launch.wrapperPid;
-    const waited = runPowerShell(runner, [
-      "-Action", "wait", "-LaunchPath", launch.launchPath, "-TimeoutMs", "15000", "-PollMs", "250",
-    ]);
-    assertPowerShellSuccess(waited);
-    const status = JSON.parse(waited.stdout);
-    assert.equal(status.state, "complete");
-    assert.equal(JSON.parse(readFileSync(outputPath, "utf8")).launchId, launch.launchId);
+    for (const iteration of ["one", "two"]) {
+      const inputPath = path.join(specialRoot, `input & percent % ${iteration}.json`);
+      const outputPath = path.join(specialRoot, `report & percent % ${iteration}.json`);
+      writeFileSync(inputPath, "{}\n", "utf8");
+      const launched = runDetachedRunner(runner, runtime, "batch", inputPath, outputPath, launchRoot, ["-AllowSend"]);
+      assertPowerShellSuccess(launched);
+      const launch = JSON.parse(launched.stdout);
+      childPids.push(launch.pid, launch.wrapperPid);
+      assert.match(launch.launchPath, /桥接/u);
+      const observed = runPowerShell(runner, [
+        "-Action", "status", "-LaunchPath", launch.launchPath,
+      ]);
+      assertPowerShellSuccess(observed);
+      assert.equal(JSON.parse(observed.stdout).launchPath, launch.launchPath);
+      const waited = runPowerShell(runner, [
+        "-Action", "wait", "-LaunchPath", launch.launchPath, "-TimeoutMs", "15000", "-PollMs", "250",
+      ]);
+      assertPowerShellSuccess(waited);
+      const status = JSON.parse(waited.stdout);
+      assert.equal(status.state, "complete");
+      assert.equal(JSON.parse(readFileSync(outputPath, "utf8")).launchId, launch.launchId);
+    }
   } finally {
-    stopProcess(childPid);
-    stopProcess(wrapperPid);
+    for (const pid of childPids) stopProcess(pid);
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
 });

@@ -234,6 +234,9 @@ progress sidecar; their detached records have `progressPath: null`.
 `-Detach` creates a durable launch record before starting the child and returns
 `launchId`, `launchPath`, `reportPath`, `progressPath`, `stdoutPath`,
 `stderrPath`, PID/start-time identity and the recorded authorization facts.
+All runner JSON emitted to stdout or stderr is UTF-8 without a BOM, including
+detached launch handles and runner-only `status`/`wait` results; callers must
+parse those bytes as UTF-8 even when PowerShell has no interactive console.
 `launchId` is also injected as a validated, ignored bridge launch token into the
 final Node command line. Process attribution matches that token, never merely a
 report path; two callers sharing an output path cannot adopt each other's PID.
