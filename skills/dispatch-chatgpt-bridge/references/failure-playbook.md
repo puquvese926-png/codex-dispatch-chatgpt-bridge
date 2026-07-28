@@ -99,11 +99,13 @@ process start time. Each final Node command line also carries the unique launch 
 PID attribution uses that token, not the report path, so equal output paths cannot
 cross-adopt a process.
 
-If the Windows worker was created but the final Node process could not be attributed,
-the launch is `starting` with `errorClass: created-but-unattributed`, a wrapper PID and
-`unknown-after-launch`. This is an ambiguous post-launch state: do not mark it as
-`not-created`, do not start a replacement batch, and do not retry automatically. Only a
-proven failure before worker creation is `not-created`/`failed`.
+If Windows created the detached final Node process but it could not be uniquely
+attributed, the launch is `starting` with `errorClass: created-but-unattributed`
+and `unknown-after-launch`. `wrapperPid` is retained as a legacy diagnostic alias;
+on the current direct CIM path it equals the final Node PID, not a second worker
+PID. This is an ambiguous post-launch state: do not mark it as `not-created`, do
+not start a replacement batch, and do not retry automatically. Only a proven
+final-process creation failure is `not-created`/`failed`.
 
 Safe response: preserve the launch directory and business files, do not start another
 batch, and do not infer success from a visible window. Re-run `status` with the exact

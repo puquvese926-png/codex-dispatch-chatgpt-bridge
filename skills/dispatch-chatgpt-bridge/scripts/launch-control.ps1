@@ -474,13 +474,6 @@ function Get-LaunchStatus {
     ambiguousJobs = $ambiguous
   }
 
-  if ($record.errorClass -eq 'created-but-unattributed' -and $null -eq $report) {
-    $base.state = 'unknown-after-launch'
-    $base.reason = 'created-but-unattributed'
-    $base.recoveryRequired = $true
-    $base.retryAllowed = $false
-    return $base
-  }
   if ($reportResult.corrupt) {
     $base.reason = $reportResult.error
     $base.reportCorrupt = $true
@@ -488,9 +481,16 @@ function Get-LaunchStatus {
     return $base
   }
   if ($progressResult.corrupt -and $progressResult.error -eq 'progress-rebound') {
-    $base.reason = 'progress-rebound'
+    $base.reason = $progressResult.error
     $base.progressCorrupt = $true
     $base.progressRebound = $true
+    return $base
+  }
+  if ($record.errorClass -eq 'created-but-unattributed' -and $null -eq $report) {
+    $base.state = 'unknown-after-launch'
+    $base.reason = 'created-but-unattributed'
+    $base.recoveryRequired = $true
+    $base.retryAllowed = $false
     return $base
   }
   if ($null -ne $report) {

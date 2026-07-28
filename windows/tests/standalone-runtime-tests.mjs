@@ -1412,6 +1412,77 @@ test("status rejects rebound report and progress identities without exposing the
   }
 });
 
+test("unattributed launches still expose report and progress corruption explicitly", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-unattributed-artifacts-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const makeUnattributed = (root, command) => {
+      const fixture = writeRunningLaunchFixture(root, command);
+      const record = {
+        ...fixture.record,
+        state: "starting",
+        pid: null,
+        processStartedAt: null,
+        wrapperPid: process.pid,
+        errorClass: "created-but-unattributed",
+      };
+      writeFileSync(fixture.launchPath, JSON.stringify(record), "utf8");
+      return fixture;
+    };
+
+    const corruptRoot = path.join(temporaryRoot, "report-corrupt");
+    mkdirSync(corruptRoot, { recursive: true });
+    const corrupt = makeUnattributed(corruptRoot, "resume");
+    writeFileSync(corrupt.reportPath, "{not-json\\n", "utf8");
+    const corruptResult = runPowerShell(runner, ["-Action", "status", "-LaunchPath", corrupt.launchPath]);
+    assertPowerShellSuccess(corruptResult);
+    const corruptStatus = JSON.parse(corruptResult.stdout);
+    assert.equal(corruptStatus.reason, "report-corrupt");
+    assert.equal(corruptStatus.reportCorrupt, true);
+    assert.equal(corruptStatus.retryAllowed, undefined);
+    assert.doesNotMatch(corruptResult.stdout, /not-json/);
+
+    const reboundRoot = path.join(temporaryRoot, "report-rebound");
+    mkdirSync(reboundRoot, { recursive: true });
+    const rebound = makeUnattributed(reboundRoot, "resume");
+    writeFileSync(rebound.reportPath, JSON.stringify({
+      pass: true,
+      command: "resume",
+      launchId: crypto.randomUUID(),
+      secret: "DO_NOT_READ_UNATTRIBUTED_REPORT",
+    }), "utf8");
+    const reboundResult = runPowerShell(runner, ["-Action", "status", "-LaunchPath", rebound.launchPath]);
+    assertPowerShellSuccess(reboundResult);
+    const reboundStatus = JSON.parse(reboundResult.stdout);
+    assert.equal(reboundStatus.reason, "report-rebound");
+    assert.equal(reboundStatus.reportRebound, true);
+    assert.equal(reboundStatus.retryAllowed, undefined);
+    assert.doesNotMatch(reboundResult.stdout, /DO_NOT_READ_UNATTRIBUTED_REPORT/);
+
+    const progressRoot = path.join(temporaryRoot, "progress-rebound");
+    mkdirSync(progressRoot, { recursive: true });
+    const progress = makeUnattributed(progressRoot, "batch");
+    writeFileSync(progress.record.progressPath, JSON.stringify({
+      command: "batch",
+      launchId: crypto.randomUUID(),
+      secret: "DO_NOT_READ_UNATTRIBUTED_PROGRESS",
+      jobs: [],
+    }), "utf8");
+    const progressResult = runPowerShell(runner, ["-Action", "status", "-LaunchPath", progress.launchPath]);
+    assertPowerShellSuccess(progressResult);
+    const progressStatus = JSON.parse(progressResult.stdout);
+    assert.equal(progressStatus.reason, "progress-rebound");
+    assert.equal(progressStatus.progressRebound, true);
+    assert.equal(progressStatus.retryAllowed, undefined);
+    assert.doesNotMatch(progressResult.stdout, /DO_NOT_READ_UNATTRIBUTED_PROGRESS/);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("detached worker creation failure leaves a failed launch record under the test-only gate", () => {
   const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-start-fail-"));
   try {

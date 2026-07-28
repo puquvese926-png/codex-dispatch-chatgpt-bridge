@@ -256,12 +256,14 @@ corrupt/oversized report or progress file is surfaced as `report-corrupt` or
 `progress-corrupt`, never silently treated as absent. PID reuse is rejected by
 matching the recorded process start time.
 
-If Windows creates the detached worker but the final Node process cannot be
+If Windows creates the detached final Node process but it cannot be uniquely
 attributed, the record remains `state: "starting"` with
-`errorClass: "created-but-unattributed"`, the wrapper PID and
-`unknown-after-launch` status. This is not a pre-start failure and is never an
-automatic retry permission. Only a proven worker-creation failure may become a
-durable `failed`/`not-created` launch.
+`errorClass: "created-but-unattributed"` and `unknown-after-launch` status.
+`wrapperPid` is retained for schema compatibility as a legacy diagnostic alias;
+on the current direct CIM path it equals the final Node PID, not a second worker
+PID. This is not a pre-start failure and is never an automatic retry permission.
+Only a proven final-process creation failure may become a durable
+`failed`/`not-created` launch.
 
 The launch handle is the supported semi-automatic wait interface:
 `plan -> explicit authorization -> detach -> status/wait -> report or one

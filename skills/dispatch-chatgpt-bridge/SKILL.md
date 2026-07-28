@@ -118,10 +118,12 @@ installed content.
    read-only and do not require a valid deployment manifest, start Node, touch
    CDP, resend, resume or delete. A corrupt report/progress file is reported
    explicitly; it is not treated as no report. Never infer success from a
-   visible window alone or from a parent-process timeout. If Windows created a
-   detached worker but the final Node PID could not be uniquely attributed,
-   status reports `unknown-after-launch`; preserve that launch and do not retry
-   automatically.
+   visible window alone or from a parent-process timeout. If Windows created
+   the detached final Node process but its PID could not be uniquely
+   attributed, status reports `unknown-after-launch`; preserve that launch and
+   do not retry automatically. The compatibility `wrapperPid` field is a
+   legacy diagnostic alias and equals the final Node PID on the current direct
+   CIM path; it is not a second worker process.
 
 For image generation or editing, use schema v2. One job must equal one candidate and one newly created GPT chat. Every v2 job includes a `references` array. For original `image-generation`, use `references: []`; reference-guided generation may include 1–8 user-approved local PNG/JPEG/WebP files. `image-edit` requires 1–8 references. The bridge verifies every supplied path, type, size and SHA-256 before opening a chat, and skips the attachment UI only for an empty original-generation list. Set `conversationMode` to `fresh-per-job`, record a lifecycle ledger, and keep the default retention at seven days. Do not continue an edit or iteration inside the previous generation chat.
 

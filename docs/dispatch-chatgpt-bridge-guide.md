@@ -292,7 +292,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
 `null`，不会伪造不存在的进度文件。`status`/`wait` 是 runner-only 的只读
 诊断，不启动 Node、不连接 CDP、不恢复、不重发。报告或进度文件若损坏，
 会返回 `report-corrupt`/`progress-corrupt`，不能被解释成“还没生成”。
-如果 Windows 已创建 detached worker 但最终 Node 进程暂时无法按唯一
+如果 Windows 已创建 detached 最终 Node 进程但暂时无法按唯一
 launch UUID 归属，返回 `unknown-after-launch`；保留原 launch，不要自动重试。
 
 这形成的是“计划 → 明确授权 → detach → status/wait → 报告或一次只读恢复”
