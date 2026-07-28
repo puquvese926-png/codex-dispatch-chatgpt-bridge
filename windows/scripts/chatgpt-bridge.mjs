@@ -22,6 +22,12 @@ import {
   writeJsonAtomically,
 } from "./chatgpt-handoff-checkpoint.mjs";
 import {
+  IMAGE_LIMITS,
+  isMetadataOnlyImageSource,
+  isStrictAppBlobSource,
+  parseStrictImageDataUrl,
+} from "./chatgpt-image-materialization.mjs";
+import {
   acquireBridgeControllerLock,
   buildDispatchPlan,
   readQuickChatHealth,
@@ -67,6 +73,9 @@ const defaultStatePath = path.join(
   "state.json",
 );
 export const DEFAULT_TIMEOUT_MS = 600000;
+const PNG_DATA_PREFIX = "data:image/png;base64,";
+const MAX_RENDERED_DATA_URL_LENGTH = PNG_DATA_PREFIX.length + IMAGE_LIMITS.maxBase64Length;
+const MAX_BLOB_CHUNK_SIZE = 1024 * 1024;
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value) &&
@@ -1642,7 +1651,7 @@ function buildHistoryDeleteConfirmExpression() {
 }
 
 export function buildBlobImageDataExpression(source) {
-  if (typeof source !== "string" || !/^blob:app:\/\/-\/[A-Za-z0-9._-]{1,200}$/.test(source)) {
+  if (!isStrictAppBlobSource(source)) {
     throw new Error("Rendered blob image URL is invalid");
   }
   return `(() => {
@@ -1650,7 +1659,8 @@ export function buildBlobImageDataExpression(source) {
     const image = [...document.images]
       .find((node) => (node.currentSrc || node.src || '') === source);
     if (!image || !image.complete || image.naturalWidth < 1 || image.naturalHeight < 1 ||
-        image.naturalWidth * image.naturalHeight > 40000000) {
+        image.naturalWidth > ${IMAGE_LIMITS.maxDimension} || image.naturalHeight > ${IMAGE_LIMITS.maxDimension} ||
+        image.naturalWidth * image.naturalHeight > ${IMAGE_LIMITS.maxPixels}) {
       throw new Error('Rendered blob image is unavailable or invalid');
     }
     const canvas = document.createElement('canvas');
@@ -1660,18 +1670,18 @@ export function buildBlobImageDataExpression(source) {
     if (!context) throw new Error('Rendered blob image canvas is unavailable');
     context.drawImage(image, 0, 0);
     const dataUrl = canvas.toDataURL('image/png');
-    if (!dataUrl.startsWith('data:image/png;base64,') || dataUrl.length > 41943040) {
+    if (!dataUrl.startsWith(${JSON.stringify(PNG_DATA_PREFIX)}) || dataUrl.length > ${MAX_RENDERED_DATA_URL_LENGTH}) {
       throw new Error('Rendered blob image export is invalid');
     }
     return dataUrl;
   })()`;
 }
 
-export function buildBlobImageChunkExpression(source, offset, chunkSize = 1024 * 1024) {
-  if (typeof source !== "string" || !/^blob:app:\/\/-\/[A-Za-z0-9._-]{1,200}$/.test(source)) {
+export function buildBlobImageChunkExpression(source, offset, chunkSize = MAX_BLOB_CHUNK_SIZE) {
+  if (!isStrictAppBlobSource(source)) {
     throw new Error("Rendered blob image URL is invalid");
   }
-  if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > 4 * 1024 * 1024) {
+  if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > MAX_BLOB_CHUNK_SIZE) {
     throw new Error("Rendered blob image chunk offset or size is invalid");
   }
   return `(() => {
@@ -1681,7 +1691,8 @@ export function buildBlobImageChunkExpression(source, offset, chunkSize = 1024 *
     const image = [...document.images]
       .find((node) => (node.currentSrc || node.src || '') === source);
     if (!image || !image.complete || image.naturalWidth < 1 || image.naturalHeight < 1 ||
-        image.naturalWidth * image.naturalHeight > 40000000) {
+        image.naturalWidth > ${IMAGE_LIMITS.maxDimension} || image.naturalHeight > ${IMAGE_LIMITS.maxDimension} ||
+        image.naturalWidth * image.naturalHeight > ${IMAGE_LIMITS.maxPixels}) {
       throw new Error('Rendered blob image is unavailable or invalid');
     }
     const canvas = document.createElement('canvas');
@@ -1691,7 +1702,7 @@ export function buildBlobImageChunkExpression(source, offset, chunkSize = 1024 *
     if (!context) throw new Error('Rendered blob image canvas is unavailable');
     context.drawImage(image, 0, 0);
     const dataUrl = canvas.toDataURL('image/png');
-    if (!dataUrl.startsWith('data:image/png;base64,') || dataUrl.length > 41943040 || offset >= dataUrl.length) {
+    if (!dataUrl.startsWith(${JSON.stringify(PNG_DATA_PREFIX)}) || dataUrl.length > ${MAX_RENDERED_DATA_URL_LENGTH} || offset >= dataUrl.length) {
       throw new Error('Rendered blob image export is invalid');
     }
     const nextOffset = Math.min(offset + chunkSize, dataUrl.length);
@@ -1720,29 +1731,43 @@ export function classifyJobObservation(observation) {
   return "complete";
 }
 
-async function materializeRenderedImages(session, images) {
+export async function materializeRenderedImages(session, images) {
   const materialized = [];
   for (const image of images) {
-    if (typeof image?.src === "string" && image.src.startsWith("blob:")) {
+    if (isStrictAppBlobSource(image?.src)) {
       const chunks = [];
       let offset = 0;
       let total = null;
-      for (let index = 0; index < 64; index += 1) {
+      let received = 0;
+      let completed = false;
+      const maxChunks = Math.ceil(MAX_RENDERED_DATA_URL_LENGTH / MAX_BLOB_CHUNK_SIZE);
+      for (let index = 0; index < maxChunks; index += 1) {
         const part = await session.evaluate(buildBlobImageChunkExpression(image.src, offset), false, 60000);
         if (!isPlainObject(part) || typeof part.chunk !== "string" || part.offset !== offset ||
             !Number.isInteger(part.nextOffset) || part.nextOffset <= offset ||
-            !Number.isInteger(part.total) || part.total < part.nextOffset || typeof part.done !== "boolean") {
+            !Number.isInteger(part.total) || part.total < part.nextOffset ||
+            (total !== null && part.total !== total) ||
+            part.total > MAX_RENDERED_DATA_URL_LENGTH ||
+            part.nextOffset - part.offset !== part.chunk.length ||
+            part.chunk.length < 1 || part.chunk.length > MAX_BLOB_CHUNK_SIZE ||
+            received + part.chunk.length > MAX_RENDERED_DATA_URL_LENGTH ||
+            typeof part.done !== "boolean" || part.done !== (part.nextOffset === part.total)) {
           throw new Error("Rendered blob image chunk is invalid");
         }
         chunks.push(part.chunk);
+        received += part.chunk.length;
         total = part.total;
-        if (part.done) break;
+        if (part.done) {
+          completed = true;
+          break;
+        }
         offset = part.nextOffset;
       }
       const dataUrl = chunks.join("");
-      if (!total || dataUrl.length !== total || !dataUrl.startsWith("data:image/png;base64,")) {
+      if (!completed || !total || dataUrl.length !== total || !dataUrl.startsWith(PNG_DATA_PREFIX)) {
         throw new Error("Rendered blob image chunks are incomplete");
       }
+      parseStrictImageDataUrl(dataUrl);
       materialized.push({ ...image, src: dataUrl });
     } else {
       materialized.push(image);
@@ -1753,19 +1778,38 @@ async function materializeRenderedImages(session, images) {
 
 function normalizeImage(image) {
   if (!isPlainObject(image) || typeof image.src !== "string") return null;
-  let safe = false;
+  let data = null;
+  let url = null;
   try {
-    const url = new URL(image.src);
-    safe = url.protocol === "https:" || url.protocol === "http:" ||
-      (url.protocol === "data:" && /^data:image\/(?:png|jpeg|webp);base64,/i.test(image.src));
+    if (image.src.startsWith("data:")) data = parseStrictImageDataUrl(image.src);
+    else url = new URL(image.src);
   } catch {
-    safe = false;
+    return null;
   }
-  if (!safe) return null;
-  const width = Number.isFinite(image.width) && image.width >= 0 ? Number(image.width) : 0;
-  const height = Number.isFinite(image.height) && image.height >= 0 ? Number(image.height) : 0;
+  const remote = url && isMetadataOnlyImageSource(image.src);
+  if (!data && !remote) return null;
+  const width = data ? data.width :
+    Number.isInteger(image.width) && image.width >= 0 && image.width <= IMAGE_LIMITS.maxDimension ? image.width : 0;
+  const height = data ? data.height :
+    Number.isInteger(image.height) && image.height >= 0 && image.height <= IMAGE_LIMITS.maxDimension ? image.height : 0;
   const alt = typeof image.alt === "string" ? image.alt.slice(0, 500) : "";
   return Object.freeze({ src: image.src, width, height, alt });
+}
+
+function remoteImageMetadata(image) {
+  if (!isPlainObject(image) || typeof image.src !== "string") return null;
+  let url;
+  try {
+    url = new URL(image.src);
+  } catch {
+    return null;
+  }
+  if (!isMetadataOnlyImageSource(image.src) || !url.protocol) return null;
+  return Object.freeze({
+    width: Number.isInteger(image.width) && image.width >= 0 && image.width <= IMAGE_LIMITS.maxDimension ? image.width : 0,
+    height: Number.isInteger(image.height) && image.height >= 0 && image.height <= IMAGE_LIMITS.maxDimension ? image.height : 0,
+    alt: typeof image.alt === "string" ? image.alt.slice(0, 500) : "",
+  });
 }
 
 export function normalizeCollectedResult(value) {
@@ -1791,13 +1835,16 @@ export function normalizeCollectedResult(value) {
 
 export function summarizeCollectedImages(images) {
   if (!Array.isArray(images)) throw new Error("collected image list is invalid");
-  return images.map((image) => ({
-    sourceType: typeof image?.src === "string" && image.src.startsWith("data:image/") ?
-      "materialized-app-blob" : "remote-image",
-    width: Number(image?.width) || 0,
-    height: Number(image?.height) || 0,
-    alt: typeof image?.alt === "string" ? image.alt : "",
-  }));
+  return images.map((image) => {
+    const remote = isMetadataOnlyImageSource(image?.src);
+    return {
+      sourceType: remote ? "remote-image" : "materialized-app-blob",
+      materializationStatus: remote ? "metadata-only" : "materialized",
+      width: Number(image?.width) || 0,
+      height: Number(image?.height) || 0,
+      alt: typeof image?.alt === "string" ? image.alt : "",
+    };
+  });
 }
 
 export function buildJobRouting(
@@ -2861,52 +2908,62 @@ async function closeOwnedQuickChat(session) {
   }, 5000, "owned quick-chat target close");
 }
 
-function imageExtension(contentType) {
-  if (/image\/png/i.test(contentType)) return ".png";
-  if (/image\/(?:jpeg|jpg)/i.test(contentType)) return ".jpg";
-  if (/image\/webp/i.test(contentType)) return ".webp";
-  return null;
-}
-
-async function downloadJobImages(job, outputFile) {
+export async function materializeJobImages(job, outputFile) {
   const images = job.result?.images || [];
   if (!images.length) return [];
   const root = path.join(path.dirname(outputFile), `${path.basename(outputFile, path.extname(outputFile))}.assets`, job.id);
-  await fs.mkdir(root, { recursive: true });
+  let rootCreated = false;
   const artifacts = [];
   for (let index = 0; index < images.length; index += 1) {
     const image = images[index];
-    try {
-      let bytes;
-      let contentType;
-      if (image.src.startsWith("data:image/")) {
-        const match = image.src.match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/i);
-        if (!match) throw new Error("unsupported data image");
-        contentType = match[1];
-        bytes = Buffer.from(match[2], "base64");
-      } else {
-        const response = await fetch(image.src, { redirect: "follow" });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        contentType = response.headers.get("content-type") || "";
-        bytes = Buffer.from(await response.arrayBuffer());
+    const remote = remoteImageMetadata(image);
+    if (!remote) {
+      try {
+        const inspected = parseStrictImageDataUrl(image?.src);
+        if (!rootCreated) {
+          await fs.mkdir(root, { recursive: true });
+          rootCreated = true;
+        }
+        const extension = inspected.mime === "image/png" ? ".png" :
+          inspected.mime === "image/jpeg" ? ".jpg" : ".webp";
+        const file = path.join(root, `image-${index + 1}${extension}`);
+        await fs.writeFile(file, inspected.bytes, { flag: "wx" });
+        artifacts.push({
+          index,
+          status: "downloaded",
+          materializationStatus: "materialized",
+          sourceType: "materialized-app-blob",
+          path: file,
+          sha256: createHash("sha256").update(inspected.bytes).digest("hex"),
+          bytes: inspected.bytes.length,
+          contentType: inspected.mime,
+          width: inspected.width,
+          height: inspected.height,
+        });
+      } catch (error) {
+        artifacts.push({
+          index,
+          status: "metadata-only",
+          materializationStatus: "metadata-only",
+          sourceType: "unsupported-image",
+          width: Number.isInteger(image?.width) && image.width >= 0 && image.width <= IMAGE_LIMITS.maxDimension ? image.width : 0,
+          height: Number.isInteger(image?.height) && image.height >= 0 && image.height <= IMAGE_LIMITS.maxDimension ? image.height : 0,
+          alt: typeof image?.alt === "string" ? image.alt : "",
+          error: error.message,
+        });
       }
-      const extension = imageExtension(contentType);
-      if (!extension || bytes.length < 100 || bytes.length > 30 * 1024 * 1024) {
-        throw new Error("downloaded image type or size is invalid");
-      }
-      const file = path.join(root, `image-${index + 1}${extension}`);
-      await fs.writeFile(file, bytes, { flag: "wx" });
-      artifacts.push({
-        index,
-        status: "downloaded",
-        path: file,
-        sha256: createHash("sha256").update(bytes).digest("hex"),
-        bytes: bytes.length,
-        contentType,
-      });
-    } catch (error) {
-      artifacts.push({ index, status: "metadata-only", error: error.message });
+      continue;
     }
+    artifacts.push({
+      index,
+      status: "metadata-only",
+      materializationStatus: "metadata-only",
+      sourceType: "remote-image",
+      width: remote.width,
+      height: remote.height,
+      alt: remote.alt,
+      error: "remote image materialization is disabled; renderer-provided data is required",
+    });
   }
   return artifacts;
 }
@@ -3501,7 +3558,7 @@ async function runBatch(options, discovery) {
 
   for (let index = 0; index < jobs.length; index += 1) {
     const artifacts = jobs[index].status === "complete" ?
-      await downloadJobImages(jobs[index], options.output) : [];
+      await materializeJobImages(jobs[index], options.output) : [];
     jobs[index] = {
       ...jobs[index],
       result: jobs[index].result ? {
@@ -3694,7 +3751,7 @@ async function runResume(options, discovery) {
 
   for (let index = 0; index < jobs.length; index += 1) {
     const artifacts = jobs[index].status === "complete" ?
-      await downloadJobImages(jobs[index], options.output) : [];
+      await materializeJobImages(jobs[index], options.output) : [];
     jobs[index] = {
       ...jobs[index],
       result: jobs[index].result ? {

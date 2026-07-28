@@ -81,6 +81,7 @@ import {
 const EXACT_CHATGPT_ID = "local-chatgpt:11111111-1111-4111-8111-111111111111";
 const EXACT_LOCAL_ID = "local:22222222-2222-4222-8222-222222222222";
 const EXACT_MARKER = "CODEX-BRIDGE-exact-root-marker";
+const VALID_PNG_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 function createDomElement(tagName, {
   attributes = {},
@@ -2653,7 +2654,7 @@ test("normalizes only the target result and strips unsafe or non-image URLs", ()
     assistantText: "完成。",
     images: [
       { src: "https://files.oaiusercontent.com/image.png", width: 1024, height: 1024, alt: "generated" },
-      { src: "data:image/png;base64,AAA=", width: 2, height: 2, alt: "inline" },
+      { src: VALID_PNG_DATA_URL, width: 1, height: 1, alt: "inline" },
       { src: "javascript:alert(1)", width: 1, height: 1, alt: "bad" },
     ],
   });
@@ -2663,7 +2664,7 @@ test("normalizes only the target result and strips unsafe or non-image URLs", ()
     assistantText: "完成。",
     images: [
       { src: "https://files.oaiusercontent.com/image.png", width: 1024, height: 1024, alt: "generated" },
-      { src: "data:image/png;base64,AAA=", width: 2, height: 2, alt: "inline" },
+      { src: VALID_PNG_DATA_URL, width: 1, height: 1, alt: "inline" },
     ],
   });
   assert.ok(Object.isFrozen(normalized));
@@ -2676,10 +2677,10 @@ test("normalizes only the target result and strips unsafe or non-image URLs", ()
 
 test("keeps image metadata in reports without embedding image bytes", () => {
   assert.deepEqual(summarizeCollectedImages([
-    { src: "data:image/png;base64,AAA=", width: 1672, height: 941, alt: "已生成图像 1" },
+    { src: VALID_PNG_DATA_URL, width: 1672, height: 941, alt: "已生成图像 1" },
     { src: "https://files.oaiusercontent.com/image.png", width: 1024, height: 1024, alt: "generated" },
   ]), [
-    { sourceType: "materialized-app-blob", width: 1672, height: 941, alt: "已生成图像 1" },
-    { sourceType: "remote-image", width: 1024, height: 1024, alt: "generated" },
+    { sourceType: "materialized-app-blob", materializationStatus: "materialized", width: 1672, height: 941, alt: "已生成图像 1" },
+    { sourceType: "remote-image", materializationStatus: "metadata-only", width: 1024, height: 1024, alt: "generated" },
   ]);
 });

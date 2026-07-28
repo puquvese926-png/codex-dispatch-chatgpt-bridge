@@ -155,6 +155,26 @@ Any selector, identity or hash uncertainty fails closed. Failed deletion remains
 
 Reports preserve job status, conversation ID, marker, promptHash, per-job `surface`, `submittedAt`, routing (`requestedSurface`, `selectedSurface`, and nullable `fallbackReason`), captured history title, assistant text metadata, image dimensions, artifact paths, bytes and SHA-256. The top-level `surface` is a transport summary: `chatgpt-quick-chat`, `chatgpt-main-chat`, `mixed`, or `unknown`; it is not a durable conversation identity. Reports omit credentials and embedded image bytes.
 
+Image materialization is deliberately local and bounded. Only a strict
+`data:image/png|jpeg|webp;base64,...` value, or an exact renderer-owned
+`blob:app://-/<strict-id>` first materialized by the renderer canvas/chunk path
+into that PNG data form, may become a local artifact. MIME, magic bytes, header
+dimensions and the decoded limits are checked before allocation and before the
+`wx` write: at most 30 MiB, 40,000,000 pixels and 16,384 pixels on either side.
+PNG IHDR, JPEG SOF and WebP VP8/VP8L/VP8X headers are the dimension authority;
+DOM-reported dimensions do not authorize a file.
+
+HTTP(S), loopback, metadata-service, redirect-shaped and `blob:https` image
+sources are metadata-only. The bridge never fetches or follows them, never
+puts their URL in the final report, and never treats them as artifacts. The
+report may retain bounded width/height/alt with
+`sourceType: "remote-image"` and `materializationStatus: "metadata-only"`.
+SVG, GIF, percent-encoded data URLs, non-canonical base64, unknown blob
+protocols, malformed headers, MIME/magic mismatches and incomplete/oversized
+blob chunks fail closed without a file. A remote-only result therefore needs a
+renderer-provided materialized value or a user-supplied local save if a local
+artifact is required.
+
 Plan reports and final batch reports preserve the full `dispatchPlan`. Final
 batch reports also preserve `runState: "complete"`, the effective `timeoutMs`,
 and `progressPath`. During execution, the sidecar at `progressPath` records
