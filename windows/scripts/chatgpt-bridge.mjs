@@ -1599,6 +1599,22 @@ export function buildAttachmentButtonExpression(surface, conversationId) {
   })()`;
 }
 
+export function buildAttachmentInputStateExpression(surface, conversationId) {
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
+  return `(() => {
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return { ok: false, inputCount: null, ...resolved };
+    const inputCount = [...resolved.root.querySelectorAll('input[type="file"]')].length;
+    return {
+      ok: inputCount === 1,
+      inputCount,
+      inputPresent: inputCount === 1,
+      reason: inputCount === 0 ? 'file-input-missing' : inputCount > 1 ? 'file-input-count' : 'ready',
+    };
+  })()`;
+}
+
 export function buildAttachmentInputExpression(surface, conversationId) {
   const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
@@ -1626,15 +1642,28 @@ export function buildAttachmentAcknowledgementExpression(surface, conversationId
     if (inputs.length !== 1) return false;
     const input = inputs[0];
     const selected = input ? [...input.files].map((file) => file.name) : [];
-    const body = resolved.root.innerText || '';
-    const renderedLabels = [...resolved.root.querySelectorAll('[aria-label], [title], img[alt]')]
+    const attachmentSemantic = /attachment|attached|file|upload|image|picture|图片|附件|文件|上传|图像/iu;
+    const renderedLabels = [...resolved.root.querySelectorAll('[aria-label], [title], img[alt], [data-testid]')]
       .filter(visible)
+      .filter((node) => {
+        const tagName = (node.tagName || '').toLowerCase();
+        const dataTestId = node.getAttribute('data-testid') || '';
+        const label = [
+          node.getAttribute('aria-label') || '',
+          node.getAttribute('title') || '',
+          tagName === 'img' ? node.getAttribute('alt') || '' : '',
+        ].join(' ');
+        return tagName === 'img' && Boolean(node.getAttribute('alt')) ||
+          attachmentSemantic.test(label) ||
+          /attachment|attached|file|upload/iu.test(dataTestId);
+      })
       .flatMap((node) => [
         node.getAttribute('aria-label') || '',
         node.getAttribute('title') || '',
         node.getAttribute('alt') || '',
+        node.getAttribute('data-testid') || '',
       ]);
-    return expected.every((name) => selected.includes(name) || body.includes(name) ||
+    return expected.every((name) => selected.includes(name) ||
       renderedLabels.some((label) => label.includes(name)));
   })()`;
 }
@@ -2535,16 +2564,25 @@ async function attachJobReferences(session, prepared, job) {
     prepared.surface,
     prepared.conversationId,
   ), true);
+  if (buttonState?.reason === "file-input-count") {
+    throw new Error(`ChatGPT attachment input count is ambiguous for ${job.id}: ${buttonState.inputCount}`);
+  }
   if (!buttonState?.inputPresent && !buttonState?.clicked) {
     throw new Error(`ChatGPT attachment control was not uniquely resolved for ${job.id}: ${buttonState?.reason || "unknown"}`);
   }
-  await waitFor(async () => {
-    const state = await session.evaluate(buildAttachmentButtonExpression(
+  const inputState = await waitFor(async () => {
+    const state = await session.evaluate(buildAttachmentInputStateExpression(
       prepared.surface,
       prepared.conversationId,
     ));
+    if (state?.inputCount > 1) {
+      return { fatal: true, reason: "file-input-count", inputCount: state.inputCount };
+    }
     return state?.inputPresent ? state : null;
   }, 5000, `attachment input for ${job.id}`);
+  if (inputState?.fatal) {
+    throw new Error(`ChatGPT attachment input count is ambiguous for ${job.id}: ${inputState.inputCount}`);
+  }
   const nodeId = await requestExactAttachmentInputNode(session, prepared);
   await session.send("DOM.setFileInputFiles", {
     nodeId,

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import vm from "node:vm";
+import { fileURLToPath } from "node:url";
 
 import * as bridgeRuntime from "../scripts/chatgpt-bridge.mjs";
 import {
@@ -710,6 +712,32 @@ test("zero or multiple exact-root file inputs fail before DOM.setFileInputFiles"
   )), null);
 });
 
+test("attachment input state reports multiple exact-root inputs without clicking", () => {
+  const attach = createDomElement("button", {
+    attributes: { "aria-label": "添加文件" },
+  });
+  const inputA = createDomElement("input", { attributes: { type: "file" } });
+  const inputB = createDomElement("input", { attributes: { type: "file" } });
+  const exactRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [attach, inputA, inputB],
+  );
+  const harness = createDomHarness([exactRoot]);
+
+  const state = harness.evaluate(bridgeRuntime.buildAttachmentInputStateExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  ));
+
+  assert.equal(state.ok, false);
+  assert.equal(state.inputCount, 2);
+  assert.equal(state.inputPresent, false);
+  assert.equal(state.reason, "file-input-count");
+  assert.equal(attach.clickCount, 0);
+});
+
 test("attachment acknowledgement ignores identical filenames outside the exact root", () => {
   const exactInput = createDomElement("input", {
     attributes: { type: "file" },
@@ -733,6 +761,105 @@ test("attachment acknowledgement ignores identical filenames outside the exact r
   ));
 
   assert.equal(result, false);
+});
+
+test("attachment acknowledgement ignores identical filenames in ordinary exact-root text", () => {
+  const exactInput = createDomElement("input", {
+    attributes: { type: "file" },
+    files: [],
+  });
+  const exactRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [exactInput],
+  );
+  exactRoot.innerText = "历史消息中提到了 same.png，但这不是附件";
+  exactRoot.textContent = exactRoot.innerText;
+  const harness = createDomHarness([exactRoot]);
+
+  const result = harness.evaluate(bridgeRuntime.buildAttachmentAcknowledgementExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    ["same.png"],
+  ));
+
+  assert.equal(result, false);
+});
+
+test("attachment acknowledgement accepts exact files and semantic attachment labels", () => {
+  const exactInput = createDomElement("input", {
+    attributes: { type: "file" },
+    files: [{ name: "reference-a.jpg" }],
+  });
+  const attachmentLabel = createDomElement("div", {
+    attributes: { "aria-label": "Attached file reference-b.png" },
+  });
+  const exactRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [exactInput, attachmentLabel],
+  );
+  const harness = createDomHarness([exactRoot]);
+
+  const result = harness.evaluate(bridgeRuntime.buildAttachmentAcknowledgementExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    ["reference-a.jpg", "reference-b.png"],
+  ));
+
+  assert.equal(result, true);
+});
+
+test("delayed exact-root input polling clicks attachment once and then stays read-only", async () => {
+  const fixturePath = fileURLToPath(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url));
+  const fixtureSha256 = createHash("sha256").update(readFileSync(fixturePath)).digest("hex");
+  const prepared = {
+    surface: "chatgpt-main-chat",
+    conversationId: EXACT_CHATGPT_ID,
+  };
+  const job = {
+    id: "delayed-attachment-input",
+    references: [{ path: fixturePath, sha256: fixtureSha256 }],
+  };
+  const attachmentClickExpressions = [];
+  const inputStateExpressions = [];
+  let inputStatePolls = 0;
+  const sendCalls = [];
+  const session = {
+    async evaluate(expression) {
+      if (expression.includes("attach.click")) {
+        attachmentClickExpressions.push(expression);
+        return { inputPresent: false, clicked: true };
+      }
+      if (expression.includes("inputCount")) {
+        inputStateExpressions.push(expression);
+        inputStatePolls += 1;
+        const inputCount = inputStatePolls >= 2 ? 1 : 0;
+        return { ok: inputCount === 1, inputCount, inputPresent: inputCount === 1 };
+      }
+      return true;
+    },
+    async evaluateRemoteObject() {
+      return { objectId: "attachment-input-remote" };
+    },
+    async send(method, params) {
+      sendCalls.push([method, params]);
+      if (method === "DOM.requestNode") return { nodeId: 42 };
+      return {};
+    },
+  };
+
+  await bridgeRuntime.attachJobReferences(session, prepared, job);
+
+  assert.equal(attachmentClickExpressions.length, 1);
+  assert.equal(inputStateExpressions.length, 2);
+  assert.deepEqual(sendCalls.map(([method]) => method), [
+    "DOM.requestNode",
+    "Runtime.releaseObject",
+    "DOM.setFileInputFiles",
+  ]);
 });
 
 test("attachment acknowledgement fails after conversation identity or Quick Chat route changes", () => {
