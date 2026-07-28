@@ -1,5 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 
 import {
@@ -12,7 +14,6 @@ import {
 const DEFAULT_LOCK_WAIT_MS = 2000;
 const DEFAULT_LOCK_STALE_MS = 30000;
 const DEFAULT_LOCK_POLL_MS = 25;
-const OWNER_FIELDS = new Set(["schemaVersion", "ownerId", "pid", "checkpointPath", "acquiredAt"]);
 
 function checkpointPathValue(value) {
   if (typeof value !== "string" || !value || value.includes("\0") ||
@@ -36,54 +37,25 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function parseOwner(value, expectedCheckpointPath) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("handoff checkpoint lock owner metadata is invalid");
-  }
-  for (const field of Object.keys(value)) {
-    if (!OWNER_FIELDS.has(field)) throw new Error("handoff checkpoint lock owner metadata has unknown fields");
-  }
-  if (value.schemaVersion !== 1 || typeof value.ownerId !== "string" ||
-      !value.ownerId || value.ownerId.length > 200 || !Number.isInteger(value.pid) || value.pid < 1 ||
-      typeof value.acquiredAt !== "string" || Number.isNaN(Date.parse(value.acquiredAt))) {
-    throw new Error("handoff checkpoint lock owner metadata is invalid");
-  }
-  if (checkpointPathValue(value.checkpointPath) !== expectedCheckpointPath) {
-    throw new Error("handoff checkpoint lock owner path changed");
-  }
-  return {
-    schemaVersion: 1,
-    ownerId: value.ownerId,
-    pid: value.pid,
-    checkpointPath: expectedCheckpointPath,
-    acquiredAt: new Date(value.acquiredAt).toISOString(),
-  };
-}
-
-function defaultProcessAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
-}
-
-async function readOwner(ownerPath, expectedCheckpointPath, fsApi = fs) {
-  const raw = await fsApi.readFile(ownerPath, "utf8");
-  return parseOwner(JSON.parse(raw), expectedCheckpointPath);
-}
-
-async function removeExactLock(lockPath, fsApi = fs) {
-  try {
-    await fsApi.rm(lockPath, { recursive: true, force: true });
-  } catch (error) {
-    if (!isMissing(error)) throw error;
-  }
-}
-
 export function checkpointLockPath(checkpointPath) {
   return `${checkpointPathValue(checkpointPath)}.lock`;
+}
+
+export function checkpointLockResource(checkpointPath) {
+  const normalized = checkpointPathValue(checkpointPath);
+  const resourceKey = process.platform === "win32"
+    ? path.win32.normalize(normalized).toLowerCase()
+    : normalized;
+  const digest = createHash("sha256").update(resourceKey, "utf8").digest("hex");
+  if (process.platform === "win32") return `\\\\.\\pipe\\codex-handoff-${digest}`;
+  return path.join(os.tmpdir(), `codex-handoff-${digest}.sock`);
+}
+
+function errorWithCleanupFailure(primaryError, cleanupError, message) {
+  const aggregate = new AggregateError([primaryError, cleanupError], message, { cause: primaryError });
+  aggregate.primaryError = primaryError;
+  aggregate.cleanupError = cleanupError;
+  return aggregate;
 }
 
 export async function writeJsonAtomically(file, value, {
@@ -106,57 +78,84 @@ export async function writeJsonAtomically(file, value, {
     if (handle) {
       try { await handle.close(); } catch { /* preserve the original write error */ }
     }
-    try { await fsApi.unlink(temporary); } catch (cleanupError) {
-      if (!isMissing(cleanupError)) { /* preserve the original error and leave no silent overwrite */ }
+    let cleanupError = null;
+    try { await fsApi.unlink(temporary); } catch (candidate) {
+      if (!isMissing(candidate)) cleanupError = candidate;
+    }
+    if (cleanupError) {
+      throw errorWithCleanupFailure(
+        error,
+        cleanupError,
+        "atomic JSON write failed and temporary-file cleanup also failed",
+      );
     }
     throw error;
   }
 }
 
-async function inspectExistingLock(lockPath, expectedCheckpointPath, {
-  fsApi,
-  staleMs,
-  now,
-  processAlive,
-}) {
-  let stats;
-  try {
-    stats = await fsApi.stat(lockPath);
-  } catch (error) {
-    if (isMissing(error)) return { reclaim: false };
-    throw error;
+function lockBusyFrom(error, resource) {
+  if (error?.code === "ELOCKBUSY" || error?.code === "EADDRINUSE" || error?.code === "EEXIST") {
+    return lockBusyError(resource);
   }
-  const ageMs = Math.max(0, now() - stats.mtimeMs);
-  let owner = null;
-  let ownerValid = true;
-  try {
-    owner = await readOwner(path.join(lockPath, "owner.json"), expectedCheckpointPath, fsApi);
-  } catch (error) {
-    if (!isMissing(error)) ownerValid = false;
-  }
-  if (ageMs < staleMs) return { reclaim: false };
-  if (!ownerValid || !owner) return { reclaim: true };
-  return { reclaim: !processAlive(owner.pid) };
+  return error;
 }
 
-export async function releaseHandoffCheckpointLock(checkpointPath, ownerId, { fsApi = fs } = {}) {
-  const normalized = checkpointPathValue(checkpointPath);
-  const lockPath = checkpointLockPath(normalized);
-  if (typeof ownerId !== "string" || !ownerId) return false;
-  let owner;
-  try {
-    owner = await readOwner(path.join(lockPath, "owner.json"), normalized, fsApi);
-  } catch {
-    return false;
-  }
-  if (owner.ownerId !== ownerId) return false;
-  try {
-    await fsApi.rm(lockPath, { recursive: true, force: false });
-    return true;
-  } catch (error) {
-    if (isMissing(error)) return false;
-    throw error;
-  }
+function acquireNamedPipeLease(resource, netApi = net) {
+  return new Promise((resolve, reject) => {
+    const server = netApi.createServer((socket) => socket.destroy());
+    let acquired = false;
+    const onError = (error) => {
+      if (acquired) return;
+      acquired = false;
+      reject(lockBusyFrom(error, resource));
+    };
+    server.on("error", onError);
+    server.once("listening", () => {
+      acquired = true;
+      let released = false;
+      resolve({
+        ownerId: null,
+        async release() {
+          if (released) return false;
+          released = true;
+          await new Promise((resolveClose, rejectClose) => {
+            server.close((error) => {
+              if (error && error.code !== "ERR_SERVER_NOT_RUNNING") {
+                rejectClose(error);
+                return;
+              }
+              resolveClose();
+            });
+          });
+          return true;
+        },
+      });
+    });
+    try {
+      server.listen({ path: resource, exclusive: true });
+    } catch (error) {
+      onError(error);
+    }
+  });
+}
+
+function defaultExclusiveApi(netApi) {
+  return {
+    acquire(resource) {
+      return acquireNamedPipeLease(resource, netApi);
+    },
+  };
+}
+
+export async function releaseHandoffCheckpointLock(checkpointPath, ownerId, {
+  exclusiveLease = null,
+} = {}) {
+  const resource = checkpointLockResource(checkpointPath);
+  if (typeof ownerId !== "string" || !ownerId ||
+      !exclusiveLease || exclusiveLease.ownerId !== ownerId ||
+      exclusiveLease.resource !== resource ||
+      typeof exclusiveLease.release !== "function") return false;
+  return exclusiveLease.release();
 }
 
 export async function acquireHandoffCheckpointLock(checkpointPath, {
@@ -165,16 +164,20 @@ export async function acquireHandoffCheckpointLock(checkpointPath, {
   pollMs = DEFAULT_LOCK_POLL_MS,
   fsApi = fs,
   now = () => Date.now(),
-  processAlive = defaultProcessAlive,
   processId = process.pid,
   idFactory = randomUUID,
+  netApi = net,
+  exclusiveApi = defaultExclusiveApi(netApi),
 } = {}) {
   const normalized = checkpointPathValue(checkpointPath);
+  // `staleMs` remains accepted for manifest compatibility; metadata age never
+  // decides ownership or triggers a lock-path deletion.
   if (!Number.isFinite(waitMs) || waitMs < 0 || !Number.isFinite(staleMs) || staleMs < 0 ||
       !Number.isFinite(pollMs) || pollMs < 0) {
     throw new Error("handoff checkpoint lock timing is invalid");
   }
   const lockPath = checkpointLockPath(normalized);
+  const resource = checkpointLockResource(normalized);
   const ownerPath = path.join(lockPath, "owner.json");
   const ownerId = idFactory();
   const deadline = now() + waitMs;
@@ -186,44 +189,52 @@ export async function acquireHandoffCheckpointLock(checkpointPath, {
     acquiredAt: new Date(now()).toISOString(),
   };
 
-  // The lock is adjacent to the checkpoint, so create only its known parent
-  // before attempting the exclusive mkdir. The lock directory itself remains
-  // the atomic acquisition primitive.
+  // The named pipe is the exclusive primitive. The adjacent directory is only
+  // an audit location for owner metadata and is never used for reclamation.
   await fsApi.mkdir(path.dirname(normalized), { recursive: true });
 
   while (true) {
-    let created = false;
+    let exclusiveLease = null;
+    let acquiredExclusive = false;
     try {
-      await fsApi.mkdir(lockPath);
-      created = true;
+      exclusiveLease = await exclusiveApi.acquire(resource, { owner });
+      if (!exclusiveLease || typeof exclusiveLease.release !== "function") {
+        throw new Error("handoff checkpoint exclusive lease is invalid");
+      }
+      acquiredExclusive = true;
+      const ownedLease = {
+        ownerId,
+        resource,
+        release: () => exclusiveLease.release(),
+      };
       await writeJsonAtomically(ownerPath, owner, { fsApi, processId, idFactory });
       let released = false;
       return {
         ...owner,
         lockPath,
+        resource,
         async release() {
           if (released) return false;
           released = true;
-          return releaseHandoffCheckpointLock(normalized, ownerId, { fsApi });
+          return releaseHandoffCheckpointLock(normalized, ownerId, { exclusiveLease: ownedLease });
         },
       };
     } catch (error) {
-      if (created) {
-        await removeExactLock(lockPath, fsApi);
-        throw error;
+      if (exclusiveLease && typeof exclusiveLease.release === "function") {
+        try {
+          await exclusiveLease.release();
+        } catch (cleanupError) {
+          throw errorWithCleanupFailure(
+            error,
+            cleanupError,
+            "handoff checkpoint lease setup failed and lease release also failed",
+          );
+        }
       }
-      if (error?.code !== "EEXIST") throw error;
-      const state = await inspectExistingLock(lockPath, normalized, {
-        fsApi,
-        staleMs,
-        now,
-        processAlive,
-      });
-      if (state.reclaim) {
-        await removeExactLock(lockPath, fsApi);
-        continue;
-      }
-      if (now() >= deadline) throw lockBusyError(lockPath);
+      if (acquiredExclusive) throw error;
+      const normalizedError = lockBusyFrom(error, resource);
+      if (normalizedError.code !== "ELOCKBUSY") throw normalizedError;
+      if (now() >= deadline) throw normalizedError;
       await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
     }
   }
@@ -248,6 +259,11 @@ export async function commitHandoffDelivery({
   pollMs,
   fsApi = fs,
   onLockAcquired = null,
+  now,
+  processId,
+  idFactory,
+  netApi,
+  exclusiveApi,
 } = {}) {
   const normalized = checkpointPathValue(checkpointPath);
   const lock = await acquireHandoffCheckpointLock(normalized, {
@@ -255,6 +271,11 @@ export async function commitHandoffDelivery({
     staleMs,
     pollMs,
     fsApi,
+    now,
+    processId,
+    idFactory,
+    netApi,
+    exclusiveApi,
   });
   try {
     if (onLockAcquired) await onLockAcquired(lock);

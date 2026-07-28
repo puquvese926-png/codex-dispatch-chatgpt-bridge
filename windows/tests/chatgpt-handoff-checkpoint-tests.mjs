@@ -9,6 +9,7 @@ import { test } from "node:test";
 import {
   acquireHandoffCheckpointLock,
   checkpointLockPath,
+  checkpointLockResource,
   commitHandoffDelivery,
   releaseHandoffCheckpointLock,
   writeJsonAtomically,
@@ -63,7 +64,15 @@ async function runWorker(checkpointPath, holdMs) {
   });
 }
 
-if (process.argv[2] === "--handoff-worker") {
+async function runCrashLockWorker(checkpointPath) {
+  const lease = await acquireHandoffCheckpointLock(checkpointPath, { waitMs: 5000 });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  process.exit(17);
+}
+
+if (process.argv[2] === "--lock-worker") {
+  await runCrashLockWorker(process.argv[3]);
+} else if (process.argv[2] === "--handoff-worker") {
   const checkpointPath = process.argv[3];
   const holdMs = Number(process.argv[4] || 0);
   const result = await commitHandoffDelivery({
@@ -116,32 +125,50 @@ if (process.argv[2] === "--handoff-worker") {
     await fs.rm(root, { recursive: true, force: true });
   });
 
-  test("young incomplete lock is busy while a clearly stale dead lock is recoverable", async () => {
+  test("OS lease, not young or stale metadata, controls recovery and exclusion", async () => {
     const root = await makeTempRoot();
     const checkpointPath = path.join(root, "checkpoint.json");
     const lockPath = checkpointLockPath(checkpointPath);
     try {
       await fs.mkdir(lockPath);
-      await assert.rejects(
-        acquireHandoffCheckpointLock(checkpointPath, { waitMs: 20, staleMs: 60000 }),
-        (error) => error.code === "ELOCKBUSY",
-      );
-      await fs.rm(lockPath, { recursive: true, force: true });
-
-      await fs.mkdir(lockPath);
       await fs.writeFile(path.join(lockPath, "owner.json"), JSON.stringify({
         schemaVersion: 1,
-        ownerId: "dead-owner",
+        ownerId: "incomplete-old-owner",
         pid: 2147483647,
         checkpointPath,
         acquiredAt: "2020-01-01T00:00:00.000Z",
       }), "utf8");
       const old = new Date("2020-01-01T00:00:00.000Z");
       await fs.utimes(lockPath, old, old);
-      const recovered = await acquireHandoffCheckpointLock(checkpointPath, {
-        waitMs: 100,
-        staleMs: 10,
+      const first = await acquireHandoffCheckpointLock(checkpointPath, { waitMs: 100 });
+      try {
+        await assert.rejects(
+          acquireHandoffCheckpointLock(checkpointPath, { waitMs: 30 }),
+          (error) => error.code === "ELOCKBUSY",
+        );
+        assert.equal((await fs.readFile(path.join(lockPath, "owner.json"), "utf8")).includes(first.ownerId), true);
+      } finally {
+        await first.release();
+      }
+
+      const recovered = await acquireHandoffCheckpointLock(checkpointPath, { waitMs: 100 });
+      await recovered.release();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("abnormal process exit releases the OS lease for bounded recovery", async () => {
+    const root = await makeTempRoot();
+    const checkpointPath = path.join(root, "checkpoint.json");
+    try {
+      const child = spawn(process.execPath, [TEST_FILE, "--lock-worker", checkpointPath], { windowsHide: true });
+      const exitCode = await new Promise((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", resolve);
       });
+      assert.equal(exitCode, 17);
+      const recovered = await acquireHandoffCheckpointLock(checkpointPath, { waitMs: 1000, pollMs: 10 });
       await recovered.release();
     } finally {
       await fs.rm(root, { recursive: true, force: true });
@@ -211,6 +238,31 @@ if (process.argv[2] === "--handoff-worker") {
       await assert.rejects(writeJsonAtomically(target, { version: "write-fail" }, { fsApi: writeFailFs }), /write failure/i);
       assert.deepEqual(JSON.parse(await fs.readFile(target, "utf8")), { version: "old" });
       assert.equal((await fs.readdir(root)).some((name) => name.includes(".tmp")), false);
+
+      const cleanupToken = "cleanup-token";
+      let cleanupError;
+      try {
+        await writeJsonAtomically(target, { version: "cleanup-fail" }, {
+          processId: "cleanup-process",
+          idFactory: () => cleanupToken,
+          fsApi: {
+            ...baseFs,
+            rename: async () => { throw new Error("injected rename failure"); },
+            unlink: async () => { throw new Error("injected cleanup failure"); },
+          },
+        });
+      } catch (error) {
+        cleanupError = error;
+      }
+      assert.ok(cleanupError instanceof AggregateError);
+      assert.match(cleanupError.message, /cleanup/i);
+      assert.match(cleanupError.primaryError.message, /rename failure/i);
+      assert.match(cleanupError.cleanupError.message, /cleanup failure/i);
+      assert.equal(
+        await fs.readFile(`${target}.cleanup-process.${cleanupToken}.tmp`, "utf8").then(() => true),
+        true,
+      );
+      assert.deepEqual(JSON.parse(await fs.readFile(target, "utf8")), { version: "old" });
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -245,6 +297,108 @@ if (process.argv[2] === "--handoff-worker") {
       });
       assert.equal(second.status, "no-new-delivery");
       assert.equal(JSON.parse(await fs.readFile(checkpointPath, "utf8")).delivered.length, 1);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("stale metadata cannot delete a newer OS lease during a forced ABA interleave", async () => {
+    const root = await makeTempRoot();
+    const checkpointPath = path.join(root, "checkpoint.json");
+    const lockPath = checkpointLockPath(checkpointPath);
+    const events = [];
+    let holder = null;
+    let firstEnteredResolve;
+    const firstEntered = new Promise((resolve) => { firstEnteredResolve = resolve; });
+    let releaseFirstResolve;
+    const releaseFirst = new Promise((resolve) => { releaseFirstResolve = resolve; });
+    const exclusiveApi = {
+      async acquire(resource, { owner }) {
+        events.push(`request:${owner.ownerId}`);
+        if (holder) {
+          events.push(`busy:${owner.ownerId}`);
+          const error = new Error(`busy: ${resource}`);
+          error.code = "ELOCKBUSY";
+          throw error;
+        }
+        const generation = Symbol(owner.ownerId);
+        holder = { generation, ownerId: owner.ownerId };
+        events.push(`acquired:${owner.ownerId}`);
+        return {
+          ownerId: owner.ownerId,
+          async release() {
+            if (holder?.generation !== generation) return false;
+            holder = null;
+            events.push(`released:${owner.ownerId}`);
+            return true;
+          },
+        };
+      },
+    };
+    const fsApi = {
+      mkdir: fs.mkdir.bind(fs),
+      open: fs.open.bind(fs),
+      rename: fs.rename.bind(fs),
+      unlink: fs.unlink.bind(fs),
+      readFile: fs.readFile.bind(fs),
+      rm: async (target, ...args) => {
+        if (target === lockPath) throw new Error("ABA test forbids fixed lock deletion");
+        return fs.rm(target, ...args);
+      },
+    };
+    try {
+      await fs.mkdir(lockPath, { recursive: true });
+      await fs.writeFile(path.join(lockPath, "owner.json"), JSON.stringify({
+        schemaVersion: 1,
+        ownerId: "old-generation",
+        pid: 2147483647,
+        checkpointPath,
+        acquiredAt: "2020-01-01T00:00:00.000Z",
+      }), "utf8");
+
+      const first = commitHandoffDelivery({
+        checkpointPath,
+        conversationId: CONVERSATION_ID,
+        units: UNITS,
+        waitMs: 500,
+        pollMs: 5,
+        fsApi,
+        exclusiveApi,
+        idFactory: () => "owner-a",
+        onLockAcquired: async () => {
+          events.push("transaction:owner-a");
+          firstEnteredResolve();
+          await releaseFirst;
+        },
+      });
+      await firstEntered;
+
+      const second = commitHandoffDelivery({
+        checkpointPath,
+        conversationId: CONVERSATION_ID,
+        units: UNITS,
+        waitMs: 500,
+        pollMs: 5,
+        fsApi,
+        exclusiveApi,
+        idFactory: () => "owner-b",
+        onLockAcquired: async () => { events.push("transaction:owner-b"); },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(events.includes("busy:owner-b"), true);
+      assert.equal(events.includes("transaction:owner-b"), false);
+      releaseFirstResolve();
+      const results = await Promise.all([first, second]);
+      assert.deepEqual(results.map((item) => item.status).sort(), ["handoff-ready", "no-new-delivery"]);
+      assert.equal(events.indexOf("released:owner-a") < events.indexOf("transaction:owner-b"), true);
+      assert.equal(events.filter((event) => event.startsWith("transaction:")).length, 2);
+      assert.equal(events.includes("fixed lock deletion"), false);
+      assert.equal((await fs.readFile(path.join(lockPath, "owner.json"), "utf8")).includes("owner-b"), true);
+      assert.equal(checkpointLockResource(checkpointPath).includes("codex-handoff-"), true);
+      assert.equal(
+        checkpointLockResource(checkpointPath),
+        checkpointLockResource(checkpointPath.toUpperCase()),
+      );
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
