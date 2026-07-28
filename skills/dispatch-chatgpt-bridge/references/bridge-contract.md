@@ -109,7 +109,7 @@ Never convert `unknown-after-submit` or `timeout-after-submit` into a new send.
 
 The watch manifest contains `schemaVersion`, the pinned `conversationId`, `surface: "chatgpt-main-chat"`, and an absolute `checkpointPath`; watch passes that validated manifest surface to every read. A successful handoff atomically records the task ID and normalized plan hash before reporting `handoff-ready`. This local checkpoint mutation is not a ChatGPT history mutation. Identity mismatch, unreadable surface, malformed protocol, changed-plan task ID reuse, and timeout all fail closed without sending.
 
-`approve` is the only supported Codex-relayed second turn. It requires `-AllowSend`, an exact conversation ID, original bridge marker and task ID, then verifies the visible schema-valid proposal and idle blank composer. Its read-only proposal/acknowledgement checks use the surface of the actually opened prepared session, so direct recovery may use Quick Chat without guessing from the ID. It sends only `CODEX_APPROVE <taskId>`. It is not an arbitrary continuation API. For embedded no-title Quick chat, start `watch` first and keep it active across approval; the surface may unmount before a later process can recover it by ID.
+`approve` is the only supported Codex-relayed second turn. It requires `-AllowSend`, an exact conversation ID, original bridge marker and task ID, then verifies the visible schema-valid proposal and idle blank composer. Its focus and submit expressions both receive the actually opened prepared `surface` plus expected conversation ID and reuse the exact owner resolver; Main and Quick Chat never guess each other. Focus checks only the exact root's unique blank composer and busy/stop state. The click-capable expression resolves that root again in the same evaluation, requires the unique same-root composer to equal exactly `CODEX_APPROVE <taskId>` and requires the unique same-root send control before clicking. Its read-only proposal/acknowledgement checks use the surface of the actually opened prepared session, so direct recovery may use Quick Chat without guessing from the ID. It sends only `CODEX_APPROVE <taskId>`. It is not an arbitrary continuation API. For embedded no-title Quick chat, start `watch` first and keep it active across approval; the surface may unmount before a later process can recover it by ID.
 
 ## Lifecycle ledger
 
@@ -252,6 +252,17 @@ is durable `not-submitted`. Once the bridge enters that click-capable
 `unknown-after-submit`; the report preserves `attemptedAt`, expected conversation
 identity, surface and marker and must never be downgraded by an outer pre-submit
 catch or retried automatically.
+
+Approval follows the same boundary with its own exact attempt record. Focus or
+`Input.insertText` failures occur before the click attempt and remain
+`not-submitted` with `submittedAt: null`. An explicit `{ ok: false }` or
+`{ clicked: false }` from the approval expression is also `not-submitted` and
+never enters acknowledgement. Only `{ ok: true, clicked: true }` becomes
+submitted; if CDP/`Runtime.evaluate` fails after the click-capable evaluation
+has begun, the result is sealed as `unknown-after-submit` with `attemptedAt`,
+`submittedAt`, expected surface and conversation ID. Identity, route or
+acknowledgement drift after a possible click is read-only recovery territory;
+it never authorizes an automatic second approval.
 
 The pinned client currently permits two owned Quick Chat windows per wave only
 when `-ExperimentalQuickChat` is explicitly selected and the current route plan

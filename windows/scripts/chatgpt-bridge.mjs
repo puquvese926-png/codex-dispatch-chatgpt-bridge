@@ -1405,44 +1405,15 @@ export function buildHandoffUnitsExpression(surface, expectedConversationId) {
   })()`;
 }
 
-export function buildHandoffApprovalFocusExpression(conversationId) {
-  if (!LOCAL_CHATGPT_ID_PATTERN.test(conversationId) && !LOCAL_THREAD_ID_PATTERN.test(conversationId)) {
-    throw new Error("handoff approval conversation identity is invalid");
-  }
+export function buildHandoffApprovalFocusExpression(surface, conversationId) {
+  validateSubmissionExpressionInput(surface, conversationId);
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
-    const expected = ${JSON.stringify(conversationId)};
-    const visible = (node) => {
-      if (!node || node.disabled || node.getAttribute('aria-hidden') === 'true') return false;
-      const style = getComputedStyle(node);
-      const rect = node.getBoundingClientRect();
-      return style.display !== 'none' && style.visibility !== 'hidden' &&
-        rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
-    };
-    const dialog = [...document.querySelectorAll('[data-pip-obstacle="quick-chat"]')]
-      .find(visible) || [...document.querySelectorAll('[role="dialog"]')].find(visible) || null;
-    const routeMatches = (() => {
-      try { return decodeURIComponent(location.href).includes(expected); } catch { return false; }
-    })();
-    const root = dialog || (routeMatches ? document : null);
-    if (!root) return { ok: false, reason: 'exact-root-missing' };
-    const raw = root.querySelector('[data-above-composer-conversation-id]')
-      ?.getAttribute('data-above-composer-conversation-id')?.trim() || '';
-    const activeThread = document.querySelector(
-      '[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-active="true"], [data-app-action-sidebar-thread-id][aria-current="page"]',
-    )?.getAttribute('data-app-action-sidebar-thread-id')?.trim() || '';
-    const actual = raw.startsWith('chatgpt:') ? raw.slice('chatgpt:'.length) :
-      (/^[0-9a-f-]{36}$/iu.test(raw) ? 'local:' + raw : (routeMatches ? expected : activeThread));
-    if (actual !== expected) return { ok: false, reason: 'conversation-identity-mismatch', actual };
-    const selectors = [
-      '[contenteditable="true"][data-lexical-editor="true"]',
-      '[contenteditable="true"][role="textbox"]',
-      '[contenteditable="true"][aria-label="给 ChatGPT 发消息"]',
-      '[contenteditable="true"][aria-label*="ChatGPT"]',
-      'textarea[data-testid="prompt-textarea"]',
-      'textarea'
-    ];
-    const composer = selectors.map((selector) => root.querySelector(selector)).find(visible) || null;
-    if (!composer) return { ok: false, reason: 'composer-missing' };
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return resolved;
+    const root = resolved.root;
+    const composer = resolved.composer;
     const composerText = 'value' in composer ? composer.value : (composer.innerText || composer.textContent || '');
     if (composerText.trim()) return { ok: false, reason: 'composer-not-empty' };
     const stop = [...root.querySelectorAll('button')].find((button) => {
@@ -1455,71 +1426,32 @@ export function buildHandoffApprovalFocusExpression(conversationId) {
     return {
       ok: document.activeElement === composer || composer.contains(document.activeElement),
       reason: 'focused',
+      conversationId: expectedConversationId,
     };
   })()`;
 }
 
-export function buildHandoffApprovalSubmitExpression(conversationId, taskId) {
-  if (!LOCAL_CHATGPT_ID_PATTERN.test(conversationId) && !LOCAL_THREAD_ID_PATTERN.test(conversationId)) {
-    throw new Error("handoff approval conversation identity is invalid");
-  }
+export function buildHandoffApprovalSubmitExpression(surface, conversationId, taskId) {
+  validateSubmissionExpressionInput(surface, conversationId);
   if (!ID_PATTERN.test(taskId)) throw new Error("handoff approval taskId is invalid");
   const approval = `CODEX_APPROVE ${taskId}`;
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
-    const expected = ${JSON.stringify(conversationId)};
     const approval = ${JSON.stringify(approval)};
-    const visible = (node) => {
-      if (!node || node.disabled || node.getAttribute('aria-hidden') === 'true') return false;
-      const style = getComputedStyle(node);
-      const rect = node.getBoundingClientRect();
-      return style.display !== 'none' && style.visibility !== 'hidden' &&
-        rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
-    };
-    const dialog = [...document.querySelectorAll('[data-pip-obstacle="quick-chat"]')]
-      .find(visible) || [...document.querySelectorAll('[role="dialog"]')].find(visible) || null;
-    const routeMatches = (() => {
-      try { return decodeURIComponent(location.href).includes(expected); } catch { return false; }
-    })();
-    const root = dialog || (routeMatches ? document : null);
-    if (!root) return { ok: false, reason: 'exact-root-missing' };
-    const raw = root.querySelector('[data-above-composer-conversation-id]')
-      ?.getAttribute('data-above-composer-conversation-id')?.trim() || '';
-    const activeThread = document.querySelector(
-      '[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-active="true"], [data-app-action-sidebar-thread-id][aria-current="page"]',
-    )?.getAttribute('data-app-action-sidebar-thread-id')?.trim() || '';
-    const actual = raw.startsWith('chatgpt:') ? raw.slice('chatgpt:'.length) :
-      (/^[0-9a-f-]{36}$/iu.test(raw) ? 'local:' + raw : (routeMatches ? expected : activeThread));
-    if (actual !== expected) return { ok: false, reason: 'conversation-identity-mismatch', actual };
-    const selectors = [
-      '[contenteditable="true"][data-lexical-editor="true"]',
-      '[contenteditable="true"][role="textbox"]',
-      '[contenteditable="true"][aria-label="给 ChatGPT 发消息"]',
-      '[contenteditable="true"][aria-label*="ChatGPT"]',
-      'textarea[data-testid="prompt-textarea"]',
-      'textarea'
-    ];
-    const composer = selectors.map((selector) => root.querySelector(selector)).find(visible) || null;
-    const composerText = composer
-      ? ('value' in composer ? composer.value : (composer.innerText || composer.textContent || ''))
-      : '';
+    ${rootSource}
+    const resolved = resolveExactOwner(true);
+    if (!resolved.ok) return { ok: false, clicked: false, ...resolved };
+    const root = resolved.root;
+    const composer = resolved.composer;
+    const composerText = 'value' in composer ? composer.value : (composer.innerText || composer.textContent || '');
     if (composerText.trim() !== approval) {
-      return { ok: false, reason: 'approval-mismatch', composerText: composerText.slice(0, 200) };
+      return { ok: false, clicked: false, reason: 'approval-mismatch', composerText: composerText.slice(0, 200) };
     }
-    const directSend = [
-      'button[data-testid="send-button"]',
-      'button[aria-label="发送"]',
-      'button[aria-label="Send"]',
-      'button[type="submit"]'
-    ].map((selector) => root.querySelector(selector)).find(visible) || null;
-    const semanticSend = [...root.querySelectorAll('button')].find((button) => {
-      const label = [button.getAttribute('aria-label'), button.getAttribute('title'), button.textContent]
-        .filter(Boolean).join(' ');
-      return visible(button) && /(?:send|发送|提交)/iu.test(label);
-    }) || null;
-    const send = directSend || semanticSend;
-    if (!send || send.disabled) return { ok: false, reason: 'send-missing' };
-    send.click();
-    return { ok: true, reason: 'clicked' };
+    if (!root.contains(composer) || !root.contains(resolved.send) || resolved.send.disabled) {
+      return { ok: false, clicked: false, reason: 'owner-mismatch' };
+    }
+    resolved.send.click();
+    return { ok: true, clicked: true, reason: 'clicked', conversationId: expectedConversationId };
   })()`;
 }
 
@@ -2660,6 +2592,58 @@ export async function attemptExactSendClick(
   }
 }
 
+export async function attemptHandoffApprovalClick(
+  session,
+  prepared,
+  taskId,
+  now = () => new Date().toISOString(),
+) {
+  validatePreparedSubmission(prepared);
+  if (!ID_PATTERN.test(taskId)) throw new Error("handoff approval taskId is invalid");
+  const expression = buildHandoffApprovalSubmitExpression(
+    prepared.surface,
+    prepared.conversationId,
+    taskId,
+  );
+  const attemptedAt = now();
+  if (typeof attemptedAt !== "string" || !attemptedAt) {
+    throw new Error("approval attempt timestamp is invalid");
+  }
+  const identity = {
+    attemptedAt,
+    expectedConversationId: prepared.conversationId,
+    expectedSurface: prepared.surface,
+    taskId,
+  };
+  try {
+    const result = await session.evaluate(expression, true);
+    if (result?.ok !== true || result?.clicked !== true) {
+      return Object.freeze({
+        ...identity,
+        clicked: false,
+        submittedAt: null,
+        status: "not-submitted",
+        error: `ChatGPT approval send control rejected submission: ${result?.reason || "clicked-false"}`,
+      });
+    }
+    return Object.freeze({
+      ...identity,
+      clicked: true,
+      submittedAt: attemptedAt,
+      status: "submitted",
+      error: null,
+    });
+  } catch (error) {
+    return Object.freeze({
+      ...identity,
+      clicked: null,
+      submittedAt: attemptedAt,
+      status: "unknown-after-submit",
+      error: `handoff-approve-send-click: ${error.message}`,
+    });
+  }
+}
+
 async function submitJob(session, prepared, job, runId) {
   validatePreparedSubmission(prepared);
   const marker = bridgeMarker(runId, job.id);
@@ -3145,12 +3129,17 @@ async function runApprove(options, discovery) {
   const startedAt = new Date().toISOString();
   const approvalText = `CODEX_APPROVE ${manifest.taskId}`;
   let session = null;
+  let attemptedAt = null;
   let submittedAt = null;
   let proposal = null;
   let status = "not-submitted";
   let errorText = null;
   try {
     const opened = await openHandoffApprovalConversation(discovery, manifest);
+    if (!opened?.prepared || opened.prepared.conversationId !== manifest.conversationId) {
+      throw new Error("handoff approval prepared conversation identity mismatch");
+    }
+    validateSubmissionExpressionInput(opened.prepared.surface, opened.prepared.conversationId);
     session = opened.session;
     const observation = await evaluateAtStage(
       session,
@@ -3182,31 +3171,36 @@ async function runApprove(options, discovery) {
       }
       const focused = await evaluateAtStage(
         session,
-        buildHandoffApprovalFocusExpression(manifest.conversationId),
+        buildHandoffApprovalFocusExpression(opened.prepared.surface, manifest.conversationId),
         "handoff-approve-composer-focus",
         true,
       );
       if (!focused?.ok) throw new Error(`handoff approval composer rejected focus: ${focused?.reason || "unknown"}`);
       await session.send("Input.insertText", { text: approvalText });
-      submittedAt = new Date().toISOString();
-      const clicked = await evaluateAtStage(
+      const attempt = await attemptHandoffApprovalClick(
         session,
-        buildHandoffApprovalSubmitExpression(manifest.conversationId, manifest.taskId),
-        "handoff-approve-send-click",
-        true,
+        opened.prepared,
+        manifest.taskId,
       );
-      if (!clicked?.ok) throw new Error(`handoff approval was not submitted: ${clicked?.reason || "unknown"}`);
-      await waitFor(async () => {
-        const current = await evaluateAtStage(
-          session,
-          buildHandoffUnitsExpression(opened.prepared.surface, manifest.conversationId),
-          "handoff-approve-ack-units",
-        );
-        return current?.readable && current?.conversationId === manifest.conversationId &&
-          current?.units?.some((unit) =>
-          unit.role === "user" && unit.text.trim() === approvalText) || null;
-      }, Math.min(options.timeoutMs, 30000), `handoff approval acknowledgement for ${manifest.taskId}`);
-      status = "approved";
+      attemptedAt = attempt.attemptedAt;
+      submittedAt = attempt.submittedAt;
+      if (attempt.status !== "submitted") {
+        status = attempt.status;
+        errorText = attempt.error;
+      } else {
+        status = "submitted";
+        await waitFor(async () => {
+          const current = await evaluateAtStage(
+            session,
+            buildHandoffUnitsExpression(opened.prepared.surface, manifest.conversationId),
+            "handoff-approve-ack-units",
+          );
+          return current?.readable && current?.conversationId === manifest.conversationId &&
+            current?.units?.some((unit) =>
+            unit.role === "user" && unit.text.trim() === approvalText) || null;
+        }, Math.min(options.timeoutMs, 30000), `handoff approval acknowledgement for ${manifest.taskId}`);
+        status = "approved";
+      }
     }
   } catch (error) {
     errorText = error.message;
@@ -3222,6 +3216,7 @@ async function runApprove(options, discovery) {
     startedAt,
     completedAt: new Date().toISOString(),
     status,
+    attemptedAt,
     conversationId: manifest.conversationId,
     surface: manifest.surface,
     marker: manifest.marker,

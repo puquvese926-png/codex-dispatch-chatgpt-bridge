@@ -19,6 +19,7 @@ import {
   buildHistoryTitleExpression,
   buildHandoffApprovalFocusExpression,
   buildHandoffApprovalSubmitExpression,
+  attemptHandoffApprovalClick,
   buildHandoffUnitsExpression,
   buildMarkerPresenceExpression,
   buildAttachmentAcknowledgementExpression,
@@ -1796,8 +1797,8 @@ test("validates exact handoff approval and scopes visible UI submission to its c
     () => validateHandoffApprovalManifest({ ...manifest, taskId: "changed task" }),
     /taskId|approval/i,
   );
-  const focus = buildHandoffApprovalFocusExpression(manifest.conversationId);
-  const submit = buildHandoffApprovalSubmitExpression(manifest.conversationId, manifest.taskId);
+  const focus = buildHandoffApprovalFocusExpression(manifest.surface, manifest.conversationId);
+  const submit = buildHandoffApprovalSubmitExpression(manifest.surface, manifest.conversationId, manifest.taskId);
   assert.match(focus, /data-above-composer-conversation-id/);
   assert.match(focus, /composer-not-empty/);
   assert.match(focus, /aria-label="给 ChatGPT 发消息"/);
@@ -1805,6 +1806,170 @@ test("validates exact handoff approval and scopes visible UI submission to its c
   assert.match(submit, /data-above-composer-conversation-id/);
   assert.match(submit, /aria-label\*="ChatGPT"/);
   assert.doesNotMatch(focus + submit, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
+});
+
+test("handoff approval focus and submit use only the exact leased ChatGPT owner", () => {
+  const codexComposer = createComposer("", { "aria-label": "Codex composer" });
+  const codexSend = createSendButton({ "aria-label": "Send" });
+  const codexRoot = createDomElement("div", {
+    attributes: { role: "dialog" },
+    children: [codexComposer, codexSend],
+  });
+  const composer = createComposer("", { "aria-label": "给 ChatGPT 发消息" });
+  const send = createSendButton();
+  const chatRoot = createExactDialog(EXACT_CHATGPT_ID, composer, send);
+  const harness = createDomHarness([codexRoot, chatRoot]);
+  const focus = harness.evaluate(buildHandoffApprovalFocusExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  ));
+  assert.equal(focus.ok, true);
+  composer.textContent = "CODEX_APPROVE exact-approval";
+  composer.innerText = composer.textContent;
+  const clicked = harness.evaluate(buildHandoffApprovalSubmitExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    "exact-approval",
+  ));
+  assert.equal(clicked.ok, true);
+  assert.equal(send.clickCount, 1);
+  assert.equal(codexSend.clickCount, 0);
+});
+
+test("handoff approval rejects duplicate roots, composers, sends and identity conflicts", () => {
+  const duplicateRoots = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, createComposer(""), createSendButton()),
+    createExactDialog(EXACT_CHATGPT_ID, createComposer(""), createSendButton()),
+  ]).evaluate(buildHandoffApprovalFocusExpression("chatgpt-main-chat", EXACT_CHATGPT_ID));
+  assert.equal(duplicateRoots.ok, false);
+  assert.equal(duplicateRoots.reason, "exact-root-count");
+
+  const duplicateComposers = createDomElement("div", {
+    children: [createComposer(""), createComposer("")],
+  });
+  const composerResult = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, createComposer(""), createSendButton(), [duplicateComposers]),
+  ]).evaluate(buildHandoffApprovalFocusExpression("chatgpt-main-chat", EXACT_CHATGPT_ID));
+  assert.equal(composerResult.ok, false);
+  assert.equal(composerResult.reason, "composer-count");
+
+  const sendA = createSendButton();
+  const sendB = createSendButton({ "aria-label": "发送" });
+  const sendRoot = createDomElement("div", { children: [sendA, sendB] });
+  const sendResult = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, createComposer(""), createSendButton(), [sendRoot]),
+  ]).evaluate(buildHandoffApprovalSubmitExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    "duplicate-send",
+  ));
+  assert.equal(sendResult.ok, false);
+  assert.equal(sendResult.reason, "send-count");
+
+  const otherIdentity = createDomElement("div", {
+    attributes: { "data-above-composer-conversation-id": "chatgpt:local-chatgpt:33333333-3333-4333-8333-333333333333" },
+  });
+  const conflictRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(""),
+    createSendButton(),
+    [otherIdentity],
+  );
+  const conflict = createDomHarness([conflictRoot]).evaluate(
+    buildHandoffApprovalFocusExpression("chatgpt-main-chat", EXACT_CHATGPT_ID),
+  );
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.reason, "exact-root-count");
+});
+
+test("handoff approval rejects stale, malformed and non-app Quick Chat routes", () => {
+  const composer = createComposer("");
+  const send = createSendButton();
+  const root = createExactDialog(EXACT_CHATGPT_ID, composer, send);
+  for (const href of [
+    quickChatAppUrl("local-chatgpt:44444444-4444-4444-8444-444444444444"),
+    "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat%2Fprewarm",
+    "https://chatgpt.local/quick-chat/local-chatgpt%3A11111111-1111-4111-8111-111111111111",
+  ]) {
+    const result = createDomHarness([root], { href }).evaluate(
+      buildHandoffApprovalSubmitExpression("chatgpt-quick-chat", EXACT_CHATGPT_ID, "quick-approval"),
+    );
+    assert.equal(result.ok, false);
+    assert.equal(send.clickCount, 0);
+  }
+
+  const validHarness = createDomHarness([root], { href: quickChatAppUrl(EXACT_CHATGPT_ID) });
+  const focused = validHarness.evaluate(buildHandoffApprovalFocusExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+  ));
+  assert.equal(focused.ok, true);
+  composer.textContent = "CODEX_APPROVE quick-approval";
+  composer.innerText = composer.textContent;
+  const clicked = validHarness.evaluate(buildHandoffApprovalSubmitExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+    "quick-approval",
+  ));
+  assert.equal(clicked.ok, true);
+  assert.equal(send.clickCount, 1);
+});
+
+test("handoff approval requires exact approval text before clicking", () => {
+  const composer = createComposer("CODEX_APPROVE exact-approval-extra");
+  const send = createSendButton();
+  const result = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, composer, send),
+  ]).evaluate(buildHandoffApprovalSubmitExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    "exact-approval",
+  ));
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "approval-mismatch");
+  assert.equal(send.clickCount, 0);
+});
+
+test("handoff approval click boundary preserves not-submitted and unknown states", async () => {
+  const prepared = {
+    surface: "chatgpt-main-chat",
+    conversationId: EXACT_CHATGPT_ID,
+  };
+  const rejected = await attemptHandoffApprovalClick(
+    { async evaluate() { return { ok: false, reason: "approval-mismatch" }; } },
+    prepared,
+    "boundary-approval",
+    () => "2026-07-28T12:02:00.000Z",
+  );
+  assert.equal(rejected.status, "not-submitted");
+  assert.equal(rejected.clicked, false);
+  assert.equal(rejected.attemptedAt, "2026-07-28T12:02:00.000Z");
+  assert.equal(rejected.submittedAt, null);
+
+  const lost = await attemptHandoffApprovalClick(
+    { async evaluate() { throw new Error("CDP websocket closed"); } },
+    prepared,
+    "boundary-approval",
+    () => "2026-07-28T12:03:00.000Z",
+  );
+  assert.equal(lost.status, "unknown-after-submit");
+  assert.equal(lost.clicked, null);
+  assert.equal(lost.attemptedAt, "2026-07-28T12:03:00.000Z");
+  assert.equal(lost.submittedAt, "2026-07-28T12:03:00.000Z");
+  assert.equal(lost.expectedSurface, "chatgpt-main-chat");
+  assert.equal(lost.expectedConversationId, EXACT_CHATGPT_ID);
+});
+
+test("runApprove binds every approval action to the opened prepared identity and surface", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function runApprove");
+  const end = source.indexOf("async function recordGenerationLifecycle", start);
+  const approveSource = source.slice(start, end);
+  assert.match(approveSource, /opened\.prepared\.conversationId\s*!==\s*manifest\.conversationId/);
+  assert.match(approveSource, /buildHandoffApprovalFocusExpression\(\s*opened\.prepared\.surface,\s*manifest\.conversationId\s*\)/);
+  assert.match(approveSource, /attemptHandoffApprovalClick\(\s*session,\s*opened\.prepared,\s*manifest\.taskId/);
+  assert.doesNotMatch(approveSource, /buildHandoffApprovalFocusExpression\(manifest\.conversationId\)/);
+  assert.doesNotMatch(approveSource, /buildHandoffApprovalSubmitExpression\(manifest\.conversationId/);
 });
 
 test("handoff checkpoint prevents duplicate delivery and task rebinding", () => {
