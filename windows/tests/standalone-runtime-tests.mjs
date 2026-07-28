@@ -242,6 +242,13 @@ test("standalone bootstrap owns Codex CDP state without theme or Dream Skin depe
   assert.match(source, /--remote-debugging-address=127\.0\.0\.1/);
   assert.match(source, /--remote-debugging-port/);
   assert.match(source, /RestartExisting/);
+  assert.match(
+    source,
+    /Invoke-CimMethod[\s\S]*Win32_Process[\s\S]*Create/,
+    "restart must be created by the Windows process service so it survives Codex shutdown",
+  );
+  assert.match(source, /restart-dispatched/);
+  assert.match(source, /restart-report\.json/);
 
   const result = spawnSync("powershell.exe", [
     "-NoProfile",
@@ -255,6 +262,8 @@ test("standalone bootstrap owns Codex CDP state without theme or Dream Skin depe
   const desktopResult = JSON.parse(result.stdout);
   assert.equal(desktopResult.pass, true);
   assert.equal(desktopResult.hostEdition, "Desktop");
+  assert.equal(desktopResult.restartStrategy, "cim-detached-worker");
+  assert.equal(desktopResult.durableRestartReport, true);
 
   const coreResult = spawnSync("pwsh.exe", [
     "-NoProfile",

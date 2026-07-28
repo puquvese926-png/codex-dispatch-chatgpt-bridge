@@ -53,6 +53,9 @@ Git 仓库
 7. PowerShell 7 调用启动器时，自动转交 Windows PowerShell 5.1 处理 `Appx`，
    并保留参数与退出码。
 8. 更新调用方说明、handoff 合同和故障手册。
+9. 将 `-RestartExisting` 改为持久化 detached restart handoff：先写重启请求与
+   `restart-report.json`，再由 Windows 进程服务创建独立 worker，避免当前 Codex
+   被关闭时把负责重启的 PowerShell 子进程一并中断。
 
 ## 验证
 

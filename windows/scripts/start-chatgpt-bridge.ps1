@@ -4,7 +4,13 @@ param(
   [int]$Port = 9335,
   [switch]$RestartExisting,
   [string]$StatePath = (Join-Path $env:LOCALAPPDATA 'CodexChatGPTBridge\state.json'),
-  [switch]$SelfTest
+  [switch]$SelfTest,
+  [Parameter(DontShow = $true)]
+  [switch]$RestartWorker,
+  [Parameter(DontShow = $true)]
+  [string]$RestartRequestPath,
+  [Parameter(DontShow = $true)]
+  [string]$RestartReportPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,6 +31,15 @@ if ($PSVersionTable.PSEdition -ne 'Desktop') {
     $relayArguments += @('-StatePath', [IO.Path]::GetFullPath($StatePath))
   }
   if ($SelfTest) { $relayArguments += '-SelfTest' }
+  if ($RestartWorker) {
+    $relayArguments += @(
+      '-RestartWorker',
+      '-RestartRequestPath',
+      [IO.Path]::GetFullPath($RestartRequestPath),
+      '-RestartReportPath',
+      [IO.Path]::GetFullPath($RestartReportPath)
+    )
+  }
   & $windowsPowerShell @relayArguments
   exit $LASTEXITCODE
 }
@@ -273,6 +288,223 @@ function Write-BridgeState {
   }
 }
 
+function Start-BridgeDetachedRestart {
+  param(
+    [Parameter(Mandatory = $true)][object]$Codex,
+    [Parameter(Mandatory = $true)][object[]]$Processes,
+    [Parameter(Mandatory = $true)][int]$CandidatePort,
+    [Parameter(Mandatory = $true)][string]$TargetStatePath
+  )
+  $stateFile = [IO.Path]::GetFullPath($TargetStatePath)
+  $stateDirectory = Split-Path -Parent $stateFile
+  New-Item -ItemType Directory -Force -Path $stateDirectory | Out-Null
+  $operationId = [guid]::NewGuid().ToString('N')
+  $requestPath = Join-Path $stateDirectory "restart-request-$operationId.json"
+  $reportPath = Join-Path $stateDirectory 'restart-report.json'
+  $request = [ordered]@{
+    schemaVersion = 1
+    operationId = $operationId
+    requestedAt = [DateTime]::UtcNow.ToString('o')
+    port = $CandidatePort
+    statePath = $stateFile
+    packageFullName = "$($Codex.PackageFullName)"
+    processIds = @($Processes | ForEach-Object { [int]$_.ProcessId })
+  }
+  Write-BridgeState -Path $requestPath -State $request
+  Write-BridgeState -Path $reportPath -State ([ordered]@{
+    schemaVersion = 1
+    action = 'restart'
+    operationId = $operationId
+    status = 'dispatching'
+    ready = $false
+    requestedAt = $request.requestedAt
+    completedAt = $null
+    port = $CandidatePort
+    statePath = $stateFile
+    workerProcessId = $null
+    error = $null
+  })
+
+  $workerCommand = "& '$($PSCommandPath.Replace("'", "''"))' -RestartWorker " +
+    "-RestartRequestPath '$($requestPath.Replace("'", "''"))' " +
+    "-RestartReportPath '$($reportPath.Replace("'", "''"))'"
+  $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($workerCommand))
+  $commandLine = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedCommand"
+  try {
+    $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+      CommandLine = $commandLine
+    } -ErrorAction Stop
+    if ([int]$created.ReturnValue -ne 0 -or [int]$created.ProcessId -le 0) {
+      throw "Windows process service returned $($created.ReturnValue)."
+    }
+    Write-BridgeState -Path $reportPath -State ([ordered]@{
+      schemaVersion = 1
+      action = 'restart'
+      operationId = $operationId
+      status = 'restart-dispatched'
+      ready = $false
+      requestedAt = $request.requestedAt
+      completedAt = $null
+      port = $CandidatePort
+      statePath = $stateFile
+      workerProcessId = [int]$created.ProcessId
+      error = $null
+    })
+    return [pscustomobject]@{
+      OperationId = $operationId
+      ReportPath = $reportPath
+      WorkerProcessId = [int]$created.ProcessId
+    }
+  } catch {
+    Write-BridgeState -Path $reportPath -State ([ordered]@{
+      schemaVersion = 1
+      action = 'restart'
+      operationId = $operationId
+      status = 'failed'
+      ready = $false
+      requestedAt = $request.requestedAt
+      completedAt = [DateTime]::UtcNow.ToString('o')
+      port = $CandidatePort
+      statePath = $stateFile
+      workerProcessId = $null
+      error = $_.Exception.Message
+    })
+    throw
+  }
+}
+
+function Invoke-BridgeRestartWorker {
+  param(
+    [Parameter(Mandatory = $true)][string]$RequestPath,
+    [Parameter(Mandatory = $true)][string]$ReportPath
+  )
+  $requestFile = [IO.Path]::GetFullPath($RequestPath)
+  $reportFile = [IO.Path]::GetFullPath($ReportPath)
+  $request = Get-Content -Raw -LiteralPath $requestFile | ConvertFrom-Json
+  $requestedAt = "$($request.requestedAt)"
+  $operationId = "$($request.operationId)"
+  try {
+    if ([int]$request.schemaVersion -ne 1 -or
+        $operationId -cnotmatch '^[a-f0-9]{32}$' -or
+        [int]$request.port -lt 1024 -or [int]$request.port -gt 65535 -or
+        -not [IO.Path]::IsPathRooted("$($request.statePath)") -or
+        @($request.processIds).Count -lt 1) {
+      throw 'Detached restart request is invalid.'
+    }
+    $codex = Get-BridgeCodexInstall
+    if ("$($codex.PackageFullName)" -cne "$($request.packageFullName)") {
+      throw 'Detached restart package identity changed.'
+    }
+    Write-BridgeState -Path $reportFile -State ([ordered]@{
+      schemaVersion = 1
+      action = 'restart'
+      operationId = $operationId
+      status = 'stopping-existing'
+      ready = $false
+      requestedAt = $requestedAt
+      completedAt = $null
+      port = [int]$request.port
+      statePath = [IO.Path]::GetFullPath("$($request.statePath)")
+      workerProcessId = $PID
+      error = $null
+    })
+    Start-Sleep -Milliseconds 1500
+    foreach ($processId in @($request.processIds)) {
+      $process = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$processId)" `
+        -ErrorAction SilentlyContinue
+      if ($null -eq $process) { continue }
+      if (-not (Test-BridgePathEqual -Left "$($process.ExecutablePath)" -Right "$($codex.Executable)")) {
+        throw "Restart target process $processId no longer belongs to the verified Codex package."
+      }
+      Stop-Process -Id ([int]$processId) -ErrorAction Stop
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+      Start-Sleep -Milliseconds 250
+      $remaining = @($request.processIds | Where-Object {
+        $null -ne (Get-Process -Id ([int]$_) -ErrorAction SilentlyContinue)
+      })
+    } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
+    if ($remaining.Count -gt 0) {
+      throw "Codex processes did not stop within 15 seconds: $($remaining -join ', ')."
+    }
+    Write-BridgeState -Path $reportFile -State ([ordered]@{
+      schemaVersion = 1
+      action = 'restart'
+      operationId = $operationId
+      status = 'starting'
+      ready = $false
+      requestedAt = $requestedAt
+      completedAt = $null
+      port = [int]$request.port
+      statePath = [IO.Path]::GetFullPath("$($request.statePath)")
+      workerProcessId = $PID
+      error = $null
+    })
+    $arguments = @(
+      '--remote-debugging-address=127.0.0.1',
+      "--remote-debugging-port=$([int]$request.port)"
+    )
+    $null = Start-BridgeCodexApplication -Codex $codex -Arguments $arguments
+    $identity = Wait-BridgeCdpIdentity -CandidatePort ([int]$request.port) -Codex $codex
+    if ($null -eq $identity) {
+      throw "Codex did not expose a verified loopback bridge endpoint on port $($request.port) within 45 seconds."
+    }
+    $state = [ordered]@{
+      schemaVersion = 1
+      platform = 'windows'
+      port = [int]$request.port
+      browserId = "$($identity.BrowserId)"
+      codexExe = "$($codex.Executable)"
+      codexPackageRoot = "$($codex.PackageRoot)"
+      codexPackageFullName = "$($codex.PackageFullName)"
+      codexPackageFamilyName = "$($codex.PackageFamilyName)"
+      codexVersion = "$($codex.Version)"
+      createdAt = [DateTime]::UtcNow.ToString('o')
+    }
+    Write-BridgeState -Path ([IO.Path]::GetFullPath("$($request.statePath)")) -State $state
+    Write-BridgeState -Path $reportFile -State ([ordered]@{
+      schemaVersion = 1
+      action = 'restart'
+      operationId = $operationId
+      status = 'complete'
+      ready = $true
+      requestedAt = $requestedAt
+      completedAt = [DateTime]::UtcNow.ToString('o')
+      port = [int]$request.port
+      statePath = [IO.Path]::GetFullPath("$($request.statePath)")
+      workerProcessId = $PID
+      browserId = "$($identity.BrowserId)"
+      codexVersion = "$($codex.Version)"
+      error = $null
+    })
+  } catch {
+    Write-BridgeState -Path $reportFile -State ([ordered]@{
+      schemaVersion = 1
+      action = 'restart'
+      operationId = $operationId
+      status = 'failed'
+      ready = $false
+      requestedAt = $requestedAt
+      completedAt = [DateTime]::UtcNow.ToString('o')
+      workerProcessId = $PID
+      error = $_.Exception.Message
+    })
+    throw
+  } finally {
+    Remove-Item -LiteralPath $requestFile -Force -ErrorAction SilentlyContinue
+  }
+}
+
+if ($RestartWorker) {
+  if ([string]::IsNullOrWhiteSpace($RestartRequestPath) -or
+      [string]::IsNullOrWhiteSpace($RestartReportPath)) {
+    throw 'Detached restart worker requires request and report paths.'
+  }
+  Invoke-BridgeRestartWorker -RequestPath $RestartRequestPath -ReportPath $RestartReportPath
+  exit 0
+}
+
 if ($SelfTest) {
   $safe = Test-BridgeBrowserWebSocketUrl `
     -Value 'ws://127.0.0.1:9335/devtools/browser/browser-123' -CandidatePort 9335
@@ -283,6 +515,8 @@ if ($SelfTest) {
     hostEdition = "$($PSVersionTable.PSEdition)"
     stateSchemaVersion = 1
     stateRoot = 'CodexChatGPTBridge'
+    restartStrategy = 'cim-detached-worker'
+    durableRestartReport = $true
   } | ConvertTo-Json -Compress
   exit 0
 }
@@ -300,21 +534,24 @@ if (-not $portWasExplicit) {
 
 $identity = Get-BridgeCdpIdentity -CandidatePort $Port -Codex $codex
 if ($null -eq $identity) {
-  if ($processes.Count -gt 0 -and -not $RestartExisting) {
-    throw 'Codex is running without a verified loopback bridge endpoint. Rerun with -RestartExisting to restart only the official Codex package.'
-  }
   if ($processes.Count -gt 0) {
-    foreach ($process in $processes) {
-      Stop-Process -Id ([int]$process.ProcessId) -ErrorAction Stop
+    if (-not $RestartExisting) {
+      throw 'Codex is running without a verified loopback bridge endpoint. Rerun with -RestartExisting to dispatch a durable detached restart.'
     }
-    $deadline = [DateTime]::UtcNow.AddSeconds(15)
-    do {
-      Start-Sleep -Milliseconds 250
-      $processes = @(Get-BridgeCodexProcesses -Codex $codex)
-    } while ($processes.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
-    if ($processes.Count -gt 0) {
-      throw 'Codex did not stop within 15 seconds; no replacement process was started.'
-    }
+    $restart = Start-BridgeDetachedRestart -Codex $codex -Processes $processes `
+      -CandidatePort $Port -TargetStatePath $StatePath
+    [ordered]@{
+      pass = $true
+      action = 'restart-dispatched'
+      ready = $false
+      operationId = "$($restart.OperationId)"
+      workerProcessId = [int]$restart.WorkerProcessId
+      reportPath = "$($restart.ReportPath)"
+      statePath = [IO.Path]::GetFullPath($StatePath)
+      port = $Port
+      userNotice = 'Codex will close and reopen. Do not start it manually; inspect restart-report.json after it returns.'
+    } | ConvertTo-Json -Depth 5
+    exit 0
   }
 
   $arguments = @(

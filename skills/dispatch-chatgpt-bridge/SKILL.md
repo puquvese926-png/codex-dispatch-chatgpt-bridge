@@ -69,7 +69,11 @@ The first standalone setup runs
 `windows/scripts/start-chatgpt-bridge.ps1`. It may reuse an already verified
 loopback Codex endpoint without restarting. If Codex is running without that
 endpoint, restarting it requires explicit user authorization through
-`-RestartExisting`.
+`-RestartExisting`. An authorized restart is handed to a Windows-service-created
+detached worker before Codex is closed. Treat the durable
+`%LOCALAPPDATA%\CodexChatGPTBridge\restart-report.json` as authoritative because
+the calling command can disappear with the old Codex window. Do not ask the user
+to reopen Codex manually while the report is still in a running state.
 
 ## Dispatch workflow
 

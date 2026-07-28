@@ -65,8 +65,22 @@ git pull
 如果 Codex 已经以受验证的 loopback CDP 参数运行，脚本会复用它并写入
 `%LOCALAPPDATA%\CodexChatGPTBridge\state.json`。如果 Codex 正在运行但没有
 该端点，脚本会停止并要求明确使用 `-RestartExisting`，不会擅自关闭当前 Codex。
+获得授权后，启动器会先写入持久化重启记录，再通过 Windows 进程服务创建一个
+不依赖当前 Codex 进程树的隐藏 worker。worker 负责关闭已验证的旧 Codex PID、
+重新启动官方 Store 包、等待 loopback CDP 就绪并原子写入状态文件。
 从 PowerShell 7 调用时，启动器会把 Windows `Appx` 检查自动转交给
 Windows PowerShell 5.1，并保留相同参数和退出状态。
+
+重启期间当前命令可能因为 Codex 窗口关闭而在界面中显示“被中断”；这不再作为
+重启成败依据。不要手动启动 Codex，等待它自动重新打开，然后查看：
+
+```powershell
+Get-Content -Raw "$env:LOCALAPPDATA\CodexChatGPTBridge\restart-report.json"
+```
+
+只有报告为 `"status": "complete"` 且 `"ready": true` 时才算重启成功。
+`dispatching`、`restart-dispatched`、`stopping-existing` 和 `starting` 表示仍在
+进行；`failed` 会保留具体错误。成功后再顺序运行 `discover` 和 `probe`。
 
 初始化后直接执行：
 
