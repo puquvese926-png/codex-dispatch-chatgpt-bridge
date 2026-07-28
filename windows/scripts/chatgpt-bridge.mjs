@@ -79,6 +79,7 @@ const defaultStatePath = path.join(
 );
 export const DEFAULT_TIMEOUT_MS = 600000;
 const MAX_LAUNCH_LOG_BYTES = 64 * 1024;
+const MAX_LAUNCH_LOG_PATH_LENGTH = 32767;
 const PNG_DATA_PREFIX = "data:image/png;base64,";
 const MAX_RENDERED_DATA_URL_LENGTH = PNG_DATA_PREFIX.length + IMAGE_LIMITS.maxBase64Length;
 const MAX_BLOB_CHUNK_SIZE = 1024 * 1024;
@@ -118,10 +119,18 @@ function validateLaunchLogOptions(options) {
   if (hasStdout !== hasStderr) {
     throw new Error("bridge stdout/stderr log paths must be supplied as a pair");
   }
-  if (!hasStdout) return options;
+  if (!hasStdout) {
+    if (options.launchToken !== null) {
+      throw new Error("bridge launch token requires stdout/stderr log paths");
+    }
+    return options;
+  }
   if (!options.launchToken) throw new Error("bridge launch logs require a launch token");
   const stdout = requireAbsolute(options.stdoutLogPath, "bridge stdout log path");
   const stderr = requireAbsolute(options.stderrLogPath, "bridge stderr log path");
+  if (stdout.length > MAX_LAUNCH_LOG_PATH_LENGTH || stderr.length > MAX_LAUNCH_LOG_PATH_LENGTH) {
+    throw new Error("bridge launch log path exceeds the Windows path limit");
+  }
   const launchDirectory = path.win32.dirname(stdout);
   if (path.win32.dirname(stderr).toLowerCase() !== launchDirectory.toLowerCase()) {
     throw new Error("bridge stdout/stderr logs must share the launch directory");
@@ -139,19 +148,16 @@ function validateLaunchLogOptions(options) {
 }
 
 function launchLogPathsFromArgv(argv) {
-  try {
-    let launchToken = null;
-    let stdoutLogPath = null;
-    let stderrLogPath = null;
-    for (let index = 1; index < argv.length; index += 1) {
-      if (argv[index] === "--bridge-launch-token") launchToken = argv[index + 1] ?? null;
-      if (argv[index] === "--bridge-stdout-log") stdoutLogPath = argv[index + 1] ?? null;
-      if (argv[index] === "--bridge-stderr-log") stderrLogPath = argv[index + 1] ?? null;
-    }
-    return validateLaunchLogOptions({ launchToken, stdoutLogPath, stderrLogPath });
-  } catch {
-    return null;
+  let launchToken = null;
+  let stdoutLogPath = null;
+  let stderrLogPath = null;
+  for (let index = 1; index < argv.length; index += 1) {
+    if (argv[index] === "--bridge-launch-token") launchToken = argv[index + 1] ?? null;
+    if (argv[index] === "--bridge-stdout-log") stdoutLogPath = argv[index + 1] ?? null;
+    if (argv[index] === "--bridge-stderr-log") stderrLogPath = argv[index + 1] ?? null;
   }
+  if (launchToken === null && stdoutLogPath === null && stderrLogPath === null) return null;
+  return validateLaunchLogOptions({ launchToken, stdoutLogPath, stderrLogPath });
 }
 
 function safeLaunchLogError(error) {
@@ -2279,6 +2285,32 @@ async function evaluateAtStage(session, expression, stage, userGesture = false, 
   }
 }
 
+async function testOnlyP08Discovery(options) {
+  if (process.env.CODEX_BRIDGE_P08_TEST_MODE !== "1" ||
+      process.env.CODEX_BRIDGE_P08_TEST_ENVIRONMENT !== "black-box") return null;
+  const fixturePath = process.env.CODEX_BRIDGE_P08_DISCOVERY_PATH;
+  if (typeof fixturePath !== "string" || !path.win32.isAbsolute(fixturePath)) {
+    throw new Error("P0.8 test discovery fixture path must be absolute");
+  }
+  const fixture = await readStrictJson(fixturePath);
+  assertKnownFields(fixture, new Set([
+    "statePath", "discoveryCountPath", "state", "identity", "version", "target",
+  ]), "P0.8 test discovery fixture");
+  const countPath = requireAbsolute(fixture.discoveryCountPath, "P0.8 discovery count path");
+  const count = Number.parseInt((await fs.readFile(countPath, "utf8")).trim(), 10);
+  if (!Number.isSafeInteger(count) || count < 0 || count >= 100) {
+    throw new Error("P0.8 discovery count is invalid");
+  }
+  await fs.writeFile(countPath, `${count + 1}\n`, { encoding: "utf8", flag: "w" });
+  return Object.freeze({
+    statePath: options.statePath || requireAbsolute(fixture.statePath, "P0.8 fixture state path"),
+    state: validateBridgeState(fixture.state),
+    identity: fixture.identity,
+    version: fixture.version,
+    target: fixture.target,
+  });
+}
+
 async function evaluateRemoteObjectAtStage(session, expression, stage, userGesture = false, timeoutMs = 10000) {
   try {
     return await session.evaluateRemoteObject(expression, userGesture, timeoutMs);
@@ -4241,13 +4273,18 @@ export async function runBridgeMain(argv, { discover = discoverBridge } = {}) {
 async function main() {
   const argv = process.argv.slice(2);
   const launchLogs = launchLogPathsFromArgv(argv);
-  const result = await runBridgeMain(argv);
+  const testDiscovery = await testOnlyP08Discovery(parseBridgeArgs(argv));
+  const result = await runBridgeMain(argv, testDiscovery ? { discover: async () => testDiscovery } : {});
   if (launchLogs) {
-    appendBridgeLaunchLog(launchLogs.stdoutLogPath, {
-      pass: true,
-      command: argv[0] || null,
-      launchId: launchLogs.launchToken,
-    });
+    try {
+      appendBridgeLaunchLog(launchLogs.stdoutLogPath, {
+        pass: true,
+        command: argv[0] || null,
+        launchId: launchLogs.launchToken,
+      });
+    } catch {
+      // Launch logs are diagnostics; never replace a completed command result.
+    }
   }
   console.log(JSON.stringify(result, null, 2));
 }
@@ -4256,7 +4293,12 @@ const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolv
 if (isMain) {
   main().catch((error) => {
     const argv = process.argv.slice(2);
-    const launchLogs = launchLogPathsFromArgv(argv);
+    let launchLogs = null;
+    try {
+      launchLogs = launchLogPathsFromArgv(argv);
+    } catch {
+      // Invalid launch arguments cannot be trusted for diagnostic output.
+    }
     const safeError = { pass: false, command: argv[0] || null, launchId: launchLogs?.launchToken || null, error: safeLaunchLogError(error) };
     if (launchLogs) {
       try {

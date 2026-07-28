@@ -249,7 +249,14 @@ or rely on a PowerShell argument-list join. Arguments use Windows CRT quoting,
 including trailing backslashes before quotes. The launcher passes the two
 launch-bound `--bridge-stdout-log` and `--bridge-stderr-log` arguments to that
 same final Node process. Node appends bounded JSON success/error records there;
-the durable report remains the result source and the logs never replace it.
+the durable report remains the result source and the logs never replace it. A
+synchronous CLI may omit both launch-log arguments; in that mode no launch-log
+append is attempted. Detached execution must pass both absolute `stdout.log` and
+`stderr.log` paths inside the UUID launch directory. A missing pair member, empty,
+relative, malformed, overlong, wrong-name or wrong-directory path fails before the
+operation. A failure while appending a diagnostic record is swallowed after the
+command result is known and cannot change a completed/submitted/unknown result or
+invite a resend.
 The launch record is atomically rewritten from `starting` to `running` (or a
 durable `failed` record if start fails). `status` reads only a bounded,
 strictly validated launch record; `wait` performs the same inspection in a

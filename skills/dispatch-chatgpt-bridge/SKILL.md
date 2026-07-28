@@ -125,7 +125,11 @@ installed content.
 7. Invoke `batch` once with `-AllowSend`. Long-running generation should use
    `-Detach`; it returns a durable `launchPath` immediately. `progressPath` is
    populated only for batch, because resume/watch do not write a progress
-   sidecar. The detached logs are inside the launch directory.
+   sidecar. The detached logs are inside the launch directory. Synchronous CLI
+   calls omit both launch-log arguments and do not attempt diagnostic logging;
+   detached calls must receive the complete absolute UUID-bound `stdout.log` /
+   `stderr.log` pair. A diagnostic append failure never changes the durable
+   command result or authorizes a resend.
 8. Use runner-only `status -LaunchPath <launch.json>` or bounded `wait
    -LaunchPath <launch.json>` to inspect that handle. These actions are
    read-only and do not require a valid deployment manifest, start Node, touch

@@ -458,5 +458,9 @@ python -X utf8 "$env:USERPROFILE\.codex\skills\.system\skill-creator\scripts\qui
 .\windows\tests\run-tests.ps1
 ```
 
+全量入口会串行聚合多个 Node 测试文件，完整运行通常约需 8 分钟；控制台中间暂时
+没有新行不代表卡死。测试或隔离 smoke 使用临时 `-Root` 时，必须同时传入同一临时
+目录下的 `-StatePath`，因为 `-Root` 不会替换或隔离默认的 `%LOCALAPPDATA%` 状态。
+
 权威 Skill 位于本仓库的 `skills/dispatch-chatgpt-bridge/`。安装到 Codex
 运行环境后，还应将 Skill 和本仓库的独立 runtime 与全局副本逐文件校验。

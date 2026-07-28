@@ -88,6 +88,14 @@ GPT 规划 → 用户批准 → Codex 执行 → 测试验收 → 回读结果
 本仓库同时维护 Skill、独立运行时、契约、文档和测试，不包含任何皮肤、图片素材或
 业务项目代码，也不需要从其他项目借用 `chatgpt-bridge.mjs`。
 
+## 测试与临时隔离
+
+全量入口 `windows/tests/run-tests.ps1` 会串行聚合多个 Node 测试文件，完整运行通常
+约需 8 分钟；中间控制台可能暂时没有新行，不应据此判断卡死。测试和 smoke 若使用
+临时 Runtime 根目录，也必须同时显式传入临时 `-StatePath`；`-Root` 只选择运行时，
+不会隔离 `%LOCALAPPDATA%` 下的桥接状态。`status`/`wait` 读取 launch 句柄时同样只
+接受该句柄声明的受控路径。
+
 ## 适合谁
 
 - 想让 GPT 和 Codex 分工协作的个人开发者；

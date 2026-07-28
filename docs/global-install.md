@@ -169,12 +169,16 @@ Skill 副本和最终选中的 Runtime 的两份 manifest、规范化 hash、版
 $smoke = Join-Path $env:TEMP ('dispatch-bridge-smoke-' + [guid]::NewGuid().ToString('N'))
 $skills = Join-Path $smoke 'skills'
 $runtime = Join-Path $smoke 'runtime'
+$state = Join-Path $smoke 'state.json'
 ./scripts/install-global.ps1 -GlobalSkillsRoot $skills -GlobalRuntimeRoot $runtime
 ./scripts/verify-global-install.ps1 -GlobalSkillsRoot $skills -GlobalRuntimeRoot $runtime
 $smokeRunner = Join-Path $skills 'dispatch-chatgpt-bridge/scripts/run-bridge.ps1'
-& $smokeRunner -Root $runtime -Action discover
-& $smokeRunner -Root $runtime -Action probe
+& $smokeRunner -Root $runtime -StatePath $state -Action discover
+& $smokeRunner -Root $runtime -StatePath $state -Action probe
 ```
 
-该 smoke 只证明 Skill/Runtime 清单、路径绑定和只读诊断可用；它不发送、恢复、批准
-或删除任何 GPT 对话，也不验证永久后台自动化。
+其中 `$state` 必须由同一临时部署的合法、已验证 loopback 状态填充；没有状态时，
+discover/probe 应明确 fail closed，而不是偷偷读取当前用户的
+`%LOCALAPPDATA%\CodexChatGPTBridge\state.json`。`-Root` 只选择 Runtime，不提供状态
+隔离。该 smoke 只证明 Skill/Runtime 清单、路径绑定和只读诊断可用；它不发送、恢复、
+批准或删除任何 GPT 对话，也不验证永久后台自动化。

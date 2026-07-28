@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -84,6 +85,7 @@ const EXACT_CHATGPT_ID = "local-chatgpt:11111111-1111-4111-8111-111111111111";
 const EXACT_LOCAL_ID = "local:22222222-2222-4222-8222-222222222222";
 const EXACT_MARKER = "CODEX-BRIDGE-exact-root-marker";
 const VALID_PNG_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+const BRIDGE_RUNTIME_PATH = fileURLToPath(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url));
 
 function createDomElement(tagName, {
   attributes = {},
@@ -248,6 +250,49 @@ function createConversationUnit(role, text, key = `${role}-unit`) {
   return createDomElement("div", {
     attributes: { "data-content-search-unit-key": `${key}:${role}` },
     text,
+  });
+}
+
+function createP08CliFixture(root) {
+  const statePath = path.join(root, "state.json");
+  const ledgerPath = path.join(root, "ledger.json");
+  const reportPath = path.join(root, "cleanup-report.json");
+  const discoveryCountPath = path.join(root, "discovery-count.txt");
+  writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, platform: "windows" }) + "\n", "utf8");
+  writeFileSync(ledgerPath, JSON.stringify({ schemaVersion: 1, entries: [] }) + "\n", "utf8");
+  writeFileSync(discoveryCountPath, "0\n", "utf8");
+  writeFileSync(path.join(root, "discovery.json"), JSON.stringify({
+    statePath,
+    discoveryCountPath,
+    state: {
+      schemaVersion: 1,
+      platform: "windows",
+      port: 9345,
+      browserId: "browser-p08",
+      codexVersion: "26.715.10079.0",
+      codexExe: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_test\\app\\ChatGPT.exe",
+      codexPackageRoot: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_test",
+      codexPackageFullName: "OpenAI.Codex_26.715.10079.0_x64__test",
+      codexPackageFamilyName: "OpenAI.Codex_test",
+      createdAt: "2026-07-28T00:00:00.000Z",
+    },
+    identity: { processId: 1234 },
+    version: { Browser: "Codex/26.715.10079.0" },
+    target: { id: "page-p08", title: "Codex", url: "app://-/index.html" },
+  }) + "\n", "utf8");
+  return { statePath, ledgerPath, reportPath, discoveryCountPath, discoveryPath: path.join(root, "discovery.json") };
+}
+
+function runP08Cli(fixture, args) {
+  return spawnSync(process.execPath, [BRIDGE_RUNTIME_PATH, ...args], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      CODEX_BRIDGE_P08_TEST_MODE: "1",
+      CODEX_BRIDGE_P08_TEST_ENVIRONMENT: "black-box",
+      CODEX_BRIDGE_P08_DISCOVERY_PATH: fixture.discoveryPath,
+      LOCALAPPDATA: path.dirname(fixture.statePath),
+    },
   });
 }
 
@@ -521,13 +566,13 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     "--allow-send",
   ]).experimentalQuickChat, true);
   const launchToken = "11111111-1111-4111-8111-111111111111";
-  assert.equal(parseBridgeArgs([
+  assert.throws(() => parseBridgeArgs([
     "batch",
     "--input", "C:\\jobs\\batch.json",
     "--output", "C:\\jobs\\report.json",
     "--allow-send",
     "--bridge-launch-token", launchToken,
-  ]).launchToken, launchToken);
+  ]), /launch token|log paths/i);
   const launchLogRoot = "C:\\Users\\HP\\AppData\\Local\\CodexChatGPTBridge\\launches\\11111111-1111-4111-8111-111111111111";
   const parsedLaunchLogs = parseBridgeArgs([
     "batch",
@@ -575,6 +620,96 @@ test("oversized launcher log events degrade to one bounded safe record", () => {
       pass: false,
       error: "bridge launch log payload exceeded the bounded limit",
     });
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("final Node CLI succeeds exactly once without detached log arguments", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-p08-cli-"));
+  try {
+    const fixture = createP08CliFixture(temporaryRoot);
+    const discovered = runP08Cli(fixture, ["discover", "--state", fixture.statePath]);
+    assert.equal(discovered.status, 0, discovered.stderr || discovered.stdout);
+    assert.deepEqual(JSON.parse(discovered.stdout), {
+      pass: true,
+      command: "discover",
+      codexVersion: "26.715.10079.0",
+      packageFullName: "OpenAI.Codex_26.715.10079.0_x64__test",
+      port: 9345,
+      browserId: "browser-p08",
+      browser: "Codex/26.715.10079.0",
+      renderer: { id: "page-p08", title: "Codex", url: "app://-/index.html" },
+      processId: 1234,
+    });
+
+    const cleanup = runP08Cli(fixture, [
+      "cleanup",
+      "--state", fixture.statePath,
+      "--input", fixture.ledgerPath,
+      "--output", fixture.reportPath,
+      "--allow-delete",
+    ]);
+    assert.equal(cleanup.status, 0, cleanup.stderr || cleanup.stdout);
+    const cleanupReport = JSON.parse(cleanup.stdout);
+    assert.equal(cleanupReport.pass, true);
+    assert.equal(cleanupReport.command, "cleanup");
+    assert.deepEqual(JSON.parse(readFileSync(fixture.ledgerPath, "utf8")), { schemaVersion: 1, entries: [] });
+    assert.equal(JSON.parse(readFileSync(fixture.discoveryCountPath, "utf8")), 2);
+    assert.equal(existsSync(path.join(temporaryRoot, "stdout.log")), false);
+    assert.equal(existsSync(path.join(temporaryRoot, "stderr.log")), false);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("final Node CLI rejects partial or invalid detached log arguments before any operation", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-p08-log-args-"));
+  try {
+    const fixture = createP08CliFixture(temporaryRoot);
+    const launchToken = "11111111-1111-4111-8111-111111111111";
+    const stdoutPath = path.join(temporaryRoot, launchToken, "stdout.log");
+    const stderrPath = path.join(temporaryRoot, launchToken, "stderr.log");
+    const cases = [
+      ["--bridge-stdout-log", stdoutPath],
+      ["--bridge-stdout-log", "relative-stdout.log", "--bridge-stderr-log", "relative-stderr.log", "--bridge-launch-token", launchToken],
+      ["--bridge-stdout-log", stdoutPath, "--bridge-stderr-log", stderrPath, "--bridge-launch-token", "not-a-uuid"],
+    ];
+    for (const logArguments of cases) {
+      const result = runP08Cli(fixture, ["cleanup", "--state", fixture.statePath,
+        "--input", fixture.ledgerPath, "--output", fixture.reportPath, "--allow-delete", ...logArguments]);
+      assert.notEqual(result.status, 0);
+    }
+    assert.equal(readFileSync(fixture.discoveryCountPath, "utf8").trim(), "0");
+    assert.equal(readFileSync(fixture.ledgerPath, "utf8").trim(), '{"schemaVersion":1,"entries":[]}');
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("detached log finalization failure cannot change a completed command result", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-p08-log-failure-"));
+  try {
+    const fixture = createP08CliFixture(temporaryRoot);
+    const launchToken = "22222222-2222-4222-8222-222222222222";
+    const launchRoot = path.join(temporaryRoot, launchToken);
+    mkdirSync(launchRoot, { recursive: true });
+    mkdirSync(path.join(launchRoot, "stdout.log"));
+    writeFileSync(path.join(launchRoot, "stderr.log"), "", "utf8");
+    const result = runP08Cli(fixture, [
+      "cleanup",
+      "--state", fixture.statePath,
+      "--input", fixture.ledgerPath,
+      "--output", fixture.reportPath,
+      "--allow-delete",
+      "--bridge-launch-token", launchToken,
+      "--bridge-stdout-log", path.join(launchRoot, "stdout.log"),
+      "--bridge-stderr-log", path.join(launchRoot, "stderr.log"),
+    ]);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout).pass, true);
+    assert.equal(JSON.parse(readFileSync(fixture.discoveryCountPath, "utf8")), 1);
+    assert.equal(JSON.parse(readFileSync(fixture.reportPath, "utf8")).pass, true);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
