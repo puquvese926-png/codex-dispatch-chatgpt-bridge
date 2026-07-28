@@ -107,9 +107,9 @@ Never convert `unknown-after-submit` or `timeout-after-submit` into a new send.
 
 `watch` implements the bounded, read-only GPT-to-Codex protocol defined in [handoff-contract.md](handoff-contract.md). It observes only rendered message units inside the exact active `chatgpt-main-chat` identity. GPT must emit a schema-valid `CODEX_HANDOFF` proposal, and a later user-role message must exactly approve the same task ID.
 
-The watch manifest contains `schemaVersion`, the pinned `conversationId`, `surface: "chatgpt-main-chat"`, and an absolute `checkpointPath`. A successful handoff atomically records the task ID and normalized plan hash before reporting `handoff-ready`. This local checkpoint mutation is not a ChatGPT history mutation. Identity mismatch, unreadable surface, malformed protocol, changed-plan task ID reuse, and timeout all fail closed without sending.
+The watch manifest contains `schemaVersion`, the pinned `conversationId`, `surface: "chatgpt-main-chat"`, and an absolute `checkpointPath`; watch passes that validated manifest surface to every read. A successful handoff atomically records the task ID and normalized plan hash before reporting `handoff-ready`. This local checkpoint mutation is not a ChatGPT history mutation. Identity mismatch, unreadable surface, malformed protocol, changed-plan task ID reuse, and timeout all fail closed without sending.
 
-`approve` is the only supported Codex-relayed second turn. It requires `-AllowSend`, an exact conversation ID, original bridge marker and task ID, then verifies the visible schema-valid proposal and idle blank composer. It sends only `CODEX_APPROVE <taskId>`. It is not an arbitrary continuation API. For embedded no-title Quick chat, start `watch` first and keep it active across approval; the surface may unmount before a later process can recover it by ID.
+`approve` is the only supported Codex-relayed second turn. It requires `-AllowSend`, an exact conversation ID, original bridge marker and task ID, then verifies the visible schema-valid proposal and idle blank composer. Its read-only proposal/acknowledgement checks use the surface of the actually opened prepared session, so direct recovery may use Quick Chat without guessing from the ID. It sends only `CODEX_APPROVE <taskId>`. It is not an arbitrary continuation API. For embedded no-title Quick chat, start `watch` first and keep it active across approval; the surface may unmount before a later process can recover it by ID.
 
 ## Lifecycle ledger
 
@@ -188,15 +188,22 @@ already visible. Collection may reopen the entry only after the current lease is
 not visible, and it must prove the same lease again before consuming a result.
 
 Read-only snapshots, result collection and handoff-unit reads must receive the
-expected conversation ID explicitly. They reuse the exact ChatGPT owner
+expected `surface` and conversation ID explicitly. The surface must be exactly
+`chatgpt-main-chat` or `chatgpt-quick-chat`; the bridge never invents a
+`chatgpt-handoff` surface and never guesses Main versus Quick Chat from the
+current DOM or route. Each read reuses the corresponding exact ChatGPT owner
 resolver: one visible owner, one verifiable DOM identity, and for native Quick
-Chat the current strict `app:` route checked inside the same `Runtime.evaluate`.
-Marker, rendered message units, image/blob sources, composer/stop/send state and
-handoff code blocks are read only from that root. Zero or multiple owners,
-identity or route drift, and a missing expected ID return an unreadable result
-or fail at expression construction. The main submission lease resolves the
-owner once and derives both its identity and snapshot from that same root; it
-never chains two independent root selections.
+Chat the current strict `app:` route checked inside the same
+`Runtime.evaluate`. Marker, rendered message units, image/blob sources,
+composer/stop/send state and handoff code blocks are read only from that root.
+Zero or multiple owners, identity or route drift, a missing expected ID or an
+invalid surface return an unreadable result or fail at expression construction.
+The main submission lease resolves the owner once and derives both its identity
+and snapshot from that same root; it never chains two independent root
+selections. Explicit identity attributes are authoritative: exactly one must
+equal the expected ID. The active-sidebar fallback is allowed only for a Main
+surface with no explicit identity and an explicit ChatGPT mode/composer; an
+expected-plus-other or other-only identity conflict fails closed.
 
 The fresh-conversation gate accepts an exact visible `新聊天` / `New chat`
 semantic label from `aria-label`, title or rendered text. Icon-only controls

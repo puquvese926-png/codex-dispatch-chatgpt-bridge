@@ -1838,9 +1838,10 @@ test("handoff checkpoint prevents duplicate delivery and task rebinding", () => 
 });
 
 test("handoff DOM collection is read-only and scoped to rendered conversation units", () => {
-  assert.throws(() => buildHandoffUnitsExpression(), /identity/i);
-  const expression = buildHandoffUnitsExpression(EXACT_CHATGPT_ID);
+  assert.throws(() => buildHandoffUnitsExpression(), /surface|identity/i);
+  const expression = buildHandoffUnitsExpression("chatgpt-main-chat", EXACT_CHATGPT_ID);
   const nativeExpression = buildHandoffUnitsExpression(
+    "chatgpt-quick-chat",
     "local-chatgpt:4c172155-0408-4417-b253-145d3e80a9d1",
   );
   assert.match(expression, /readable/);
@@ -1857,7 +1858,7 @@ test("handoff watch passes its expected conversation identity into DOM collectio
   const start = source.indexOf("async function readHandoffObservation");
   const end = source.indexOf("async function runWatch", start);
   const observationSource = source.slice(start, end);
-  assert.match(observationSource, /buildHandoffUnitsExpression\(expectedConversationId\)/);
+  assert.match(observationSource, /buildHandoffUnitsExpression\(expectedSurface, expectedConversationId\)/);
   assert.doesNotMatch(observationSource, /manifest\\./);
 });
 
@@ -2310,16 +2311,105 @@ test("handoff units require the exact owner and ignore another dialog", () => {
     [createConversationUnit("user", "CODEX_APPROVE exact-task", "chat")],
   );
   const result = createDomHarness([codexRoot, chatRoot]).evaluate(
-    buildHandoffUnitsExpression(EXACT_CHATGPT_ID),
+    buildHandoffUnitsExpression("chatgpt-main-chat", EXACT_CHATGPT_ID),
   );
   assert.equal(result.readable, true);
   assert.equal(result.units.length, 1);
   assert.match(result.units[0].text, /exact-task/);
 
   const wrong = createDomHarness([codexRoot]).evaluate(
-    buildHandoffUnitsExpression(EXACT_CHATGPT_ID),
+    buildHandoffUnitsExpression("chatgpt-main-chat", EXACT_CHATGPT_ID),
   );
   assert.equal(wrong.readable, false);
+});
+
+test("handoff units require an explicit surface and Quick Chat route", () => {
+  assert.throws(() => buildHandoffUnitsExpression("chatgpt-handoff", EXACT_CHATGPT_ID), /surface/i);
+  const root = createDomElement("main", {
+    children: [
+      createConversationUnit("user", "CODEX_HANDOFF exact-task", "quick"),
+      createComposer("", { "aria-label": "ChatGPT composer" }),
+      createSendButton(),
+    ],
+  });
+  const validHarness = createDomHarness([root], { href: quickChatAppUrl(EXACT_CHATGPT_ID) });
+  const valid = validHarness.evaluate(buildHandoffUnitsExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+  ));
+  assert.equal(valid.readable, true);
+
+  const mainOnQuick = validHarness.evaluate(buildHandoffUnitsExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  ));
+  assert.equal(mainOnQuick.readable, false);
+
+  const stale = createDomHarness([root], {
+    href: quickChatAppUrl("local-chatgpt:55555555-5555-4555-8555-555555555555"),
+  }).evaluate(buildHandoffUnitsExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+  ));
+  assert.equal(stale.readable, false);
+});
+
+test("snapshot rejects expected-plus-other identity conflicts", () => {
+  const other = "local-chatgpt:66666666-6666-4666-8666-666666666666";
+  const conflictingIdentity = createDomElement("div", {
+    attributes: { "data-above-composer-conversation-id": `chatgpt:${other}` },
+  });
+  const root = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [conflictingIdentity, createConversationUnit("user", "CODEX-BRIDGE-conflict", "conflict")],
+  );
+  const result = createDomHarness([root]).evaluate(buildConversationSnapshotExpression(
+    "CODEX-BRIDGE-conflict",
+    EXACT_CHATGPT_ID,
+    "main-chat",
+  ));
+  assert.equal(result.readable, false);
+});
+
+test("snapshot rejects other explicit identity despite expected active sidebar fallback", () => {
+  const other = "local:77777777-7777-4777-8777-777777777777";
+  const activeSidebar = createDomElement("div", {
+    attributes: {
+      "data-app-action-sidebar-thread-id": EXACT_LOCAL_ID,
+      "data-app-action-sidebar-thread-active": "true",
+    },
+  });
+  const root = createDomElement("main", {
+    children: [
+      createDomElement("button", { text: "当前模式：ChatGPT" }),
+      createDomElement("div", {
+        attributes: { "data-above-composer-conversation-id": other },
+      }),
+      createComposer("", { "aria-label": "ChatGPT composer" }),
+      createSendButton(),
+      createConversationUnit("user", "CODEX-BRIDGE-sidebar-conflict", "conflict"),
+    ],
+  });
+  const result = createDomHarness([activeSidebar, root]).evaluate(buildConversationSnapshotExpression(
+    "CODEX-BRIDGE-sidebar-conflict",
+    EXACT_LOCAL_ID,
+    "main-chat",
+  ));
+  assert.equal(result.readable, false);
+});
+
+test("watch status reports unreadable before inactive when exact owner is unavailable", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const watchStart = source.indexOf("async function runWatch");
+  const loopEnd = source.indexOf("const remaining = deadline - Date.now();", watchStart);
+  const reportStart = source.indexOf("const report = {", loopEnd);
+  const reportEnd = source.indexOf("await writeJsonAtomically(options.output, report);", reportStart);
+  const reportSource = source.slice(reportStart, reportEnd);
+  assert.ok(reportStart > watchStart && reportEnd > reportStart);
+  assert.ok(reportSource.indexOf("!lastReadable") < reportSource.indexOf("lastIdentity !== manifest.conversationId"));
+  assert.match(reportSource, /conversation-not-readable/);
 });
 
 test("materializes only app-local rendered blob images", () => {

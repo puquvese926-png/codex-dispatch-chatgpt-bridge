@@ -959,7 +959,7 @@ export function buildMainChatConversationIdExpression() {
 }
 
 function validateSubmissionExpressionInput(surface, conversationId, marker = null) {
-  if (!new Set(["chatgpt-quick-chat", "chatgpt-main-chat", "chatgpt-handoff"]).has(surface)) {
+  if (!new Set(["chatgpt-quick-chat", "chatgpt-main-chat"]).has(surface)) {
     throw new Error("submission surface is invalid");
   }
   const validConversationId = surface === "chatgpt-quick-chat" ?
@@ -1086,7 +1086,7 @@ function buildExactSubmissionRootSource(surface, conversationId) {
       if (dialog) return dialog;
       const identityOwner = composer.closest('[data-above-composer-conversation-id]');
       if (identityOwner) return identityOwner;
-      if (!['chatgpt-main-chat', 'chatgpt-handoff'].includes(surface)) return null;
+      if (surface !== 'chatgpt-main-chat') return null;
       let current = composer.parentElement;
       while (current && current !== document) {
         if (current.matches?.('main, [role="main"], section') && hasChatGptMode(current)) {
@@ -1103,7 +1103,7 @@ function buildExactSubmissionRootSource(surface, conversationId) {
       const identities = [...new Set(identityNodes
         .map((node) => normalizeIdentity(node.getAttribute('data-above-composer-conversation-id')))
         .filter(Boolean))];
-      if (identities.includes(expectedConversationId)) return true;
+      if (identities.length > 0) return identities.length === 1 && identities[0] === expectedConversationId;
       if (surface !== 'chatgpt-main-chat' ||
           !expectedConversationId.startsWith('local:') ||
           !hasChatGptMode(root)) {
@@ -1138,24 +1138,6 @@ function buildExactSubmissionRootSource(surface, conversationId) {
           return { ok: false, reason: 'send-count', rootCount: 1, sendCount: sends.length };
         }
         return { ok: true, root: document, composer: composers[0], send: sends[0] || null };
-      }
-      if (surface === 'chatgpt-handoff') {
-        const currentConversationId = currentQuickChatConversationId();
-        const visibleDialogs = [
-          ...document.querySelectorAll('[data-pip-obstacle="quick-chat"], [role="dialog"]'),
-        ].filter(visible);
-        const hasExpectedDialog = visibleDialogs.some((dialog) => rootHasExpectedIdentity(dialog));
-        if (currentConversationId === expectedConversationId && !hasExpectedDialog) {
-          const composers = composersIn(document);
-          if (composers.length !== 1) {
-            return { ok: false, reason: 'composer-count', rootCount: 1, composerCount: composers.length };
-          }
-          const sends = requireSend ? sendsIn(document) : [];
-          if (requireSend && sends.length !== 1) {
-            return { ok: false, reason: 'send-count', rootCount: 1, sendCount: sends.length };
-          }
-          return { ok: true, root: document, composer: composers[0], send: sends[0] || null };
-        }
       }
       const candidateRoots = [];
       const seenRoots = new Set();
@@ -1394,9 +1376,9 @@ export function buildMainChatSubmissionLeaseExpression(conversationId, marker) {
   })()`;
 }
 
-export function buildHandoffUnitsExpression(expectedConversationId) {
-  validateSubmissionExpressionInput("chatgpt-handoff", expectedConversationId);
-  const rootSource = buildExactSubmissionRootSource("chatgpt-handoff", expectedConversationId);
+export function buildHandoffUnitsExpression(surface, expectedConversationId) {
+  validateSubmissionExpressionInput(surface, expectedConversationId);
+  const rootSource = buildExactSubmissionRootSource(surface, expectedConversationId);
   return `(() => {
     ${rootSource}
     const resolved = resolveExactOwner(false);
@@ -2972,7 +2954,7 @@ async function readHandoffCheckpointOrEmpty(file, conversationId) {
   }
 }
 
-async function readHandoffObservation(discovery, expectedConversationId) {
+async function readHandoffObservation(discovery, expectedSurface, expectedConversationId) {
   const session = await openCdpSessionAtStage(async () => {
     const targets = await fetchCdpJson(discovery.state.port, "/json/list");
     return selectCdpPageTargetById(targets, discovery.state.port, discovery.target.id);
@@ -2981,7 +2963,7 @@ async function readHandoffObservation(discovery, expectedConversationId) {
   try {
     const rendered = await evaluateAtStage(
       session,
-      buildHandoffUnitsExpression(expectedConversationId),
+      buildHandoffUnitsExpression(expectedSurface, expectedConversationId),
       "handoff-watch-rendered-units",
     );
     if (!rendered || typeof rendered.readable !== "boolean" || !Array.isArray(rendered.units)) {
@@ -2991,7 +2973,7 @@ async function readHandoffObservation(discovery, expectedConversationId) {
     return {
       identity,
       units: rendered.units,
-      active: true,
+      active: rendered.readable,
       readable: rendered.readable,
     };
   } finally {
@@ -3015,7 +2997,11 @@ async function runWatch(options, discovery) {
 
   while (true) {
     polls += 1;
-    const observation = await readHandoffObservation(discovery, manifest.conversationId);
+    const observation = await readHandoffObservation(
+      discovery,
+      manifest.surface,
+      manifest.conversationId,
+    );
     lastIdentity = observation.identity || null;
     lastReadable = observation.readable;
     observedUnits = observation.units.length;
@@ -3079,8 +3065,8 @@ async function runWatch(options, discovery) {
     runId,
     startedAt,
     completedAt: new Date().toISOString(),
-    status: lastIdentity !== manifest.conversationId ? "conversation-not-active" :
-      lastReadable ? "no-handoff" : "conversation-not-readable",
+    status: !lastReadable ? "conversation-not-readable" :
+      lastIdentity !== manifest.conversationId ? "conversation-not-active" : "no-handoff",
     conversationId: manifest.conversationId,
     observedConversationId: lastIdentity,
     surface: manifest.surface,
@@ -3168,7 +3154,7 @@ async function runApprove(options, discovery) {
     session = opened.session;
     const observation = await evaluateAtStage(
       session,
-      buildHandoffUnitsExpression(manifest.conversationId),
+      buildHandoffUnitsExpression(opened.prepared.surface, manifest.conversationId),
       "handoff-approve-proposal-read",
     );
     if (!observation?.readable) throw new Error("handoff approval conversation is not readable");
@@ -3211,18 +3197,13 @@ async function runApprove(options, discovery) {
       );
       if (!clicked?.ok) throw new Error(`handoff approval was not submitted: ${clicked?.reason || "unknown"}`);
       await waitFor(async () => {
-        const currentIdentity = await evaluateAtStage(
-          session,
-          buildMainChatConversationIdExpression(),
-          "handoff-approve-ack-identity",
-        );
-        if (currentIdentity !== manifest.conversationId) return null;
         const current = await evaluateAtStage(
           session,
-          buildHandoffUnitsExpression(manifest.conversationId),
+          buildHandoffUnitsExpression(opened.prepared.surface, manifest.conversationId),
           "handoff-approve-ack-units",
         );
-        return current?.units?.some((unit) =>
+        return current?.readable && current?.conversationId === manifest.conversationId &&
+          current?.units?.some((unit) =>
           unit.role === "user" && unit.text.trim() === approvalText) || null;
       }, Math.min(options.timeoutMs, 30000), `handoff approval acknowledgement for ${manifest.taskId}`);
       status = "approved";
