@@ -959,7 +959,7 @@ export function buildMainChatConversationIdExpression() {
 }
 
 function validateSubmissionExpressionInput(surface, conversationId, marker = null) {
-  if (!new Set(["chatgpt-quick-chat", "chatgpt-main-chat"]).has(surface)) {
+  if (!new Set(["chatgpt-quick-chat", "chatgpt-main-chat", "chatgpt-handoff"]).has(surface)) {
     throw new Error("submission surface is invalid");
   }
   const validConversationId = surface === "chatgpt-quick-chat" ?
@@ -1086,7 +1086,7 @@ function buildExactSubmissionRootSource(surface, conversationId) {
       if (dialog) return dialog;
       const identityOwner = composer.closest('[data-above-composer-conversation-id]');
       if (identityOwner) return identityOwner;
-      if (surface !== 'chatgpt-main-chat') return null;
+      if (!['chatgpt-main-chat', 'chatgpt-handoff'].includes(surface)) return null;
       let current = composer.parentElement;
       while (current && current !== document) {
         if (current.matches?.('main, [role="main"], section') && hasChatGptMode(current)) {
@@ -1138,6 +1138,24 @@ function buildExactSubmissionRootSource(surface, conversationId) {
           return { ok: false, reason: 'send-count', rootCount: 1, sendCount: sends.length };
         }
         return { ok: true, root: document, composer: composers[0], send: sends[0] || null };
+      }
+      if (surface === 'chatgpt-handoff') {
+        const currentConversationId = currentQuickChatConversationId();
+        const visibleDialogs = [
+          ...document.querySelectorAll('[data-pip-obstacle="quick-chat"], [role="dialog"]'),
+        ].filter(visible);
+        const hasExpectedDialog = visibleDialogs.some((dialog) => rootHasExpectedIdentity(dialog));
+        if (currentConversationId === expectedConversationId && !hasExpectedDialog) {
+          const composers = composersIn(document);
+          if (composers.length !== 1) {
+            return { ok: false, reason: 'composer-count', rootCount: 1, composerCount: composers.length };
+          }
+          const sends = requireSend ? sendsIn(document) : [];
+          if (requireSend && sends.length !== 1) {
+            return { ok: false, reason: 'send-count', rootCount: 1, sendCount: sends.length };
+          }
+          return { ok: true, root: document, composer: composers[0], send: sends[0] || null };
+        }
       }
       const candidateRoots = [];
       const seenRoots = new Set();
@@ -1265,34 +1283,11 @@ export function buildSendClickExpression(surface, conversationId, marker) {
   })()`;
 }
 
-export function buildConversationSnapshotExpression(marker, surface = "quick-chat") {
-  if (typeof marker !== "string" || !marker || marker.length > 200 || /[\u0000-\u001f\u007f]/u.test(marker)) {
-    throw new Error("snapshot marker is invalid");
-  }
-  if (!new Set(["quick-chat", "main-chat"]).has(surface)) throw new Error("snapshot surface is invalid");
-  const markerJson = JSON.stringify(marker);
-  const rootExpression = surface === "main-chat" ? `(() => {
-      const visible = (node) => {
-        if (!node || node.getAttribute('aria-hidden') === 'true') return false;
-        const style = getComputedStyle(node);
-        const rect = node.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
-      };
-      const dialog = [...document.querySelectorAll('[data-pip-obstacle="quick-chat"]')].find(visible) ||
-        [...document.querySelectorAll('[role="dialog"]')].find(visible) || null;
-      if (dialog) return dialog;
-      const modeActive = [...document.querySelectorAll('button, [role="button"]')].some((node) => {
-        const label = [node.getAttribute('aria-label'), node.getAttribute('title'), node.innerText, node.textContent]
-          .filter(Boolean).join(' ').trim();
-        return visible(node) && /(?:当前模式|current mode)\s*[:：]?\s*ChatGPT/iu.test(label);
-      });
-      return modeActive ? document : null;
-    })()` : "document";
-  return `(() => {
-    const marker = ${markerJson};
-    const root = ${rootExpression};
-    if (!root) return { markerPresent: false, composerBusy: false, hasStopButton: false, sendPresent: false, assistantMessageCount: 0, userMessageCount: 0, assistantText: '', images: [] };
+function buildSnapshotBodySource(marker) {
+  return `
+    const marker = ${JSON.stringify(marker)};
     const units = [...root.querySelectorAll('[data-content-search-unit-key]')]
+      .filter(visible)
       .map((node) => {
         const key = node.getAttribute('data-content-search-unit-key') || '';
         const role = key.endsWith(':assistant') ? 'assistant' : key.endsWith(':user') ? 'user' : null;
@@ -1301,12 +1296,14 @@ export function buildConversationSnapshotExpression(marker, surface = "quick-cha
           key,
           role,
           text: (node.innerText || node.textContent || '').trim(),
-          images: role === 'assistant' ? [...node.querySelectorAll('img')].map((image) => ({
-            src: image.currentSrc || image.src || '',
-            width: image.naturalWidth || image.width || 0,
-            height: image.naturalHeight || image.height || 0,
-            alt: image.alt || '',
-          })) : [],
+          images: role === 'assistant' ? [...node.querySelectorAll('img')]
+            .filter(visible)
+            .map((image) => ({
+              src: image.currentSrc || image.src || '',
+              width: image.naturalWidth || image.width || 0,
+              height: image.naturalHeight || image.height || 0,
+              alt: image.alt || '',
+            })) : [],
         };
       })
       .filter(Boolean);
@@ -1314,6 +1311,7 @@ export function buildConversationSnapshotExpression(marker, surface = "quick-cha
     const users = units.filter((unit) => unit.role === 'user');
     const latest = assistants.at(-1) || null;
     const generatedImages = [...root.querySelectorAll('img')]
+      .filter(visible)
       .filter((image) => image.naturalWidth >= 512 && image.naturalHeight >= 512 &&
         /(?:generated image|生成图像)/i.test(image.alt || ''))
       .map((image) => ({
@@ -1325,6 +1323,8 @@ export function buildConversationSnapshotExpression(marker, surface = "quick-cha
     const images = [...(latest?.images || []), ...generatedImages]
       .filter((image, index, all) => image.src && all.findIndex((item) => item.src === image.src) === index);
     return {
+      readable: true,
+      conversationId: expectedConversationId,
       markerPresent: users.some((unit) => unit.text.includes(marker)),
       composerBusy: Boolean(root.querySelector('button[aria-label="停止"], button[aria-label="Stop"]')),
       hasStopButton: Boolean(root.querySelector('button[aria-label="停止"], button[aria-label="Stop"]')),
@@ -1334,6 +1334,40 @@ export function buildConversationSnapshotExpression(marker, surface = "quick-cha
       assistantText: latest?.text || '',
       images,
     };
+  `;
+}
+
+function emptySnapshotSource(reasonExpression) {
+  return `{
+      readable: false,
+      conversationId: null,
+      reason: ${reasonExpression},
+      markerPresent: false,
+      composerBusy: false,
+      hasStopButton: false,
+      sendPresent: false,
+      assistantMessageCount: 0,
+      userMessageCount: 0,
+      assistantText: '',
+      images: [],
+    }`;
+}
+
+export function buildConversationSnapshotExpression(marker, expectedConversationId, surface = "quick-chat") {
+  if (typeof marker !== "string" || !marker || marker.length > 200 || /[\u0000-\u001f\u007f]/u.test(marker)) {
+    throw new Error("snapshot marker is invalid");
+  }
+  if (!new Set(["quick-chat", "main-chat"]).has(surface)) throw new Error("snapshot surface is invalid");
+  const submissionSurface = surface === "quick-chat" ? "chatgpt-quick-chat" : "chatgpt-main-chat";
+  validateSubmissionExpressionInput(submissionSurface, expectedConversationId);
+  const rootSource = buildExactSubmissionRootSource(submissionSurface, expectedConversationId);
+  const bodySource = buildSnapshotBodySource(marker);
+  return `(() => {
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return ${emptySnapshotSource("resolved.reason")};
+    const root = resolved.root;
+    ${bodySource}
   })()`;
 }
 
@@ -1344,53 +1378,30 @@ export function buildMainChatSubmissionLeaseExpression(conversationId, marker) {
   if (typeof marker !== "string" || !marker || marker.length > 200 || /[\u0000-\u001f\u007f]/u.test(marker)) {
     throw new Error("main ChatGPT submission lease marker is invalid");
   }
+  const rootSource = buildExactSubmissionRootSource("chatgpt-main-chat", conversationId);
+  const bodySource = buildSnapshotBodySource(marker);
   return `(() => {
-    const expectedConversationId = ${JSON.stringify(conversationId)};
-    const conversationId = ${buildMainChatConversationIdExpression()};
-    if (conversationId !== expectedConversationId) {
-      return { conversationId, snapshot: null };
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) {
+      return { conversationId: null, snapshot: ${emptySnapshotSource("resolved.reason")} };
     }
-    const snapshot = ${buildConversationSnapshotExpression(marker, "main-chat")};
-    return { conversationId, snapshot };
+    const root = resolved.root;
+    const snapshot = (() => {
+      ${bodySource}
+    })();
+    return { conversationId: expectedConversationId, snapshot };
   })()`;
 }
 
-export function buildHandoffUnitsExpression(expectedConversationId = null) {
-  if (expectedConversationId !== null &&
-      !LOCAL_CHATGPT_ID_PATTERN.test(expectedConversationId) &&
-      !LOCAL_THREAD_ID_PATTERN.test(expectedConversationId)) {
-    throw new Error("handoff unit conversation identity is invalid");
-  }
+export function buildHandoffUnitsExpression(expectedConversationId) {
+  validateSubmissionExpressionInput("chatgpt-handoff", expectedConversationId);
+  const rootSource = buildExactSubmissionRootSource("chatgpt-handoff", expectedConversationId);
   return `(() => {
-    const expected = ${JSON.stringify(expectedConversationId)};
-    const visible = (node) => {
-      if (!node || node.getAttribute('aria-hidden') === 'true') return false;
-      const style = getComputedStyle(node);
-      const rect = node.getBoundingClientRect();
-      return style.display !== 'none' && style.visibility !== 'hidden' &&
-        rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
-    };
-    const dialog = [...document.querySelectorAll('[data-pip-obstacle="quick-chat"]')].find(visible) ||
-      [...document.querySelectorAll('[role="dialog"]')].find(visible) || null;
-    const modeActive = [...document.querySelectorAll('button, [role="button"]')].some((node) => {
-      const label = [node.getAttribute('aria-label'), node.getAttribute('title'), node.innerText, node.textContent]
-        .filter(Boolean).join(' ').trim();
-      return visible(node) && /(?:当前模式|current mode)\\s*[:：]?\\s*ChatGPT/iu.test(label);
-    });
-    const identityNodes = [...document.querySelectorAll('[data-above-composer-conversation-id]')];
-    const exactDocument = Boolean(expected) && (
-      identityNodes.some((node) => {
-        const raw = node.getAttribute('data-above-composer-conversation-id')?.trim() || '';
-        const actual = raw.startsWith('chatgpt:') ? raw.slice('chatgpt:'.length) :
-          (/^[0-9a-f-]{36}$/iu.test(raw) ? 'local:' + raw : raw);
-        return actual === expected;
-      }) ||
-      (() => {
-        try { return decodeURIComponent(location.href).includes(expected); } catch { return false; }
-      })()
-    );
-    const root = dialog || ((modeActive || exactDocument) ? document : null);
-    if (!root) return { readable: false, units: [] };
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return { readable: false, conversationId: null, units: [] };
+    const root = resolved.root;
     const units = [...root.querySelectorAll('[data-content-search-unit-key]')]
       .filter(visible)
       .map((node) => {
@@ -1408,7 +1419,7 @@ export function buildHandoffUnitsExpression(expectedConversationId = null) {
       })
       .filter(Boolean)
       .slice(-500);
-    return { readable: true, units };
+    return { readable: true, conversationId: expectedConversationId, units };
   })()`;
 }
 
@@ -2422,7 +2433,11 @@ async function openMainChatSubmittedConversation(discovery, conversationId, mark
       await waitFor(async () => {
         const identity = await session.evaluate(buildMainChatConversationIdExpression());
         if (identity !== conversationId) return null;
-        const snapshot = await session.evaluate(buildConversationSnapshotExpression(marker, "main-chat"));
+        const snapshot = await session.evaluate(buildConversationSnapshotExpression(
+          marker,
+          conversationId,
+          "main-chat",
+        ));
         return snapshot?.markerPresent ? snapshot : null;
       }, 15000, "main ChatGPT submitted marker");
     } catch (error) {
@@ -2466,7 +2481,11 @@ async function selectHistoryConversation(session, job, surface = "quick-chat") {
       const identity = await session.evaluate(buildMainChatConversationIdExpression());
       if (identity !== job.conversationId) return null;
     }
-    const snapshot = await session.evaluate(buildConversationSnapshotExpression(job.marker, surface));
+    const snapshot = await session.evaluate(buildConversationSnapshotExpression(
+      job.marker,
+      job.conversationId,
+      surface,
+    ));
     return snapshot?.markerPresent ? snapshot : null;
   }, 20000, `ChatGPT history marker for ${job.id}`);
 }
@@ -2496,7 +2515,7 @@ async function discoverHistoryConversation(session, job, surface = "quick-chat")
           if (identity !== job.conversationId) return null;
           const snapshot = await evaluateAtStage(
             session,
-            buildConversationSnapshotExpression(job.marker, "main-chat"),
+            buildConversationSnapshotExpression(job.marker, job.conversationId, "main-chat"),
             `history-marker-scan:${title}`,
           );
           return snapshot?.markerPresent ? snapshot : null;
@@ -2719,6 +2738,7 @@ async function submitJob(session, prepared, job, runId) {
       if (currentId !== prepared.conversationId) return null;
       const snapshot = await session.evaluate(buildConversationSnapshotExpression(
         marker,
+        prepared.conversationId,
         "quick-chat",
       ));
       return snapshot?.markerPresent ? snapshot : null;
@@ -2758,6 +2778,7 @@ async function navigateToConversation(session, submission) {
     if (id !== submission.conversationId) return null;
     const snapshot = await session.evaluate(buildConversationSnapshotExpression(
       submission.marker,
+      submission.conversationId,
       submission.surface === "chatgpt-main-chat" ? "main-chat" : "quick-chat",
     ));
     return snapshot?.markerPresent ? snapshot : null;
@@ -2801,6 +2822,7 @@ async function collectJob(session, submission, timeoutMs) {
       currentConversationId = conversationIdFromAppUrl(currentUrl);
       snapshot = await session.evaluate(buildConversationSnapshotExpression(
         submission.marker,
+        submission.conversationId,
         "quick-chat",
       ));
     }
@@ -2957,14 +2979,6 @@ async function readHandoffObservation(discovery, expectedConversationId) {
   }, discovery.state.port, "handoff-watch-session-open");
   session.ownsWindow = false;
   try {
-    const identity = await evaluateAtStage(
-      session,
-      buildMainChatConversationIdExpression(),
-      "handoff-watch-conversation-identity",
-    );
-    if (identity !== expectedConversationId) {
-      return { identity, units: [], active: false, readable: false };
-    }
     const rendered = await evaluateAtStage(
       session,
       buildHandoffUnitsExpression(expectedConversationId),
@@ -2973,6 +2987,7 @@ async function readHandoffObservation(discovery, expectedConversationId) {
     if (!rendered || typeof rendered.readable !== "boolean" || !Array.isArray(rendered.units)) {
       throw new Error("handoff watch rendered units are invalid");
     }
+    const identity = rendered.readable ? rendered.conversationId : null;
     return {
       identity,
       units: rendered.units,
@@ -3096,7 +3111,7 @@ async function openHandoffApprovalConversation(discovery, manifest) {
     const activeSnapshot = activeIdentity === manifest.conversationId ?
       await evaluateAtStage(
         activeMainSession,
-        buildConversationSnapshotExpression(manifest.marker, "main-chat"),
+        buildConversationSnapshotExpression(manifest.marker, manifest.conversationId, "main-chat"),
         "handoff-approve-active-main-marker",
       ) : null;
     if (activeSnapshot?.markerPresent) {

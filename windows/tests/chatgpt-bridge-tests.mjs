@@ -13,6 +13,7 @@ import {
   buildBlobImageDataExpression,
   buildBlobImageChunkExpression,
   buildConversationSnapshotExpression,
+  buildMainChatSubmissionLeaseExpression,
   buildHistoryDeleteStartExpression,
   buildHistoryTitleListExpression,
   buildHistoryTitleExpression,
@@ -236,6 +237,13 @@ function createExactDialog(conversationId, composer, send, extraChildren = []) {
 function quickChatAppUrl(conversationId) {
   const route = `/chatgpt/quick-chat/${conversationId}`;
   return `app://-/index.html?initialRoute=${encodeURIComponent(route)}`;
+}
+
+function createConversationUnit(role, text, key = `${role}-unit`) {
+  return createDomElement("div", {
+    attributes: { "data-content-search-unit-key": `${key}:${role}` },
+    text,
+  });
 }
 
 test("annotates bridge evaluation failures with the exact recovery stage", () => {
@@ -1632,7 +1640,11 @@ test("production batch uses a precomputed route plan, persistent health, and the
 
 test("embedded Quick chat uses its visible DOM conversation identity and snapshot root", () => {
   const identity = buildMainChatConversationIdExpression();
-  const snapshot = buildConversationSnapshotExpression("CODEX-BRIDGE-test-job", "main-chat");
+  const snapshot = buildConversationSnapshotExpression(
+    "CODEX-BRIDGE-test-job",
+    EXACT_CHATGPT_ID,
+    "main-chat",
+  );
   assert.match(identity, /data-above-composer-conversation-id/);
   assert.match(identity, /local-chatgpt/);
   assert.match(identity, /data-app-action-sidebar-thread-id/);
@@ -1826,7 +1838,8 @@ test("handoff checkpoint prevents duplicate delivery and task rebinding", () => 
 });
 
 test("handoff DOM collection is read-only and scoped to rendered conversation units", () => {
-  const expression = buildHandoffUnitsExpression();
+  assert.throws(() => buildHandoffUnitsExpression(), /identity/i);
+  const expression = buildHandoffUnitsExpression(EXACT_CHATGPT_ID);
   const nativeExpression = buildHandoffUnitsExpression(
     "local-chatgpt:4c172155-0408-4417-b253-145d3e80a9d1",
   );
@@ -2165,8 +2178,20 @@ test("probe expression is read-only and does not inspect credentials or chat his
 });
 
 test("snapshot expression scopes collection to rendered conversation units", () => {
-  const expression = buildConversationSnapshotExpression("BRIDGE-MARKER-A");
-  const mainExpression = buildConversationSnapshotExpression("BRIDGE-MARKER-A", "main-chat");
+  assert.throws(
+    () => buildConversationSnapshotExpression("BRIDGE-MARKER-A"),
+    /identity/i,
+  );
+  const expression = buildConversationSnapshotExpression(
+    "BRIDGE-MARKER-A",
+    EXACT_CHATGPT_ID,
+    "quick-chat",
+  );
+  const mainExpression = buildConversationSnapshotExpression(
+    "BRIDGE-MARKER-A",
+    EXACT_CHATGPT_ID,
+    "main-chat",
+  );
   assert.match(expression, /data-content-search-unit-key/);
   assert.match(expression, /BRIDGE-MARKER-A/);
   assert.match(expression, /assistant/);
@@ -2176,6 +2201,125 @@ test("snapshot expression scopes collection to rendered conversation units", () 
   assert.doesNotMatch(expression, /fetch\(|XMLHttpRequest|querySelectorAll\(['"]p/i);
   assert.match(mainExpression, /role="dialog"/);
   assert.match(mainExpression, /root\.querySelectorAll/);
+});
+
+test("snapshot reads only the exact ChatGPT owner and rejects zero or multiple roots", () => {
+  const marker = "CODEX-BRIDGE-exact-snapshot";
+  const codexRoot = createDomElement("div", {
+    attributes: { role: "dialog" },
+    children: [
+      createConversationUnit("user", marker, "codex"),
+      createConversationUnit("assistant", "wrong root", "codex"),
+      createComposer(),
+      createSendButton(),
+    ],
+  });
+  const chatRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [
+      createConversationUnit("user", marker, "chat"),
+      createConversationUnit("assistant", "exact answer", "chat"),
+    ],
+  );
+  const exactHarness = createDomHarness([codexRoot, chatRoot]);
+  const exact = exactHarness.evaluate(buildConversationSnapshotExpression(
+    marker,
+    EXACT_CHATGPT_ID,
+    "main-chat",
+  ));
+  assert.equal(exact.readable, true);
+  assert.equal(exact.markerPresent, true);
+  assert.equal(exact.assistantText, "exact answer");
+  assert.equal(exact.userMessageCount, 1);
+
+  const wrongOnly = createExactDialog(
+    "local-chatgpt:33333333-3333-4333-8333-333333333333",
+    createComposer(),
+    createSendButton(),
+    [createConversationUnit("user", marker, "wrong")],
+  );
+  const wrongResult = createDomHarness([wrongOnly]).evaluate(buildConversationSnapshotExpression(
+    marker,
+    EXACT_CHATGPT_ID,
+    "main-chat",
+  ));
+  assert.equal(wrongResult.readable, false);
+
+  const duplicateResult = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, createComposer(), createSendButton()),
+    createExactDialog(EXACT_CHATGPT_ID, createComposer(), createSendButton()),
+  ]).evaluate(buildConversationSnapshotExpression(
+    marker,
+    EXACT_CHATGPT_ID,
+    "main-chat",
+  ));
+  assert.equal(duplicateResult.readable, false);
+});
+
+test("quick-chat snapshot rejects a stale current app route before reading units", () => {
+  const root = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [createConversationUnit("user", "CODEX-BRIDGE-route", "quick")],
+  );
+  const result = createDomHarness([root], {
+    href: quickChatAppUrl("local-chatgpt:44444444-4444-4444-8444-444444444444"),
+  }).evaluate(buildConversationSnapshotExpression(
+    "CODEX-BRIDGE-route",
+    EXACT_CHATGPT_ID,
+    "quick-chat",
+  ));
+  assert.equal(result.readable, false);
+  assert.equal(result.markerPresent, false);
+});
+
+test("main submission lease uses one exact owner for identity and snapshot", () => {
+  const marker = "CODEX-BRIDGE-lease-marker";
+  const codexRoot = createDomElement("div", {
+    attributes: { role: "dialog" },
+    children: [createComposer(), createSendButton()],
+  });
+  const chatRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [createConversationUnit("user", marker, "lease")],
+  );
+  const result = createDomHarness([codexRoot, chatRoot]).evaluate(
+    buildMainChatSubmissionLeaseExpression(EXACT_CHATGPT_ID, marker),
+  );
+  assert.equal(result.conversationId, EXACT_CHATGPT_ID);
+  assert.equal(result.snapshot.readable, true);
+  assert.equal(result.snapshot.markerPresent, true);
+  const expression = buildMainChatSubmissionLeaseExpression(EXACT_CHATGPT_ID, marker);
+  assert.equal((expression.match(/const resolved = resolveExactOwner\(false\)/g) || []).length, 1);
+});
+
+test("handoff units require the exact owner and ignore another dialog", () => {
+  const codexRoot = createDomElement("div", {
+    attributes: { role: "dialog" },
+    children: [createConversationUnit("user", "CODEX_APPROVE wrong-task", "codex")],
+  });
+  const chatRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [createConversationUnit("user", "CODEX_APPROVE exact-task", "chat")],
+  );
+  const result = createDomHarness([codexRoot, chatRoot]).evaluate(
+    buildHandoffUnitsExpression(EXACT_CHATGPT_ID),
+  );
+  assert.equal(result.readable, true);
+  assert.equal(result.units.length, 1);
+  assert.match(result.units[0].text, /exact-task/);
+
+  const wrong = createDomHarness([codexRoot]).evaluate(
+    buildHandoffUnitsExpression(EXACT_CHATGPT_ID),
+  );
+  assert.equal(wrong.readable, false);
 });
 
 test("materializes only app-local rendered blob images", () => {
