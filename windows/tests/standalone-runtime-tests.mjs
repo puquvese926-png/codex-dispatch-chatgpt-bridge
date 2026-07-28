@@ -882,7 +882,15 @@ test("standalone bootstrap owns Codex CDP state without theme or Dream Skin depe
     /Invoke-CimMethod[\s\S]*Win32_Process[\s\S]*Create/,
     "restart must be created by the Windows process service so it survives Codex shutdown",
   );
+  assert.match(
+    source,
+    /SystemRoot.*WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe/i,
+    "restart must use an absolute Windows PowerShell 5.1 path",
+  );
   assert.match(source, /restart-dispatched/);
+  assert.match(source, /worker-ready/);
+  assert.match(source, /dispatchDeadline/);
+  assert.match(source, /ackPath/);
   assert.match(source, /restart-report\.json/);
 
   const result = spawnSync("powershell.exe", [
@@ -897,8 +905,11 @@ test("standalone bootstrap owns Codex CDP state without theme or Dream Skin depe
   const desktopResult = JSON.parse(result.stdout);
   assert.equal(desktopResult.pass, true);
   assert.equal(desktopResult.hostEdition, "Desktop");
-  assert.equal(desktopResult.restartStrategy, "cim-detached-worker");
+  assert.equal(desktopResult.restartStrategy, "cim-ready-ack-worker");
   assert.equal(desktopResult.durableRestartReport, true);
+  assert.equal(desktopResult.readyAckRequired, true);
+  assert.equal(desktopResult.hotEndpointReuse, true);
+  assert.equal(desktopResult.realRestartRequiresAuthorization, true);
 
   const coreResult = spawnSync("pwsh.exe", [
     "-NoProfile",
@@ -1015,6 +1026,172 @@ test("detached batch, resume and watch each receive a durable launch handle with
     }
   } finally {
     for (const pid of childPids) stopProcess(pid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+function runRestartProtocolSelfTest(scenario, protocolRoot) {
+  return runPowerShell(startScript, [
+    "-ProtocolSelfTest",
+    "-ProtocolTestRoot",
+    protocolRoot,
+    "-ProtocolTestScenario",
+    scenario,
+  ], { CODEX_BRIDGE_P07_TEST_MODE: "1" });
+}
+
+test("P0.7 ready-ack restart protocol completes without destructive action", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-p07-ready-ack-"));
+  const protocolRoot = path.join(temporaryRoot, "桥接 & protocol %");
+  try {
+    const result = runRestartProtocolSelfTest("success", protocolRoot);
+    assertPowerShellSuccess(result);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.pass, true, result.stdout + result.stderr);
+    assert.equal(payload.scenario, "success");
+    assert.equal(payload.readyAckRequired, true);
+    assert.equal(payload.destructiveMarkerExists, false);
+    assert.deepEqual(payload.history.map((entry) => entry.status), [
+      "dispatching",
+      "worker-created",
+      "worker-ready",
+      "restart-dispatched",
+      "complete",
+    ]);
+    assert.equal(payload.report.ready, true);
+    assert.equal(payload.report.acknowledged, true);
+    assert.equal(payload.report.retryAllowed, false);
+    assert.match(payload.reportPath, /桥接/u);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("P0.7 restart protocol fails closed for no-ack, expired, malformed and rebound requests", () => {
+  for (const scenario of ["no-ack", "expired", "malformed", "rebound"]) {
+    const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), `codex-bridge-p07-${scenario}-`));
+    const protocolRoot = path.join(temporaryRoot, "桥接 & protocol %");
+    try {
+      const result = runRestartProtocolSelfTest(scenario, protocolRoot);
+      assertPowerShellSuccess(result);
+      const payload = JSON.parse(result.stdout);
+      assert.equal(payload.pass, true, `${scenario}: ${result.stdout}${result.stderr}`);
+      assert.equal(payload.scenario, scenario);
+      assert.equal(payload.destructiveMarkerExists, false, scenario);
+      assert.equal(payload.readyAckRequired, true, scenario);
+      assert.equal(payload.report.status, "failed", scenario);
+      assert.equal(payload.report.acknowledged, false, scenario);
+      assert.equal(payload.report.retryAllowed, false, scenario);
+      assert.equal(payload.report.recoveryRequired, true, scenario);
+      assert.notEqual(payload.report.errorClass, null, scenario);
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("P0.7 formal PowerShell worker reads UTF-8 request and requires exact ack", async () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-p07-formal-worker-"));
+  let child = null;
+  try {
+    const protocolRoot = path.join(temporaryRoot, "桥接 & protocol %");
+    mkdirSync(protocolRoot, { recursive: true });
+    const operationId = crypto.randomUUID().replaceAll("-", "");
+    const requestPath = path.join(protocolRoot, `restart-request-${operationId}.json`);
+    const reportPath = path.join(protocolRoot, "restart-report.json");
+    const readyPath = path.join(protocolRoot, `restart-ready-${operationId}.json`);
+    const ackPath = path.join(protocolRoot, `restart-ack-${operationId}.json`);
+    const statePath = path.join(protocolRoot, "state-custom.json");
+    const requestedAt = new Date().toISOString();
+    const dispatchDeadline = new Date(Date.now() + 20000).toISOString();
+    const request = {
+      schemaVersion: 2,
+      action: "restart",
+      operationId,
+      requestedAt,
+      dispatchDeadline,
+      port: 9335,
+      statePath,
+      packageFullName: "Codex.P07.ProtocolTest",
+      processIds: [424242],
+      requestPath,
+      reportPath,
+      readyPath,
+      ackPath,
+      testMode: true,
+      testScenario: "success",
+    };
+    const report = {
+      schemaVersion: 2,
+      action: "restart",
+      operationId,
+      status: "dispatching",
+      ready: false,
+      acknowledged: false,
+      requestedAt,
+      dispatchDeadline,
+      completedAt: null,
+      port: 9335,
+      statePath,
+      requestPath,
+      readyPath,
+      ackPath,
+      workerProcessId: null,
+      history: [],
+      errorClass: null,
+      error: null,
+      retryAllowed: false,
+      recoveryRequired: false,
+    };
+    writeFileSync(requestPath, `${JSON.stringify(request)}\n`, "utf8");
+    writeFileSync(reportPath, `${JSON.stringify(report)}\n`, "utf8");
+    child = spawn("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      startScript,
+      "-RestartWorker",
+      "-RestartRequestPath",
+      requestPath,
+      "-RestartReportPath",
+      reportPath,
+    ], { env: { ...process.env, CODEX_BRIDGE_P07_TEST_MODE: "1" } });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const exitPromise = new Promise((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", (status) => resolve(status));
+    });
+    let ready = null;
+    const readyDeadline = Date.now() + 10000;
+    while (!ready && Date.now() < readyDeadline) {
+      if (existsSync(readyPath)) ready = JSON.parse(readFileSync(readyPath, "utf8"));
+      if (!ready) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(ready, `${stdout}${stderr}`);
+    assert.equal(ready.operationId, operationId);
+    assert.equal(ready.reportPath, reportPath);
+    writeFileSync(ackPath, `${JSON.stringify({
+      schemaVersion: 2,
+      action: "restart",
+      status: "ack",
+      operationId,
+      ackedAt: new Date().toISOString(),
+      parentProcessId: process.pid,
+      workerProcessId: ready.workerProcessId,
+      reportPath,
+      dispatchDeadline,
+    })}\n`, "utf8");
+    assert.equal(await exitPromise, 0, `${stdout}${stderr}`);
+    const completed = JSON.parse(readFileSync(reportPath, "utf8"));
+    assert.equal(completed.status, "complete");
+    assert.equal(completed.acknowledged, true);
+    assert.deepEqual(completed.history.map((entry) => entry.status), ["worker-ready", "complete"]);
+  } finally {
+    if (child && child.exitCode === null) child.kill();
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
 });

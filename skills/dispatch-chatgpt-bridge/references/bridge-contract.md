@@ -268,6 +268,31 @@ PID. This is not a pre-start failure and is never an automatic retry permission.
 Only a proven final-process creation failure may become a durable
 `failed`/`not-created` launch.
 
+The Codex bootstrap restart handoff has a separate durable ready/ack contract.
+The request is schema version 2 and binds `operationId`, `requestPath`,
+`reportPath`, `readyPath`, `ackPath`, `statePath`, `packageFullName`,
+`processIds`, `port`, `requestedAt` and `dispatchDeadline` to one non-reparse
+state directory. The worker reads the request as strict UTF-8, rejects unknown
+fields, wrong JSON types, expired deadlines, package identity changes and path
+rebinding, then atomically writes `worker-ready` with its actual PID. The parent
+must observe that exact ready record and write one matching `ack` before the
+worker may write `stopping-existing` or call `Stop-Process`. The worker repeats
+the ack, identity and deadline check immediately before that boundary.
+
+Restart reports preserve the ordered states `dispatching` → `worker-created` →
+`worker-ready` → `restart-dispatched` → `stopping-existing` → `starting` →
+`complete` (with `failed` on any closed failure). `created-but-unattributed`,
+missing ready, missing/invalid ack, expired request and any path mismatch are
+not a success and never imply retry permission: the report must say
+`retryAllowed: false` and `recoveryRequired: true` unless the process service
+definitively returned `not-created`. `allowSend`/restart authorization remains
+the caller's parameter fact, not cryptographic proof of the user's identity.
+The production handoff invokes the absolute Windows PowerShell 5.1 executable,
+not a PATH lookup. `discover`/`probe` can diagnose a missing endpoint, but the
+bootstrap must not promise that a running Electron instance can hot-enable CDP;
+real restart still requires explicit authorization. The protocol self-test is a
+test-only gated harmless worker and never stops or closes Codex.
+
 The launch handle is the supported semi-automatic wait interface:
 `plan -> explicit authorization -> detach -> status/wait -> report or one
 read-only recovery decision`. It is not a persistent daemon, automatic reply

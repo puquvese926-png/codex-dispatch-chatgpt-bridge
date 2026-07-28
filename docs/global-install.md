@@ -71,9 +71,13 @@ git pull
 如果 Codex 已经以受验证的 loopback CDP 参数运行，脚本会复用它并写入
 `%LOCALAPPDATA%\CodexChatGPTBridge\state.json`。如果 Codex 正在运行但没有
 该端点，脚本会停止并要求明确使用 `-RestartExisting`，不会擅自关闭当前 Codex。
-获得授权后，启动器会先写入持久化重启记录，再通过 Windows 进程服务创建一个
-不依赖当前 Codex 进程树的隐藏 worker。worker 负责关闭已验证的旧 Codex PID、
-重新启动官方 Store 包、等待 loopback CDP 就绪并原子写入状态文件。
+获得授权后，启动器会先写入持久化重启记录，再用绝对路径的 Windows PowerShell
+5.1 通过 Windows 进程服务创建一个不依赖当前 Codex 进程树的 detached worker。
+worker 必须先写出 `worker-ready`，父进程校验 operationId、PID、路径和 deadline
+后才写入一次性 ack；worker 再次校验 ack 后才允许进入 `stopping-existing`。
+因此没有 ready、没有 ack、请求过期、JSON 损坏或路径身份变化时，旧 Codex 不会被关闭。
+通过后 worker 才会关闭已验证的旧 Codex PID、重新启动官方 Store 包、等待 loopback
+CDP 就绪并原子写入状态文件。
 从 PowerShell 7 调用时，启动器会把 Windows `Appx` 检查自动转交给
 Windows PowerShell 5.1，并保留相同参数和退出状态。
 
@@ -84,9 +88,12 @@ Windows PowerShell 5.1，并保留相同参数和退出状态。
 Get-Content -Raw "$env:LOCALAPPDATA\CodexChatGPTBridge\restart-report.json"
 ```
 
-只有报告为 `"status": "complete"` 且 `"ready": true` 时才算重启成功。
-`dispatching`、`restart-dispatched`、`stopping-existing` 和 `starting` 表示仍在
-进行；`failed` 会保留具体错误。成功后再顺序运行 `discover` 和 `probe`。
+只有报告为 `"status": "complete"`、`"ready": true` 且 `"acknowledged": true`
+时才算重启成功。`dispatching`、`worker-created`、`worker-ready`、
+`restart-dispatched`、`stopping-existing` 和 `starting` 表示仍在进行；
+`failed` 会保留具体 `errorClass`。`created-but-unattributed` 或其他非
+`worker-not-created` 失败都带 `retryAllowed: false`，应保留报告并人工决定下一步，
+不能因为调用端退出或超时就自动重试。成功后再顺序运行 `discover` 和 `probe`。
 
 初始化后直接执行：
 

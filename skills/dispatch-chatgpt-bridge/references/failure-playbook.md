@@ -68,6 +68,37 @@ Never infer submission from a visible window. Never infer non-submission after a
 | Two callers use different report paths and both start controlling the retained main ChatGPT surface | The old duplicate guard was scoped to `<report>.progress.json`, so changing the output path bypassed it even though both processes controlled the same singleton UI. One process could switch the drawer while the other was submitting or collecting. | Stop the second controller before any UI mutation. Do not work around the rejection with a new report path. Inspect the live owner's report/progress; reclaim only if its PID is proven dead. | Acquire one atomic controller lock beside the standalone bridge state for `batch`, `resume`, `approve`, and `cleanup`. The lock is independent of report paths, fails closed on malformed state, removes only a proven dead owner, and releases only by matching owner token. Regression: different-report lock contention and dead-owner recovery integration test. |
 | 用户说“子代理”却被要求二选一，或被误路由成临时 worker；也可能把可见 `<codex_delegation>` 卡片当成发送 API | 术语已经固定：子代理是固定长期 Codex 对话/流程，应直接走 `codex-conversation`；子智能体才是临时并行 worker，走 `codex-subagent`。卡片和 `source_thread_id` 仍只是系统生成的追踪元数据，不是用户协议。 | 发送前直接选择 `codex-conversation` 并固定精确 `threadId`/`hostId`；不要投给最新或可见任务，不要手写、抓取或仿造 delegation 元数据。若用户同时提出冲突的临时与长期要求，才暂停澄清。 | 在 Skill、native contract、用户指南中维护固定术语映射；回归测试 `native-codex-bridge-skill-tests.mjs` 验证“子智能体→`codex-subagent`、子代理→`codex-conversation`”及不再要求二选一。 |
 
+## Codex restart dispatch stops before ready/ack
+
+If `start-chatgpt-bridge.ps1 -RestartExisting` reports `worker-created` but never
+reaches `worker-ready` or `restart-dispatched`, the Windows process service may
+have returned a PID without proving that the target worker actually began. This
+is an ambiguous restart handoff, not permission to run the command again. The
+same rule applies to a malformed or rebound request, an expired deadline, a
+missing acknowledgement, or a worker whose final identity no longer matches the
+request. The worker must never close Codex before the exact operation ack and
+last deadline check.
+
+Read the durable `%LOCALAPPDATA%\CodexChatGPTBridge\restart-report.json` and
+preserve the request/ready/ack files. `dispatching`, `worker-created`,
+`worker-ready`, `restart-dispatched`, `stopping-existing`, `starting`, `complete`
+and `failed` are durable protocol states. Only `failed` with the explicit
+`errorClass: worker-not-created` is retryable; every created-but-unattributed or
+post-create failure has `retryAllowed: false` and `recoveryRequired: true`.
+Do not manually close/open Codex, do not start a second restart, and do not
+interpret the caller's interrupted window as proof of success. Once the user
+decides to authorize a new attempt, run it as a new operation after the old
+report is understood.
+
+The prevention is a strict schema-v2 UTF-8 request, absolute Windows PowerShell
+5.1 executable, bounded ready wait, exact PID/operation/path/deadline checks,
+atomic ack, and a second worker-side check immediately before
+`stopping-existing`. Regression coverage includes a real CIM-launched harmless
+protocol worker, formal UTF-8 PowerShell worker, no-ack/expired/malformed/rebound
+cases and a destructive-marker assertion. This is distinct from the image-job
+`unknown-after-submit` failure: neither class is an automatic resend/restart
+permission.
+
 ## Retry gate
 
 Before any retry, answer all of these in the report or task notes:

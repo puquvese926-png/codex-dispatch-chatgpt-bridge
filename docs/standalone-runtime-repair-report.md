@@ -56,6 +56,11 @@ Git 仓库
 9. 将 `-RestartExisting` 改为持久化 detached restart handoff：先写重启请求与
    `restart-report.json`，再由 Windows 进程服务创建独立 worker，避免当前 Codex
    被关闭时把负责重启的 PowerShell 子进程一并中断。
+10. 增加 ready→ack 协议：worker 先以无 BOM UTF-8 写出 `worker-ready`，父进程
+    严格核验 operationId、最终 PID、受控状态目录和 deadline 后写入一次性 ack；
+    worker 在真正 `stopping-existing` 前再次核验。无 ack、过期、损坏或路径重绑定
+    只会留下 `failed`/恢复提示，不会关闭 Codex。CIM 创建成功但未能归属时不宣布
+    成功，也不授权自动重试；PowerShell 入口使用绝对 Windows PowerShell 5.1 路径。
 
 ## 验证
 
@@ -71,6 +76,10 @@ Git 仓库
 
 真实只读验收使用 Codex `26.715.10079.0`，独立状态记录端口 `9345`。验收过程
 没有发送 GPT 消息、没有创建生成任务、没有关闭对话，也没有重启 Codex。
+
+重启能力边界：已验证 loopback CDP 端点时优先热复用；运行中的 Electron 若没有
+该端点，不承诺可以热开启调试口，只能在用户明确授权后走 ready/ack 重启。协议自测
+使用临时目录和无破坏 worker，不代表已对真实 Codex 做过重启验收。
 
 ## 使用
 

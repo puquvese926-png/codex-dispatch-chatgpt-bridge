@@ -129,3 +129,10 @@ resume”。这不是永久 daemon、自动回帖、密码学批准证明，也�
 全局 skills 目录和 Skill 的描述匹配。
 若 detached 最终 Node 进程已创建但无法按唯一 launch UUID 归属，状态是
 `unknown-after-launch`，不是“没启动”；必须保留原 launch，禁止自动重试。
+
+启动 Codex 时同样优先热复用已验证的 loopback CDP。没有端点时，只有在用户明确
+授权 `-RestartExisting` 后才进入 ready→ack 重启协议：`worker-ready`、精确 ack 和
+最后一次 deadline/身份复核全部通过前，旧 Codex 不会被关闭。重启报告是持久事实源；
+`worker-created` 后未 ready、无 ack、过期或路径异常都属于失败关闭，不能自动重试。
+运行中的 Electron 是否能后来热开启 CDP 不作承诺；协议自测只启动无破坏测试 worker，
+不代表真实重启已执行。

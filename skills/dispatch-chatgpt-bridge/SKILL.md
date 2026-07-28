@@ -69,11 +69,24 @@ The first standalone setup runs
 `windows/scripts/start-chatgpt-bridge.ps1`. It may reuse an already verified
 loopback Codex endpoint without restarting. If Codex is running without that
 endpoint, restarting it requires explicit user authorization through
-`-RestartExisting`. An authorized restart is handed to a Windows-service-created
-detached worker before Codex is closed. Treat the durable
+`-RestartExisting`. The launcher writes a durable restart request and uses an
+absolute Windows PowerShell 5.1 path for the Windows-process-service handoff.
+The detached process must first publish a strictly validated
+`worker-ready` record; the parent then writes an exact-operation `ack` before
+the worker may enter `stopping-existing`. No ack, expired deadline, malformed
+request, or path-identity mismatch can close Codex. Treat the durable
 `%LOCALAPPDATA%\CodexChatGPTBridge\restart-report.json` as authoritative because
-the calling command can disappear with the old Codex window. Do not ask the user
-to reopen Codex manually while the report is still in a running state.
+the calling command can disappear with the old Codex window. Its states include
+`dispatching`, `worker-created`, `worker-ready`, `restart-dispatched`,
+`stopping-existing`, `starting`, `complete` and `failed`. Do not ask the user to
+reopen Codex manually while the report is still in a running state.
+
+This restart path is a recovery action, not the normal hot-start path. A healthy
+verified loopback endpoint is reused without restarting. If the running Codex
+instance has no endpoint, the Electron process cannot be promised to expose one
+later through a hot switch; use the explicitly authorized ready/ack restart and
+inspect its report. The protocol self-test is test-only and never stops a real
+Codex process.
 
 Before any operational action, the installed Skill and selected Runtime must
 pass the deployment-manifest gate. The two canonical manifests must match in
