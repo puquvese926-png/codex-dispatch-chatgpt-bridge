@@ -186,6 +186,8 @@ Any selector, identity or hash uncertainty fails closed. Failed deletion remains
 | --- | ---: | ---: | --- |
 | `discover` | No | No | none |
 | `probe` | No | No | none |
+| `status` | No | No | runner-only read-only launch inspection; no Node/CDP |
+| `wait` | No | No | runner-only bounded read-only launch polling; no Node/CDP |
 | `plan` | No | No | none; requires the intended batch manifest |
 | `batch` | Yes | Creates new chats | `-AllowSend` |
 | `resume` | No | No | `-AllowSend` forbidden |
@@ -223,12 +225,43 @@ artifact is required.
 
 Plan reports and final batch reports preserve the full `dispatchPlan`. Final
 batch reports also preserve `runState: "complete"`, the effective `timeoutMs`,
-and `progressPath`. During execution, the sidecar at `progressPath` records
-`state: "running"`, `currentJobId`, the dispatch plan, submitted/completed
-counts, per-job identity, `submittedAt`, status, routing and artifact counts. It
-is the durable status source when an outer shell returns before the bridge child
-finishes. `-Detach` intentionally starts that child hidden and returns the
-report, progress and log paths without waiting.
+and `progressPath` when the command actually implements a progress sidecar.
+During batch execution, that sidecar records `state: "running"`, `currentJobId`,
+the dispatch plan, submitted/completed counts, per-job identity, `submittedAt`,
+status, routing and artifact counts. `resume` and `watch` do not write a fake
+progress sidecar; their detached records have `progressPath: null`.
+
+`-Detach` creates a durable launch record before starting the child and returns
+`launchId`, `launchPath`, `reportPath`, `progressPath`, `stdoutPath`,
+`stderrPath`, PID/start-time identity and the recorded authorization facts.
+`launchId` is also injected as a validated, ignored bridge launch token into the
+final Node command line. Process attribution matches that token, never merely a
+report path; two callers sharing an output path cannot adopt each other's PID.
+The record may retain the exact cmd wrapper PID only as a diagnostic; the
+monitored PID is always the final Node process. Logs live inside the random
+launch directory, not beside the business output.
+The launch record is atomically rewritten from `starting` to `running` (or a
+durable `failed` record if start fails). `status` reads only a bounded,
+strictly validated launch record; `wait` performs the same inspection in a
+bounded loop. Neither starts Node, contacts CDP, mutates a report, resumes a
+job, resends content or deletes anything. A valid report is terminal; a
+corrupt/oversized report or progress file is surfaced as `report-corrupt` or
+`progress-corrupt`, never silently treated as absent. PID reuse is rejected by
+matching the recorded process start time.
+
+If Windows creates the detached worker but the final Node process cannot be
+attributed, the record remains `state: "starting"` with
+`errorClass: "created-but-unattributed"`, the wrapper PID and
+`unknown-after-launch` status. This is not a pre-start failure and is never an
+automatic retry permission. Only a proven worker-creation failure may become a
+durable `failed`/`not-created` launch.
+
+The launch handle is the supported semi-automatic wait interface:
+`plan -> explicit authorization -> detach -> status/wait -> report or one
+read-only recovery decision`. It is not a persistent daemon, automatic reply
+service, password-cryptographic proof of user approval, or a way to avoid Codex
+quota. The two-directory install remains transactional-with-rollback rather
+than truly cross-directory atomic.
 
 Every `batch`, `resume`, `approve`, and `cleanup` obtains one atomic controller
 lock beside the standalone bridge state. The lock is shared across all report

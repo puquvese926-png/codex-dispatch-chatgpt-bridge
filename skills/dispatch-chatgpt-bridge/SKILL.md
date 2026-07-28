@@ -110,9 +110,18 @@ installed content.
    two owned windows; an unhealthy cache routes directly to the serial main
    surface without making the first real job rediscover the same failure.
 7. Invoke `batch` once with `-AllowSend`. Long-running generation should use
-   `-Detach`; it returns a launch record immediately and writes progress to
-   `<report>.progress.json` while the child continues.
-8. Read the report or its progress sidecar before taking another action. Never infer success from a visible window alone or from a parent-process timeout. A running sidecar is not permission to start a second batch.
+   `-Detach`; it returns a durable `launchPath` immediately. `progressPath` is
+   populated only for batch, because resume/watch do not write a progress
+   sidecar. The detached logs are inside the launch directory.
+8. Use runner-only `status -LaunchPath <launch.json>` or bounded `wait
+   -LaunchPath <launch.json>` to inspect that handle. These actions are
+   read-only and do not require a valid deployment manifest, start Node, touch
+   CDP, resend, resume or delete. A corrupt report/progress file is reported
+   explicitly; it is not treated as no report. Never infer success from a
+   visible window alone or from a parent-process timeout. If Windows created a
+   detached worker but the final Node PID could not be uniquely attributed,
+   status reports `unknown-after-launch`; preserve that launch and do not retry
+   automatically.
 
 For image generation or editing, use schema v2. One job must equal one candidate and one newly created GPT chat. Every v2 job includes a `references` array. For original `image-generation`, use `references: []`; reference-guided generation may include 1–8 user-approved local PNG/JPEG/WebP files. `image-edit` requires 1–8 references. The bridge verifies every supplied path, type, size and SHA-256 before opening a chat, and skips the attachment UI only for an empty original-generation list. Set `conversationMode` to `fresh-per-job`, record a lifecycle ledger, and keep the default retention at seven days. Do not continue an edit or iteration inside the previous generation chat.
 
@@ -188,6 +197,15 @@ Fresh main-surface preparation must recognize the `新聊天` / `New chat` contr
 Image generation uses a ten-minute default collection window (`-TimeoutMs 600000`) because server-side image rendering can outlast a short text-task timeout. The caller may set another bounded value up to fifteen minutes. A timeout remains `timeout-after-submit`: content may already have been sent, the conversation is sealed, and the bridge never resends it.
 
 Every mutating batch writes a durable progress sidecar beside the requested report as `<report>.progress.json`. It is updated before submission, immediately after submission, after each collection result, and at finalization. It contains only task identity, status, timestamps, routing and artifact metadata; it never contains the prompt body or credentials. If an outer shell times out while the bridge child continues, read this sidecar and do not start another batch. Use `-Detach` when the caller cannot keep a synchronous parent process alive.
+
+Detached `batch`, `resume` and `watch` each return a durable launch handle. Only
+`batch` has a `progressPath`; `resume` and `watch` deliberately return
+`progressPath: null`. The runner-only `status` and `wait` actions read the
+launch record, report and (for batch) progress summary with bounded limits.
+When a report/progress file is present but malformed or oversized, status
+returns an explicit corrupt reason. For an ambiguous batch result it exposes
+`recoveryRequired`, `conversationId`, `marker` and any captured `historyTitle`;
+it never constructs or executes a resend.
 
 The bridge holds one atomic controller lock under the standalone state directory
 for every `batch`, `resume`, `approve` or `cleanup`. It rejects a second

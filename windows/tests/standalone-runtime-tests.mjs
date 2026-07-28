@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -25,6 +25,13 @@ const runnerScript = path.join(
   "dispatch-chatgpt-bridge",
   "scripts",
   "run-bridge.ps1",
+);
+const launchControlScript = path.join(
+  repositoryRoot,
+  "skills",
+  "dispatch-chatgpt-bridge",
+  "scripts",
+  "launch-control.ps1",
 );
 const installScript = path.join(repositoryRoot, "scripts", "install-global.ps1");
 const verifyScript = path.join(repositoryRoot, "scripts", "verify-global-install.ps1");
@@ -49,8 +56,93 @@ function runPowerShell(script, args = [], env = {}) {
   });
 }
 
+function runPowerShellAsync(script, args = [], env = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      script,
+      ...args,
+    ], {
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
 function assertPowerShellSuccess(result) {
   assert.equal(result.status, 0, result.stderr || result.stdout);
+}
+
+function stopProcess(pid) {
+  if (!pid) return;
+  spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-Command",
+    "Stop-Process -Id " + String(pid) + " -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 250",
+  ], { encoding: "utf8" });
+}
+
+function getProcessStartTime(pid) {
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-Command",
+    "(Get-Process -Id " + String(pid) + ").StartTime.ToUniversalTime().ToString('o')",
+  ], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return result.stdout.trim();
+}
+
+function getProcessIdsByCommandToken(token) {
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-Command",
+    "$token = '" + token + "'; @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($token, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | Select-Object -ExpandProperty ProcessId)",
+  ], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return result.stdout.split(/\r?\n/).map((value) => Number(value.trim())).filter((value) => Number.isInteger(value) && value > 0);
+}
+
+function writeRunningLaunchFixture(root, command = "batch") {
+  const launchRoot = path.join(root, "launches");
+  const launchId = crypto.randomUUID();
+  const launchDirectory = path.join(launchRoot, launchId);
+  const launchPath = path.join(launchDirectory, "launch.json");
+  const reportPath = path.join(root, "report.json");
+  const inputPath = path.join(root, "input.json");
+  mkdirSync(launchDirectory, { recursive: true });
+  writeFileSync(inputPath, "{}\n", "utf8");
+  const record = {
+    schemaVersion: 1,
+    launchId,
+    command,
+    state: "running",
+    pid: process.pid,
+    processStartedAt: getProcessStartTime(process.pid),
+    launchPath,
+    reportPath,
+    progressPath: command === "batch" ? reportPath + ".progress.json" : null,
+    stdoutPath: path.join(launchDirectory, "stdout.log"),
+    stderrPath: path.join(launchDirectory, "stderr.log"),
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    authorization: { allowSend: command === "batch", allowDelete: false },
+    inputPath,
+    statePath: null,
+    timeoutMs: 600000,
+    pollMs: 5000,
+    error: null,
+  };
+  writeFileSync(launchPath, JSON.stringify(record), "utf8");
+  return { launchPath, reportPath, record };
 }
 
 function canonicalize(value) {
@@ -149,14 +241,17 @@ test("repository bundles a generic bridge runtime with no Dream Skin state depen
 
 test("runner supports an explicit detached mode with a durable progress path", () => {
   const source = readFileSync(runnerScript, "utf8");
+  const launchControl = readFileSync(launchControlScript, "utf8");
   assert.match(source, /'plan'/);
   assert.match(source, /\[switch\]\$ExperimentalQuickChat/);
   assert.match(source, /\[switch\]\$Detach/);
-  assert.match(source, /Start-Process/);
-  assert.match(source, /WindowStyle Hidden/);
-  assert.match(source, /progress\.json/);
-  assert.match(source, /stdoutPath/);
-  assert.match(source, /stderrPath/);
+  assert.match(source, /launch-control\.ps1/);
+  assert.match(launchControl, /Invoke-CimMethod\s+-ClassName\s+Win32_Process\s+-MethodName\s+Create/);
+  assert.match(launchControl, /--bridge-launch-token/);
+  assert.match(launchControl, /created-but-unattributed/);
+  assert.match(launchControl, /progress\.json/);
+  assert.match(launchControl, /stdoutPath/);
+  assert.match(launchControl, /stderrPath/);
 });
 
 test("runner exposes a read-only route plan and makes Quick Chat opt-in", () => {
@@ -807,5 +902,513 @@ test("standalone bootstrap owns Codex CDP state without theme or Dream Skin depe
   if (coreResult.error?.code !== "ENOENT") {
     assert.equal(coreResult.status, 0, coreResult.stderr || coreResult.stdout);
     assert.equal(JSON.parse(coreResult.stdout).hostEdition, "Desktop");
+  }
+});
+
+function makeDetachedReportRuntime(root, delayMs = 250) {
+  const fakeScript = path.join(root, "windows", "scripts", "chatgpt-bridge.mjs");
+  writeFileSync(fakeScript, [
+    'import fs from "node:fs";',
+    "const args = process.argv.slice(2);",
+    "const command = args[0];",
+    "const outputIndex = args.indexOf('--output');",
+    "const output = outputIndex >= 0 ? args[outputIndex + 1] : null;",
+    "setTimeout(() => {",
+    "  if (output) fs.writeFileSync(output, JSON.stringify({ pass: true, command, jobs: [] }));",
+    "  process.exit(0);",
+    "}, " + String(delayMs) + ");",
+    "",
+  ].join("\n"), "utf8");
+  return fakeScript;
+}
+
+function runDetachedRunner(runner, runtime, action, inputPath, outputPath, launchRoot, extra = []) {
+  return runPowerShell(runner, [
+    "-Root", runtime,
+    "-Action", action,
+    "-InputPath", inputPath,
+    "-OutputPath", outputPath,
+    "-LaunchRoot", launchRoot,
+    "-Detach",
+    ...extra,
+  ]);
+}
+
+test("detached batch, resume and watch each receive a durable launch handle with truthful progress", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-handles-"));
+  const childPids = [];
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    const launchRoot = path.join(temporaryRoot, "launches");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    makeDetachedReportRuntime(runtime, 3000);
+    refreshDeployedRuntimeEntry(skills, runtime);
+    const inputPath = path.join(temporaryRoot, "input.json");
+    writeFileSync(inputPath, "{}\n", "utf8");
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+
+    for (const action of ["batch", "resume", "watch"]) {
+      const outputPath = path.join(temporaryRoot, action + ".report.json");
+      const result = runDetachedRunner(
+        runner,
+        runtime,
+        action,
+        inputPath,
+        outputPath,
+        launchRoot,
+        action === "batch" ? ["-AllowSend"] : [],
+      );
+      assertPowerShellSuccess(result);
+      const launch = JSON.parse(result.stdout);
+      childPids.push(launch.pid, launch.wrapperPid);
+      assert.equal(launch.pass, true, action);
+      assert.match(launch.launchId, /^[0-9a-f-]{36}$/i, action);
+      assert.equal(launch.command, action);
+      assert.equal(launch.state, "running");
+      assert.equal(path.isAbsolute(launch.launchPath), true);
+      assert.equal(path.basename(path.dirname(launch.launchPath)), launch.launchId);
+      assert.equal(path.dirname(launch.stdoutPath), path.dirname(launch.launchPath));
+      assert.equal(path.dirname(launch.stderrPath), path.dirname(launch.launchPath));
+      assert.equal(launch.reportPath, outputPath);
+      if (action === "batch") {
+        assert.equal(launch.progressPath, outputPath + ".progress.json");
+      } else {
+        assert.equal(launch.progressPath, null);
+      }
+      assert.equal(existsSync(launch.launchPath), true);
+      const persisted = JSON.parse(readFileSync(launch.launchPath, "utf8"));
+      assert.equal(persisted.launchId, launch.launchId);
+      assert.equal(persisted.launchPath, launch.launchPath);
+      assert.equal(persisted.progressPath, launch.progressPath);
+    }
+  } finally {
+    for (const pid of childPids) stopProcess(pid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("detach returns the launch handle before a long child report is written", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-nonblocking-"));
+  let childPid = null;
+  let wrapperPid = null;
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    const launchRoot = path.join(temporaryRoot, "launches");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    makeDetachedReportRuntime(runtime, 8000);
+    refreshDeployedRuntimeEntry(skills, runtime);
+    const inputPath = path.join(temporaryRoot, "input.json");
+    const outputPath = path.join(temporaryRoot, "report.json");
+    writeFileSync(inputPath, "{}\n", "utf8");
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const startedAt = Date.now();
+    const result = runDetachedRunner(runner, runtime, "batch", inputPath, outputPath, launchRoot, ["-AllowSend"]);
+    const elapsedMs = Date.now() - startedAt;
+    const launch = JSON.parse(result.stdout);
+    assert.equal(result.status, 0, result.stderr + result.stdout + "\\nworker stderr: " + (existsSync(launch.stderrPath) ? readFileSync(launch.stderrPath, "utf8") : "<missing>"));
+    childPid = launch.pid;
+    wrapperPid = launch.wrapperPid;
+    assert.ok(elapsedMs < 6000, `detach waited for child: ${elapsedMs}ms`);
+    assert.ok(getProcessIdsByCommandToken(launch.launchId).includes(launch.pid), "final Node PID is not bound to its unique launch token");
+    assert.equal(existsSync(outputPath), false);
+  } finally {
+    stopProcess(childPid);
+    stopProcess(wrapperPid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("status and wait are runner-only read-only actions and survive manifest mismatch", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-status-"));
+  let childPid = null;
+  let wrapperPid = null;
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    const launchRoot = path.join(temporaryRoot, "launches");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    makeDetachedReportRuntime(runtime, 3000);
+    refreshDeployedRuntimeEntry(skills, runtime);
+    const inputPath = path.join(temporaryRoot, "input.json");
+    const outputPath = path.join(temporaryRoot, "report.json");
+    writeFileSync(inputPath, "{}\n", "utf8");
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const launched = runDetachedRunner(runner, runtime, "batch", inputPath, outputPath, launchRoot, ["-AllowSend"]);
+    assertPowerShellSuccess(launched);
+    const launch = JSON.parse(launched.stdout);
+    childPid = launch.pid;
+    wrapperPid = launch.wrapperPid;
+    const runtimeManifest = path.join(runtime, "deployment-manifest.json");
+    writeFileSync(runtimeManifest, "{broken", "utf8");
+    const marker = path.join(temporaryRoot, "node-called.txt");
+    const fakeBin = makeFakeNode(temporaryRoot, marker);
+    const status = runPowerShell(runner, [
+      "-Action", "status", "-LaunchPath", launch.launchPath,
+    ], { PATH: fakeBin + ";" + process.env.PATH });
+    assertPowerShellSuccess(status);
+    const statusValue = JSON.parse(status.stdout);
+    assert.equal(statusValue.command, "batch");
+    assert.equal(statusValue.launchPath, launch.launchPath);
+    assert.equal(["running", "complete"].includes(statusValue.state), true);
+    assert.equal(existsSync(marker), false);
+
+    const waited = runPowerShell(runner, [
+      "-Action", "wait", "-LaunchPath", launch.launchPath, "-TimeoutMs", "5000", "-PollMs", "250",
+    ], { PATH: fakeBin + ";" + process.env.PATH });
+    assertPowerShellSuccess(waited);
+    const waitedValue = JSON.parse(waited.stdout);
+    assert.equal(waitedValue.state, "complete");
+    assert.equal(waitedValue.report.pass, true);
+    assert.equal(existsSync(marker), false);
+  } finally {
+    stopProcess(childPid);
+    stopProcess(wrapperPid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("launch validation fails closed for path rebound, corrupt and oversized handles", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-validation-"));
+  let childPid = null;
+  let wrapperPid = null;
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    const launchRoot = path.join(temporaryRoot, "launches");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    makeDetachedReportRuntime(runtime, 2000);
+    refreshDeployedRuntimeEntry(skills, runtime);
+    const inputPath = path.join(temporaryRoot, "input.json");
+    const outputPath = path.join(temporaryRoot, "report.json");
+    writeFileSync(inputPath, "{}\n", "utf8");
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const launched = runDetachedRunner(runner, runtime, "batch", inputPath, outputPath, launchRoot, ["-AllowSend"]);
+    assertPowerShellSuccess(launched);
+    const launch = JSON.parse(launched.stdout);
+    childPid = launch.pid;
+    wrapperPid = launch.wrapperPid;
+    const original = readFileSync(launch.launchPath, "utf8");
+
+    const rebound = JSON.parse(original);
+    rebound.stdoutPath = path.join(temporaryRoot, "outside.log");
+    writeFileSync(launch.launchPath, JSON.stringify(rebound), "utf8");
+    let result = runPowerShell(runner, ["-Action", "status", "-LaunchPath", launch.launchPath]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr + result.stdout, /launch|path|invalid/i);
+    assert.doesNotMatch(result.stderr + result.stdout, /outside.log content/i);
+
+    writeFileSync(launch.launchPath, "{broken", "utf8");
+    result = runPowerShell(runner, ["-Action", "status", "-LaunchPath", launch.launchPath]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr + result.stdout, /launch|json|invalid/i);
+
+    writeFileSync(launch.launchPath, "x".repeat(1024 * 1024 + 1), "utf8");
+    result = runPowerShell(runner, ["-Action", "status", "-LaunchPath", launch.launchPath]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr + result.stdout, /size|large|launch/i);
+  } finally {
+    stopProcess(childPid);
+    stopProcess(wrapperPid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("detached launch keeps legacy output log paths from overwriting input", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-log-isolation-"));
+  let childPid = null;
+  let wrapperPid = null;
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    const launchRoot = path.join(temporaryRoot, "launches");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    makeDetachedReportRuntime(runtime, 3000);
+    refreshDeployedRuntimeEntry(skills, runtime);
+    const outputPath = path.join(temporaryRoot, "report.json");
+    const inputPath = outputPath + ".stdout.log";
+    const originalInput = '{"mustRemain":"intact"}\n';
+    writeFileSync(inputPath, originalInput, "utf8");
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const launched = runDetachedRunner(runner, runtime, "batch", inputPath, outputPath, launchRoot, ["-AllowSend"]);
+    assertPowerShellSuccess(launched);
+    assert.equal(readFileSync(inputPath, "utf8"), originalInput);
+    const launch = JSON.parse(launched.stdout);
+    childPid = launch.pid;
+    wrapperPid = launch.wrapperPid;
+    assert.notEqual(launch.stdoutPath, inputPath);
+    assert.equal(path.dirname(launch.stdoutPath), path.dirname(launch.launchPath));
+  } finally {
+    stopProcess(childPid);
+    stopProcess(wrapperPid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+
+test("wait returns a bounded timeout without resume, resend or launch-record mutation", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-timeout-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    const launchRoot = path.join(temporaryRoot, "launches");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    const outputPath = path.join(temporaryRoot, "report.json");
+    const launchId = crypto.randomUUID();
+    const launchDirectory = path.join(launchRoot, launchId);
+    const launchPath = path.join(launchDirectory, "launch.json");
+    mkdirSync(launchDirectory, { recursive: true });
+    const beforeRecord = {
+      schemaVersion: 1,
+      launchId,
+      command: "batch",
+      state: "running",
+      pid: process.pid,
+      processStartedAt: getProcessStartTime(process.pid),
+      launchPath,
+      reportPath: outputPath,
+      progressPath: outputPath + ".progress.json",
+      stdoutPath: path.join(launchDirectory, "stdout.log"),
+      stderrPath: path.join(launchDirectory, "stderr.log"),
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      authorization: { allowSend: true, allowDelete: false },
+      inputPath: path.join(temporaryRoot, "input.json"),
+      statePath: null,
+      timeoutMs: 600000,
+      pollMs: 5000,
+      error: null,
+    };
+    writeFileSync(launchPath, JSON.stringify(beforeRecord), "utf8");
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const waited = runPowerShell(runner, [
+      "-Action", "wait", "-LaunchPath", launchPath, "-TimeoutMs", "5000", "-PollMs", "250",
+    ]);
+    assertPowerShellSuccess(waited);
+    const result = JSON.parse(waited.stdout);
+    assert.equal(result.state, "timeout");
+    assert.equal(result.timedOut, true);
+    assert.equal(result.observedState, "running");
+    assert.equal(readFileSync(launchPath, "utf8"), JSON.stringify(beforeRecord));
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("status rejects a reused PID start time as failed no-report", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-pid-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    const fixture = writeRunningLaunchFixture(temporaryRoot);
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const rebound = JSON.parse(readFileSync(fixture.launchPath, "utf8"));
+    rebound.processStartedAt = "2000-01-01T00:00:00.0000000+00:00";
+    writeFileSync(fixture.launchPath, JSON.stringify(rebound), "utf8");
+    const status = runPowerShell(runner, ["-Action", "status", "-LaunchPath", fixture.launchPath]);
+    assertPowerShellSuccess(status);
+    const result = JSON.parse(status.stdout);
+    assert.equal(result.state, "failed");
+    assert.equal(result.reason, "no-report");
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("status exposes corrupt report and progress instead of treating them as absent", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-corrupt-artifacts-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+
+    const reportFixture = writeRunningLaunchFixture(temporaryRoot, "resume");
+    writeFileSync(reportFixture.record.reportPath, "{not-json\n", "utf8");
+    const reportStatus = runPowerShell(runner, ["-Action", "status", "-LaunchPath", reportFixture.launchPath]);
+    assertPowerShellSuccess(reportStatus);
+    const reportResult = JSON.parse(reportStatus.stdout);
+    assert.equal(reportResult.state, "failed");
+    assert.equal(reportResult.reason, "report-corrupt");
+    assert.equal(reportResult.reportCorrupt, true);
+    assert.equal(reportResult.report.error, "report-corrupt");
+    assert.doesNotMatch(reportStatus.stdout, /not-json/);
+
+    const progressRoot = path.join(temporaryRoot, "progress-case");
+    mkdirSync(progressRoot, { recursive: true });
+    const progressFixture = writeRunningLaunchFixture(progressRoot, "batch");
+    writeFileSync(progressFixture.record.progressPath, "{not-json\n", "utf8");
+    const progressStatus = runPowerShell(runner, ["-Action", "status", "-LaunchPath", progressFixture.launchPath]);
+    assertPowerShellSuccess(progressStatus);
+    const progressResult = JSON.parse(progressStatus.stdout);
+    assert.equal(progressResult.state, "running");
+    assert.equal(progressResult.reason, "progress-corrupt");
+    assert.equal(progressResult.progressCorrupt, true);
+    assert.equal(progressResult.progress.error, "progress-corrupt");
+    assert.doesNotMatch(progressStatus.stdout, /not-json/);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("detached worker creation failure leaves a failed launch record under the test-only gate", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-start-fail-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    const launchRoot = path.join(temporaryRoot, "launches");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    makeDetachedReportRuntime(runtime, 100);
+    refreshDeployedRuntimeEntry(skills, runtime);
+    const inputPath = path.join(temporaryRoot, "input.json");
+    const outputPath = path.join(temporaryRoot, "report.json");
+    writeFileSync(inputPath, "{}\n", "utf8");
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const result = runPowerShell(runner, [
+      "-Root", runtime,
+      "-Action", "batch",
+      "-InputPath", inputPath,
+      "-OutputPath", outputPath,
+      "-LaunchRoot", launchRoot,
+      "-Detach",
+      "-AllowSend",
+      "-TestOnlyFailStart",
+    ], { CODEX_BRIDGE_P06_TEST_MODE: "1" });
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    const launch = JSON.parse(result.stdout);
+    assert.equal(launch.pass, false);
+    assert.equal(launch.state, "failed");
+    assert.equal(existsSync(launch.launchPath), true);
+    const persisted = JSON.parse(readFileSync(launch.launchPath, "utf8"));
+    assert.equal(persisted.state, "failed");
+    assert.match(persisted.error, /Start-Process failure/i);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("created but unattributed launch is durable and cannot be treated as retryable", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-unattributed-"));
+  let wrapperPid = null;
+  let launchToken = null;
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    const launchRoot = path.join(temporaryRoot, "launches");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    makeDetachedReportRuntime(runtime, 8000);
+    refreshDeployedRuntimeEntry(skills, runtime);
+    const inputPath = path.join(temporaryRoot, "input.json");
+    const outputPath = path.join(temporaryRoot, "report.json");
+    writeFileSync(inputPath, "{}\n", "utf8");
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const result = runPowerShell(runner, [
+      "-Root", runtime,
+      "-Action", "batch",
+      "-InputPath", inputPath,
+      "-OutputPath", outputPath,
+      "-LaunchRoot", launchRoot,
+      "-Detach",
+      "-AllowSend",
+      "-TestOnlyFailAttribution",
+    ], { CODEX_BRIDGE_P06_TEST_MODE: "1" });
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    const launch = JSON.parse(result.stdout);
+    launchToken = launch.launchId;
+    wrapperPid = launch.wrapperPid;
+    assert.equal(launch.state, "starting");
+    assert.equal(launch.errorClass, "created-but-unattributed");
+    assert.equal(launch.pass, false);
+    assert.equal(launch.retryAllowed, undefined);
+    assert.ok(wrapperPid > 0);
+    const status = runPowerShell(runner, ["-Action", "status", "-LaunchPath", launch.launchPath]);
+    assertPowerShellSuccess(status);
+    const observed = JSON.parse(status.stdout);
+    assert.equal(observed.state, "unknown-after-launch");
+    assert.equal(observed.reason, "created-but-unattributed");
+    assert.equal(observed.retryAllowed, false);
+    assert.equal(observed.recoveryRequired, true);
+  } finally {
+    if (launchToken) for (const pid of getProcessIdsByCommandToken(launchToken)) stopProcess(pid);
+    stopProcess(wrapperPid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("status exposes ambiguous batch recovery facts without constructing a resend", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-recovery-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    const fixture = writeRunningLaunchFixture(temporaryRoot);
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    writeFileSync(fixture.record.progressPath, JSON.stringify({
+      schemaVersion: 1,
+      command: "batch",
+      state: "running",
+      runId: "run-ambiguous",
+      requestedJobs: 1,
+      submittedJobs: 1,
+      completedJobs: 0,
+      jobs: [{
+        id: "shot-1",
+        status: "unknown-after-submit",
+        conversationId: "local-chatgpt:11111111-1111-4111-8111-111111111111",
+        marker: "CODEX-BRIDGE-run-ambiguous-shot-1",
+        historyTitle: "test title",
+      }],
+    }), "utf8");
+    const status = runPowerShell(runner, ["-Action", "status", "-LaunchPath", fixture.launchPath]);
+    assertPowerShellSuccess(status);
+    const result = JSON.parse(status.stdout);
+    assert.equal(result.state, "running");
+    assert.equal(result.recoveryRequired, true);
+    assert.equal(result.ambiguousJobs[0].conversationId, "local-chatgpt:11111111-1111-4111-8111-111111111111");
+    assert.equal(result.ambiguousJobs[0].marker, "CODEX-BRIDGE-run-ambiguous-shot-1");
+    assert.equal(result.ambiguousJobs[0].historyTitle, "test title");
+    assert.equal(result.ambiguousJobs[0].prompt, undefined);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("two concurrent detached launches with one output path still keep token-bound PIDs", async () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-concurrent-"));
+  const childPids = [];
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    const launchRoot = path.join(temporaryRoot, "launches");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    makeDetachedReportRuntime(runtime, 3000);
+    refreshDeployedRuntimeEntry(skills, runtime);
+    const inputPath = path.join(temporaryRoot, "input.json");
+    writeFileSync(inputPath, "{}\n", "utf8");
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const sharedOutputPath = path.join(temporaryRoot, "shared-report.json");
+    const results = await Promise.all([1, 2].map(() => runPowerShellAsync(runner, [
+      "-Root", runtime,
+      "-Action", "batch",
+      "-InputPath", inputPath,
+      "-OutputPath", sharedOutputPath,
+      "-LaunchRoot", launchRoot,
+      "-Detach",
+      "-AllowSend",
+    ])));
+    for (const result of results) assertPowerShellSuccess(result);
+    const launches = results.map((result) => JSON.parse(result.stdout));
+    childPids.push(...launches.flatMap((launch) => [launch.pid, launch.wrapperPid]));
+    assert.notEqual(launches[0].launchId, launches[1].launchId);
+    assert.notEqual(launches[0].launchPath, launches[1].launchPath);
+    assert.equal(path.dirname(launches[0].stdoutPath) === path.dirname(launches[1].stdoutPath), false);
+    for (const launch of launches) {
+      assert.ok(getProcessIdsByCommandToken(launch.launchId).includes(launch.pid));
+    }
+  } finally {
+    for (const pid of childPids) stopProcess(pid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
   }
 });

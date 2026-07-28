@@ -273,6 +273,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
 PowerShell 等待超时不代表子进程停止，也不允许因此再开第二个 batch。
 提交状态不明时只允许只读 `resume`，不能把未知状态改成新的 batch。
 
+如果调用方不适合一直等待，可以使用持久 launch handle：
+
+```powershell
+$launch = powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
+  -Action batch -InputPath 'C:\absolute\jobs.json' `
+  -OutputPath 'C:\absolute\report.json' -Detach -AllowSend | ConvertFrom-Json
+
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
+  -Action status -LaunchPath $launch.launchPath
+
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
+  -Action wait -LaunchPath $launch.launchPath -TimeoutMs 600000 -PollMs 5000
+```
+
+`launchPath` 指向严格校验的 launch JSON；`stdoutPath`、`stderrPath` 位于
+同一个随机 launch 目录。batch 才有 `progressPath`，resume/watch 的值是
+`null`，不会伪造不存在的进度文件。`status`/`wait` 是 runner-only 的只读
+诊断，不启动 Node、不连接 CDP、不恢复、不重发。报告或进度文件若损坏，
+会返回 `report-corrupt`/`progress-corrupt`，不能被解释成“还没生成”。
+如果 Windows 已创建 detached worker 但最终 Node 进程暂时无法按唯一
+launch UUID 归属，返回 `unknown-after-launch`；保留原 launch，不要自动重试。
+
+这形成的是“计划 → 明确授权 → detach → status/wait → 报告或一次只读恢复”
+的半自动路径，不是永久后台 daemon、自动回帖服务或零 Codex 额度方案。
+
 所有 batch、resume、approve 和 cleanup 还会争用同一个全局控制锁。即使
 两个调用者选择不同报告路径，也不能同时操作唯一的主 ChatGPT 界面。
 

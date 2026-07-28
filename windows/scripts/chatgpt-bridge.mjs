@@ -189,6 +189,12 @@ export function parseBridgeArgs(argv) {
     else if (argument === "--input") options.input = argv[++index];
     else if (argument === "--output") options.output = argv[++index];
     else if (argument === "--state") options.statePath = argv[++index];
+    else if (argument === "--bridge-launch-token") {
+      const launchToken = argv[++index];
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(launchToken || "")) {
+        throw new Error("bridge launch token must be a UUID");
+      }
+    }
     else if (argument === "--timeout-ms") options.timeoutMs = Number(argv[++index]);
     else if (argument === "--poll-ms") options.pollMs = Number(argv[++index]);
     else throw new Error(`Unknown argument: ${argument}`);

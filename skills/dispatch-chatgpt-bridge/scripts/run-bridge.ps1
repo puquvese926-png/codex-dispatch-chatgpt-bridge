@@ -1,11 +1,13 @@
 [CmdletBinding()]
 param(
-  [ValidateSet('discover', 'probe', 'plan', 'batch', 'resume', 'watch', 'approve', 'cleanup')]
+  [ValidateSet('discover', 'probe', 'plan', 'batch', 'resume', 'watch', 'approve', 'cleanup', 'status', 'wait')]
   [string]$Action = 'probe',
   [string]$Root,
   [string]$StatePath,
   [string]$InputPath,
   [string]$OutputPath,
+  [string]$LaunchRoot,
+  [string]$LaunchPath,
   [ValidateRange(5000, 900000)]
   [int]$TimeoutMs = 600000,
   [ValidateRange(250, 30000)]
@@ -13,7 +15,9 @@ param(
   [switch]$AllowSend,
   [switch]$AllowDelete,
   [switch]$ExperimentalQuickChat,
-  [switch]$Detach
+  [switch]$Detach,
+  [switch]$TestOnlyFailStart,
+  [switch]$TestOnlyFailAttribution
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,7 +57,10 @@ function Assert-AbsoluteBridgePath {
   }
 }
 
-$resolvedRoot = Resolve-BridgeRoot -RequestedRoot $Root
+. (Join-Path $PSScriptRoot 'launch-control.ps1')
+
+function Invoke-BridgeAction {
+  $resolvedRoot = Resolve-BridgeRoot -RequestedRoot $Root
 $bridgePath = Join-Path $resolvedRoot 'windows\scripts\chatgpt-bridge.mjs'
 $manifestDiagnostic = [ordered]@{
   skillManifest = Join-Path $skillRoot 'deployment-manifest.json'
@@ -72,21 +79,22 @@ $node = (Get-Command node -ErrorAction Stop).Source
 $arguments = @($bridgePath, $Action)
 
 if ($StatePath) {
-  Assert-AbsoluteBridgePath -Value $StatePath -Label 'StatePath'
-  $arguments += @('--state', [IO.Path]::GetFullPath($StatePath))
+  $stateFullPath = Get-NormalizedBridgePath -Value $StatePath -Label 'StatePath'
+  $arguments += @('--state', $stateFullPath)
 }
 
 if ($Action -in @('plan', 'batch', 'resume', 'watch', 'approve', 'cleanup')) {
-  Assert-AbsoluteBridgePath -Value $InputPath -Label 'InputPath'
-  Assert-AbsoluteBridgePath -Value $OutputPath -Label 'OutputPath'
-  $arguments += @('--input', [IO.Path]::GetFullPath($InputPath))
-  $arguments += @('--output', [IO.Path]::GetFullPath($OutputPath))
+  $inputFullPath = Get-NormalizedBridgePath -Value $InputPath -Label 'InputPath'
+  $outputFullPath = Get-NormalizedBridgePath -Value $OutputPath -Label 'OutputPath'
+  $arguments += @('--input', $inputFullPath)
+  $arguments += @('--output', $outputFullPath)
   $arguments += @('--timeout-ms', "$TimeoutMs")
   if ($Action -eq 'watch') {
     $arguments += @('--poll-ms', "$PollMs")
   }
 } elseif ($InputPath -or $OutputPath -or $AllowSend -or $AllowDelete -or
-    $ExperimentalQuickChat -or $Detach) {
+    $ExperimentalQuickChat -or $Detach -or $LaunchRoot -or $LaunchPath -or
+    $TestOnlyFailStart -or $TestOnlyFailAttribution) {
   throw "$Action does not accept mutation paths or authorization switches."
 }
 
@@ -103,6 +111,24 @@ if ($ExperimentalQuickChat) {
 
 if ($Detach -and $Action -notin @('batch', 'resume', 'watch')) {
   throw "$Action does not support -Detach."
+}
+if ($LaunchRoot -and -not $Detach) {
+  throw "$Action does not accept -LaunchRoot without -Detach."
+}
+if ($LaunchPath) {
+  throw "$Action does not accept -LaunchPath."
+}
+if ($TestOnlyFailStart -and -not $Detach) {
+  throw "$Action does not accept the test-only start failure switch without -Detach."
+}
+if ($TestOnlyFailStart -and $env:CODEX_BRIDGE_P06_TEST_MODE -ne '1') {
+  throw 'The test-only start failure switch requires CODEX_BRIDGE_P06_TEST_MODE=1.'
+}
+if ($TestOnlyFailAttribution -and -not $Detach) {
+  throw "$Action does not accept the test-only attribution failure switch without -Detach."
+}
+if ($TestOnlyFailAttribution -and $env:CODEX_BRIDGE_P06_TEST_MODE -ne '1') {
+  throw 'The test-only attribution failure switch requires CODEX_BRIDGE_P06_TEST_MODE=1.'
 }
 
 if ($Action -in @('batch', 'approve')) {
@@ -121,29 +147,50 @@ if ($Action -in @('batch', 'approve')) {
 }
 
 if ($Detach) {
-  $stdoutPath = "$OutputPath.stdout.log"
-  $stderrPath = "$OutputPath.stderr.log"
-  $quotedArguments = $arguments | ForEach-Object {
-    '"' + ([string]$_).Replace('"', '\\"') + '"'
+  $launchParameters = @{
+    NodePath = $node
+    Arguments = $arguments
+    Command = $Action
+    InputPath = $inputFullPath
+    ReportPath = $outputFullPath
+    StatePath = $stateFullPath
+    RequestedLaunchRoot = $LaunchRoot
+    Timeout = $TimeoutMs
+    Poll = $PollMs
+    AllowSend = [bool]$AllowSend
+    AllowDelete = [bool]$AllowDelete
+    SimulateStartFailure = [bool]$TestOnlyFailStart
+    SimulateAttributionFailure = [bool]$TestOnlyFailAttribution
   }
-  $child = Start-Process -FilePath $node `
-    -ArgumentList $quotedArguments `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $stdoutPath `
-    -RedirectStandardError $stderrPath `
-    -PassThru
-  [ordered]@{
-    pass = $true
-    command = $Action
-    state = 'running'
-    pid = $child.Id
-    reportPath = [IO.Path]::GetFullPath($OutputPath)
-    progressPath = "$([IO.Path]::GetFullPath($OutputPath)).progress.json"
-    stdoutPath = [IO.Path]::GetFullPath($stdoutPath)
-    stderrPath = [IO.Path]::GetFullPath($stderrPath)
-  } | ConvertTo-Json -Compress
+  $launch = Start-DetachedLaunch @launchParameters
+  $launch | ConvertTo-Json -Compress -Depth 12
+  if (-not $launch.pass) { exit 1 }
   exit 0
 }
 
-& $node @arguments
-exit $LASTEXITCODE
+  & $node @arguments
+  exit $LASTEXITCODE
+}
+
+
+if ($Action -notin @('status', 'wait')) {
+  Invoke-BridgeAction
+  exit $LASTEXITCODE
+}
+
+if ($Action -in @('status', 'wait')) {
+  if ($Root -or $StatePath -or $InputPath -or $OutputPath -or $LaunchRoot -or
+      $AllowSend -or $AllowDelete -or $ExperimentalQuickChat -or $Detach -or
+      $TestOnlyFailStart -or $TestOnlyFailAttribution) {
+    throw "$Action is runner-only and accepts only -LaunchPath plus bounded wait options."
+  }
+  Assert-AbsoluteBridgePath -Value $LaunchPath -Label 'LaunchPath'
+  $normalizedLaunchPath = [IO.Path]::GetFullPath($LaunchPath)
+  $result = if ($Action -eq 'status') {
+    Get-LaunchStatus -Path $normalizedLaunchPath
+  } else {
+    Wait-LaunchStatus -Path $normalizedLaunchPath -Timeout $TimeoutMs -Poll $PollMs
+  }
+  $result | ConvertTo-Json -Compress -Depth 20
+  exit 0
+}

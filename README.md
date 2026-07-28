@@ -114,3 +114,18 @@ runner 实际执行的文件路径。dirty worktree 会明确标为 `dirty-workt
 启动前 fail closed；`discover`/`probe` 可以作为只读诊断继续运行。安装不会自动
 重启 Codex，跨目录切换或进程被强杀后的恢复边界见
 [全局安装与版本同步](docs/global-install.md)。
+
+## 半自动等待与能力边界
+
+长任务可用 `-Detach` 获得持久 `launchPath`，再用 runner-only 的
+`-Action status` 或有界 `-Action wait` 查询。它们只读取 launch/report（batch
+还读取真实 progress sidecar），不启动 Node、不连接 CDP、不恢复、不重发。
+只有 batch 有 `progressPath`；resume/watch 明确为 `null`。`unknown-after-submit`
+会返回恢复所需的原始身份，但不会自动生成或执行 resend。
+
+当前产品路径是“plan → 用户授权 → detach → status/wait → 结果或一次只读
+resume”。这不是永久 daemon、自动回帖、密码学批准证明，也不会消除 Codex
+额度消耗。安装器不会修改用户的 `AGENTS.md`；触发依赖正确安装到当前用户
+全局 skills 目录和 Skill 的描述匹配。
+若 detached worker 已创建但最终 Node 无法按唯一 launch UUID 归属，状态是
+`unknown-after-launch`，不是“没启动”；必须保留原 launch，禁止自动重试。
