@@ -237,6 +237,13 @@ progress sidecar; their detached records have `progressPath: null`.
 All runner JSON emitted to stdout or stderr is UTF-8 without a BOM, including
 detached launch handles and runner-only `status`/`wait` results; callers must
 parse those bytes as UTF-8 even when PowerShell has no interactive console.
+The runner-only `status` and `wait` actions support both Windows PowerShell
+5.1 (`powershell.exe`) and PowerShell 7 (`pwsh`). PowerShell 7 may deserialize
+ISO timestamps as `DateTime`; the reader accepts only a timezone-bearing ISO
+string or that host-created `DateTime`/`DateTimeOffset`, normalizes it to an
+invariant UTC round-trip string, and still rejects local/ambiguous dates,
+arrays, objects and invalid timestamps. The restart bootstrap continues to
+use the verified Windows PowerShell 5.1 executable for its Appx/process path.
 `launchId` is also injected as a validated, ignored bridge launch token into the
 final Node command line. Process attribution matches that token, never merely a
 report path; two callers sharing an output path cannot adopt each other's PID.

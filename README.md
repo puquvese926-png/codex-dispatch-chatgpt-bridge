@@ -94,7 +94,10 @@ GPT 规划 → 用户批准 → Codex 执行 → 测试验收 → 回读结果
 约需 8 分钟；中间控制台可能暂时没有新行，不应据此判断卡死。测试和 smoke 若使用
 临时 Runtime 根目录，也必须同时显式传入临时 `-StatePath`；`-Root` 只选择运行时，
 不会隔离 `%LOCALAPPDATA%` 下的桥接状态。`status`/`wait` 读取 launch 句柄时同样只
-接受该句柄声明的受控路径。
+接受该句柄声明的受控路径。runner-only 的 `status`/`wait` 可由 Windows
+PowerShell 5.1（`powershell.exe`）或 PowerShell 7（`pwsh`）调用；两者都输出无
+BOM 的 UTF-8 JSON，并把 PowerShell 7 自动反序列化的时间统一成 UTC round-trip
+字符串。重启入口的 Appx/进程操作仍固定转交经过验证的 Windows PowerShell 5.1。
 
 ## 适合谁
 

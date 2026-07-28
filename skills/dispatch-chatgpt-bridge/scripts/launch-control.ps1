@@ -100,6 +100,72 @@ function Test-JsonInteger {
     $Value -is [uint16] -or $Value -is [uint32] -or $Value -is [uint64]
 }
 
+function ConvertTo-BridgeUtcTimestamp {
+  param(
+    [AllowNull()][object]$Value,
+    [Parameter(Mandatory = $true)][string]$Label,
+    [switch]$AllowNull
+  )
+  if ($null -eq $Value) {
+    if ($AllowNull) { return $null }
+    throw "$Label must be a non-empty ISO timestamp."
+  }
+  $timestamp = $null
+  if ($Value -is [DateTimeOffset]) {
+    $timestamp = [DateTimeOffset]$Value
+  } elseif ($Value -is [DateTime]) {
+    $dateTime = [DateTime]$Value
+    if ($dateTime.Kind -eq [DateTimeKind]::Unspecified) {
+      throw "$Label must include a timezone."
+    }
+    $timestamp = [DateTimeOffset]$dateTime
+  } elseif ($Value -is [string]) {
+    if ([string]::IsNullOrWhiteSpace($Value) -or
+        $Value -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|[+-]\d{2}:\d{2})$') {
+      throw "$Label must be a strict ISO timestamp with timezone."
+    }
+    $parsed = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse(
+        $Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind,
+        [ref]$parsed)) {
+      throw "$Label is invalid."
+    }
+    $timestamp = $parsed
+  } else {
+    throw "$Label must be a string, DateTime, DateTimeOffset, or null."
+  }
+  return $timestamp.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Normalize-BridgeTimestampFields {
+  param(
+    [AllowNull()][object]$Value,
+    [string]$Label = 'JSON value'
+  )
+  if ($null -eq $Value) { return }
+  if ($Value -is [Array]) {
+    foreach ($item in @($Value)) { [void](Normalize-BridgeTimestampFields -Value $item -Label $Label) }
+    return
+  }
+  if ($Value -isnot [pscustomobject]) { return }
+  $timestampNames = @(
+    'startedAt', 'updatedAt', 'processStartedAt', 'submittedAt',
+    'completedAt', 'createdAt', 'deletedAt', 'requestedAt',
+    'dispatchDeadline', 'ackedAt', 'at'
+  )
+  foreach ($property in @($Value.PSObject.Properties)) {
+    if ($timestampNames -contains $property.Name) {
+      if ($null -ne $property.Value) {
+        $property.Value = ConvertTo-BridgeUtcTimestamp -Value $property.Value -Label "$Label $($property.Name)"
+      }
+    } else {
+      [void](Normalize-BridgeTimestampFields -Value $property.Value -Label $Label)
+    }
+  }
+}
+
 function Assert-LaunchNullableString {
   param([AllowNull()][object]$Value, [Parameter(Mandatory = $true)][string]$Label)
   if ($null -ne $Value -and $Value -isnot [string]) { throw "launch record $Label must be a string or null." }
@@ -153,13 +219,16 @@ function Assert-LaunchRecord {
   if (-not (Test-JsonInteger $Record.pollMs) -or [int64]$Record.pollMs -lt 250 -or [int64]$Record.pollMs -gt 30000) {
     throw 'launch record pollMs is invalid.'
   }
-  foreach ($field in @('launchPath', 'reportPath', 'stdoutPath', 'stderrPath', 'startedAt', 'updatedAt', 'inputPath')) {
+  foreach ($field in @('launchPath', 'reportPath', 'stdoutPath', 'stderrPath', 'inputPath')) {
     Assert-LaunchString -Value $Record.$field -Label $field
   }
-  foreach ($field in @('statePath', 'processStartedAt', 'error', 'errorClass', 'wrapperPid', 'pid')) {
+  $Record.startedAt = ConvertTo-BridgeUtcTimestamp -Value $Record.startedAt -Label 'launch record startedAt'
+  $Record.updatedAt = ConvertTo-BridgeUtcTimestamp -Value $Record.updatedAt -Label 'launch record updatedAt'
+  foreach ($field in @('statePath', 'error', 'errorClass')) {
     if ($field -in @('pid', 'wrapperPid')) { continue }
     Assert-LaunchNullableString -Value $Record.$field -Label $field
   }
+  $Record.processStartedAt = ConvertTo-BridgeUtcTimestamp -Value $Record.processStartedAt -Label 'launch record processStartedAt' -AllowNull
   if ($Record.command -eq 'batch') {
     Assert-LaunchString -Value $Record.progressPath -Label 'progressPath'
   } elseif ($null -ne $Record.progressPath) {
@@ -212,17 +281,6 @@ function Assert-LaunchRecord {
       throw 'batch launch progressPath is not derived from reportPath.'
     }
   }
-  foreach ($field in @('startedAt', 'updatedAt')) {
-    try {
-      [DateTimeOffset]::Parse(
-        [string]$Record.$field,
-        [Globalization.CultureInfo]::InvariantCulture,
-        [Globalization.DateTimeStyles]::RoundtripKind
-      ) | Out-Null
-    } catch {
-      throw "launch record $field is invalid."
-    }
-  }
   $pidValue = 0
   if ($null -ne $Record.pid) {
     if (-not [int]::TryParse([string]$Record.pid, [ref]$pidValue) -or $pidValue -le 0) {
@@ -233,17 +291,6 @@ function Assert-LaunchRecord {
   if ($null -ne $Record.wrapperPid) {
     if (-not [int]::TryParse([string]$Record.wrapperPid, [ref]$wrapperPidValue) -or $wrapperPidValue -le 0) {
       throw 'launch record wrapperPid is invalid.'
-    }
-  }
-  if ($null -ne $Record.processStartedAt) {
-    try {
-      [DateTimeOffset]::Parse(
-        [string]$Record.processStartedAt,
-        [Globalization.CultureInfo]::InvariantCulture,
-        [Globalization.DateTimeStyles]::RoundtripKind
-      ) | Out-Null
-    } catch {
-      throw 'launch record processStartedAt is invalid.'
     }
   }
   if ($null -eq $Record.authorization -or $Record.authorization -is [Array] -or $Record.authorization -isnot [pscustomobject]) {
@@ -352,6 +399,7 @@ function Get-ReportSummary {
   try {
     $text = Read-BoundedText -Path $Path -MaxBytes 16777216 -Label 'bridge report'
     $value = $text | ConvertFrom-Json
+    [void](Normalize-BridgeTimestampFields -Value $value -Label 'bridge report')
     if ($null -eq $value -or $value -is [Array] -or $value.pass -isnot [bool] -or [string]$value.command -ne $Command) {
       throw 'invalid report shape'
     }
@@ -389,6 +437,7 @@ function Get-ProgressSummary {
   try {
     $text = Read-BoundedText -Path $Path -MaxBytes 8388608 -Label 'batch progress'
     $value = $text | ConvertFrom-Json
+    [void](Normalize-BridgeTimestampFields -Value $value -Label 'batch progress')
     if ($null -eq $value -or $value -is [Array] -or [string]$value.command -ne 'batch') {
       throw 'invalid progress shape'
     }

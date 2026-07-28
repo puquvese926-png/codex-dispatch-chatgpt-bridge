@@ -56,6 +56,27 @@ function runPowerShell(script, args = [], env = {}) {
   });
 }
 
+function runPowerShellHost(host, script, args = [], env = {}) {
+  return spawnSync(host, [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    script,
+    ...args,
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  });
+}
+
+function hasPowerShell7() {
+  const result = spawnSync("pwsh.exe", ["-NoProfile", "-Command", "exit 0"], {
+    encoding: "utf8",
+  });
+  return result.error?.code !== "ENOENT" && result.status === 0;
+}
+
 function runPowerShellAsync(script, args = [], env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn("powershell.exe", [
@@ -1026,6 +1047,108 @@ test("detached batch, resume and watch each receive a durable launch handle with
     }
   } finally {
     for (const pid of childPids) stopProcess(pid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell hosts inspect the same detached launch handle with equivalent status and wait", (t) => {
+  if (!hasPowerShell7()) {
+    t.skip("pwsh.exe is unavailable; cross-host status/wait regression is gated");
+    return;
+  }
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-powershell-hosts-"));
+  const childPids = [];
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    const launchRoot = path.join(temporaryRoot, "中文 & percent %", "launches");
+    const statePath = path.join(temporaryRoot, "中文 & percent %", "state.json");
+    const inputPath = path.join(temporaryRoot, "中文 & percent %", "input.json");
+    const outputPath = path.join(temporaryRoot, "中文 & percent %", "report.json");
+    mkdirSync(path.dirname(inputPath), { recursive: true });
+    writeFileSync(inputPath, "{}\n", "utf8");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    makeDetachedReportRuntime(runtime, 350);
+    refreshDeployedRuntimeEntry(skills, runtime);
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const launched = runDetachedRunner(
+      runner,
+      runtime,
+      "batch",
+      inputPath,
+      outputPath,
+      launchRoot,
+      ["-AllowSend", "-StatePath", statePath],
+    );
+    assertPowerShellSuccess(launched);
+    const launch = JSON.parse(launched.stdout);
+    childPids.push(launch.pid, launch.wrapperPid);
+
+    const projection = (value) => ({
+      pass: value.pass,
+      state: value.state,
+      reason: value.reason,
+      retryAllowed: value.retryAllowed,
+      recoveryRequired: value.recoveryRequired,
+      launchId: value.launchId,
+      launchPath: value.launchPath,
+      command: value.command,
+      reportPath: value.reportPath,
+      progressPath: value.progressPath,
+    });
+    const statusArgs = ["-Action", "status", "-LaunchPath", launch.launchPath];
+    const desktopStatus = runPowerShell(runner, statusArgs);
+    const coreStatus = runPowerShellHost("pwsh.exe", runner, statusArgs);
+    assertPowerShellSuccess(desktopStatus);
+    assertPowerShellSuccess(coreStatus);
+    assert.deepEqual(projection(JSON.parse(desktopStatus.stdout)), projection(JSON.parse(coreStatus.stdout)));
+
+    const waitArgs = ["-Action", "wait", "-LaunchPath", launch.launchPath, "-TimeoutMs", "15000", "-PollMs", "250"];
+    const desktopWait = runPowerShell(runner, waitArgs);
+    const coreWait = runPowerShellHost("pwsh.exe", runner, waitArgs);
+    assertPowerShellSuccess(desktopWait);
+    assertPowerShellSuccess(coreWait);
+    assert.deepEqual(projection(JSON.parse(desktopWait.stdout)), projection(JSON.parse(coreWait.stdout)));
+    assert.equal(JSON.parse(coreWait.stdout).state, "complete");
+  } finally {
+    for (const pid of childPids) stopProcess(pid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("both PowerShell hosts reject ambiguous launch timestamp values before any operation", (t) => {
+  if (!hasPowerShell7()) {
+    t.skip("pwsh.exe is unavailable; cross-host timestamp rejection is gated");
+    return;
+  }
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-timestamp-rejection-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const cases = [
+      ["no-timezone", (record) => { record.startedAt = "2026-07-29T01:02:03"; }],
+      ["array", (record) => { record.updatedAt = []; }],
+      ["object", (record) => { record.processStartedAt = {}; }],
+      ["invalid", (record) => { record.startedAt = "not-a-timestamp"; }],
+    ];
+    for (const [name, mutate] of cases) {
+      const caseRoot = path.join(temporaryRoot, name);
+      mkdirSync(caseRoot, { recursive: true });
+      const fixture = writeRunningLaunchFixture(caseRoot);
+      const record = JSON.parse(readFileSync(fixture.launchPath, "utf8"));
+      mutate(record);
+      writeFileSync(fixture.launchPath, JSON.stringify(record), "utf8");
+      for (const [host, result] of [
+        ["powershell.exe", runPowerShell(runner, ["-Action", "status", "-LaunchPath", fixture.launchPath])],
+        ["pwsh.exe", runPowerShellHost("pwsh.exe", runner, ["-Action", "status", "-LaunchPath", fixture.launchPath])],
+      ]) {
+        assert.notEqual(result.status, 0, `${name}/${host} unexpectedly accepted a timestamp`);
+        assert.doesNotMatch(result.stdout + result.stderr, /not-a-timestamp|2026-07-29T01:02:03/u, `${name}/${host} leaked input`);
+      }
+    }
+  } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
 });

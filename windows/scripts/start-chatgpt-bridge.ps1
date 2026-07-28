@@ -419,7 +419,11 @@ function Read-BridgeUtf8Json {
   $decoder = New-Object System.Text.UTF8Encoding($false, $true)
   try { $text = $decoder.GetString($bytes) } catch { throw 'Restart protocol file is not strict UTF-8.' }
   if ([string]::IsNullOrWhiteSpace($text)) { throw 'Restart protocol file is empty.' }
-  try { return ($text | ConvertFrom-Json -ErrorAction Stop) } catch { throw 'Restart protocol JSON is invalid.' }
+  try {
+    $value = $text | ConvertFrom-Json -ErrorAction Stop
+    [void](Normalize-BridgeTimestampFields -Value $value -Label 'Restart protocol')
+    return $value
+  } catch { throw 'Restart protocol JSON is invalid.' }
 }
 
 function Assert-BridgeExactProperties {
@@ -442,10 +446,75 @@ function Assert-BridgeStringValue {
   }
 }
 
+function ConvertTo-BridgeUtcTimestamp {
+  param(
+    [AllowNull()][object]$Value,
+    [Parameter(Mandatory = $true)][string]$Label,
+    [switch]$AllowNull
+  )
+  if ($null -eq $Value) {
+    if ($AllowNull) { return $null }
+    throw "$Label must be a non-empty ISO timestamp."
+  }
+  $timestamp = $null
+  if ($Value -is [DateTimeOffset]) {
+    $timestamp = [DateTimeOffset]$Value
+  } elseif ($Value -is [DateTime]) {
+    $dateTime = [DateTime]$Value
+    if ($dateTime.Kind -eq [DateTimeKind]::Unspecified) {
+      throw "$Label must include a timezone."
+    }
+    $timestamp = [DateTimeOffset]$dateTime
+  } elseif ($Value -is [string]) {
+    if ([string]::IsNullOrWhiteSpace($Value) -or
+        $Value -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|[+-]\d{2}:\d{2})$') {
+      throw "$Label must be a strict ISO timestamp with timezone."
+    }
+    $parsed = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse(
+        $Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind,
+        [ref]$parsed)) {
+      throw "$Label is invalid."
+    }
+    $timestamp = $parsed
+  } else {
+    throw "$Label must be a string, DateTime, DateTimeOffset, or null."
+  }
+  return $timestamp.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Normalize-BridgeTimestampFields {
+  param(
+    [AllowNull()][object]$Value,
+    [string]$Label = 'JSON value'
+  )
+  if ($null -eq $Value) { return }
+  if ($Value -is [Array]) {
+    foreach ($item in @($Value)) { [void](Normalize-BridgeTimestampFields -Value $item -Label $Label) }
+    return
+  }
+  if ($Value -isnot [pscustomobject]) { return }
+  $timestampNames = @(
+    'startedAt', 'updatedAt', 'processStartedAt', 'submittedAt',
+    'completedAt', 'createdAt', 'deletedAt', 'requestedAt',
+    'dispatchDeadline', 'ackedAt', 'at'
+  )
+  foreach ($property in @($Value.PSObject.Properties)) {
+    if ($timestampNames -contains $property.Name) {
+      if ($null -ne $property.Value) {
+        $property.Value = ConvertTo-BridgeUtcTimestamp -Value $property.Value -Label "$Label $($property.Name)"
+      }
+    } else {
+      [void](Normalize-BridgeTimestampFields -Value $property.Value -Label $Label)
+    }
+  }
+}
+
 function Assert-BridgeRestartTimestamp {
   param([Parameter(Mandatory = $true)][object]$Value, [Parameter(Mandatory = $true)][string]$Label)
-  Assert-BridgeStringValue -Value $Value -Label $Label
-  try { [DateTime]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) | Out-Null } catch { throw "$Label is invalid." }
+  [void](ConvertTo-BridgeUtcTimestamp -Value $Value -Label $Label)
 }
 
 function Assert-BridgeRestartRequest {
@@ -629,13 +698,13 @@ function Start-BridgeDetachedRestart {
   $readyPath = Join-Path $stateDirectory "restart-ready-$operationId.json"
   $ackPath = Join-Path $stateDirectory "restart-ack-$operationId.json"
   $paths = Assert-BridgeRestartPathSet -RequestPath $requestPath -ReportPath $reportPath -ReadyPath $readyPath -AckPath $ackPath -StatePath $stateFile -OperationId $operationId
-  $requestedAt = [DateTime]::UtcNow.ToString('o')
+  $requestedAt = ConvertTo-BridgeUtcTimestamp -Value ([DateTime]::UtcNow.ToString('o')) -Label 'Restart requestedAt'
   if ($TestOnlyProtocol) {
-    $dispatchDeadline = [DateTime]::UtcNow.AddSeconds(10).ToString('o')
+    $dispatchDeadline = ConvertTo-BridgeUtcTimestamp -Value ([DateTime]::UtcNow.AddSeconds(10).ToString('o')) -Label 'Restart dispatchDeadline'
     $packageFullName = 'Codex.P07.ProtocolTest'
     $processIds = @(424242)
   } else {
-    $dispatchDeadline = [DateTime]::UtcNow.AddSeconds(60).ToString('o')
+    $dispatchDeadline = ConvertTo-BridgeUtcTimestamp -Value ([DateTime]::UtcNow.AddSeconds(60).ToString('o')) -Label 'Restart dispatchDeadline'
     $packageFullName = "$($Codex.PackageFullName)"
     $processIds = @($Processes | ForEach-Object { [int]$_.ProcessId })
   }

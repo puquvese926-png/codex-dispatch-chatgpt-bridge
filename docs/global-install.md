@@ -80,6 +80,14 @@ worker 必须先写出 `worker-ready`，父进程校验 operationId、PID、路�
 CDP 就绪并原子写入状态文件。
 从 PowerShell 7 调用时，启动器会把 Windows `Appx` 检查自动转交给
 Windows PowerShell 5.1，并保留相同参数和退出状态。
+已生成的 detached launch 句柄可以直接用 `powershell.exe` 或 `pwsh` 做只读
+查询；两种宿主都会严格校验并规范化 launch/report/progress 的时间字段，不会
+因为 PowerShell 7 把 ISO 时间反序列化为 `DateTime` 而误报句柄损坏。例如：
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File $env:USERPROFILE\.codex\skills\dispatch-chatgpt-bridge\scripts\run-bridge.ps1 `
+  -Action status -LaunchPath <absolute-launch.json>
+```
 
 重启期间当前命令可能因为 Codex 窗口关闭而在界面中显示“被中断”；这不再作为
 重启成败依据。不要手动启动 Codex，等待它自动重新打开，然后查看：

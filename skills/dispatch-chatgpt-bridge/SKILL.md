@@ -221,6 +221,11 @@ Detached `batch`, `resume` and `watch` each return a durable launch handle. Only
 `batch` has a `progressPath`; `resume` and `watch` deliberately return
 `progressPath: null`. The runner-only `status` and `wait` actions read the
 launch record, report and (for batch) progress summary with bounded limits.
+These runner-only actions are supported from both `powershell.exe` (Windows
+PowerShell 5.1) and `pwsh` (PowerShell 7); their machine-readable output is
+UTF-8 and timestamp fields are normalized to invariant UTC strings at read
+time. The restart bootstrap still relays its Windows Appx/process work to the
+verified Windows PowerShell 5.1 executable.
 When a report/progress file is present but malformed or oversized, status
 returns an explicit corrupt reason. For an ambiguous batch result it exposes
 `recoveryRequired`, `conversationId`, `marker` and any captured `historyTitle`;
@@ -268,6 +273,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action resume -Inpu
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action approve -InputPath <absolute-approve.json> -OutputPath <absolute-report.json> -AllowSend
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action watch -InputPath <absolute-watch.json> -OutputPath <absolute-report.json> -TimeoutMs 180000 -PollMs 5000
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action cleanup -InputPath <absolute-lifecycle-ledger.json> -OutputPath <absolute-cleanup-report.json> -AllowDelete
+pwsh -NoProfile -ExecutionPolicy Bypass -File $runner -Action status -LaunchPath <absolute-launch.json>
+pwsh -NoProfile -ExecutionPolicy Bypass -File $runner -Action wait -LaunchPath <absolute-launch.json> -TimeoutMs 600000 -PollMs 5000
 ```
 
 ## Interpret outcomes
