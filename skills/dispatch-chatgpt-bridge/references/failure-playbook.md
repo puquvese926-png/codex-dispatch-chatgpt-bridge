@@ -78,3 +78,28 @@ Before any retry, answer all of these in the report or task notes:
 6. Does the next attempt risk duplicate generation?
 
 If any answer is unknown, fail closed. A user may explicitly authorize a different fresh job, but it must receive a new conversation, job ID, marker and lifecycle entry; the ambiguous original remains untouched.
+
+## Deployment installation failures
+
+| Symptom / stage | Meaning | Safe response | Preventive rule |
+| --- | --- | --- | --- |
+| `Bridge consistency gate failed before Node/CDP` for `plan`, `batch`, `resume`, `watch`, `approve` or `cleanup` | The installed Skill and selected Runtime are missing a deployment manifest, have different canonical manifests, have a path-bound target mismatch, or contain a changed managed file. No Node process, CDP request, UI action or business output was reached. A matching pair can still report `dirty-worktree`: that is explicit provenance, not a fake exact release. | Keep the command pre-submit and do not bypass the gate with `-Root`, a legacy project runtime or a manual manifest edit. Run the repository `install-global.ps1`, then `verify-global-install.ps1`; use only `discover`/`probe` for read-only diagnosis while the gate is broken. | Install both trees through same-volume staging and journaled rollback. The manifest uses Runtime paths relative to the deployed Runtime root (`windows/scripts/...`), so an upgrade cannot classify an old executed Runtime file as an unrelated extra and overwrite the staged version. Runner checks the pair before resolving/calling Node. Regression: clean/upgrade/rollback/tamper/path-binding/missing-manifest tests prove Node invocation remains zero on failure. |
+| Installation reports a failed switch or leaves a transaction journal | The two target directories cannot be switched atomically as one filesystem object. The failure may occur after one target moved, or a process may die between switches. | Do not delete staging/backup/journal paths by hand. Rerun the same installer with the same target roots; it verifies the journal's random transaction ID, parent and target bindings, restores the previous pair or completes cleanup, and refuses unknown/corrupt residue. Do not restart Codex as a recovery step. | Use same-volume sibling staging and backups, a precise journal, canonical pair validation before switch, and rollback that removes only owned paths. A committed pair is never rolled back merely because backup cleanup failed; the journal remains the recovery fact. This is transactional rollback, not a claim of cross-directory atomicity. |
+
+## `BRIDGE_BATCH_UNKNOWN_AFTER_SUBMIT`
+
+This user-facing error is a post-click ambiguity, not permission to resend. Find the
+original durable report and its `<report>.progress.json` sidecar first. Preserve the
+original job ID and copy its exact `surface`, `conversationId`, `marker`,
+`promptHash` and, when captured, the unique `historyTitle` into one read-only resume
+manifest. Run `run-bridge.ps1 -Action resume` without `-AllowSend`, using a new
+resume report path. Accept only a result that proves the same marker inside the same
+conversation identity.
+
+If the route, title or marker is unavailable, the only honest outcome is
+`not-recovered`; do not promise retrieval, close/delete the original conversation or
+start a replacement batch. A genuinely new generation requires a separate explicit
+user authorization and a new job/conversation; the ambiguous original remains sealed.
+This is a bounded recovery path, not a persistent daemon or automatic GPT reply service.
+The MVP supports explicit dispatch and read-only recovery; it does not make itself a
+background listener by editing `AGENTS.md`.

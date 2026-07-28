@@ -18,6 +18,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$skillRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'deployment-manifest.ps1')
+
 function Test-BridgeRoot {
   param([string]$Candidate)
   if ([string]::IsNullOrWhiteSpace($Candidate)) { return $false }
@@ -52,6 +55,19 @@ function Assert-AbsoluteBridgePath {
 
 $resolvedRoot = Resolve-BridgeRoot -RequestedRoot $Root
 $bridgePath = Join-Path $resolvedRoot 'windows\scripts\chatgpt-bridge.mjs'
+$manifestDiagnostic = [ordered]@{
+  skillManifest = Join-Path $skillRoot 'deployment-manifest.json'
+  runtimeManifest = Join-Path $resolvedRoot 'deployment-manifest.json'
+  status = 'diagnostic-only'
+}
+if ($Action -notin @('discover', 'probe')) {
+  try {
+    Assert-DeploymentPair -SkillRoot $skillRoot -RuntimeRoot $resolvedRoot | Out-Null
+  } catch {
+    throw "Bridge consistency gate failed before Node/CDP. Skill manifest=$($manifestDiagnostic.skillManifest); Runtime manifest=$($manifestDiagnostic.runtimeManifest); status=invalid-or-missing; repair: .\scripts\install-global.ps1 then .\scripts\verify-global-install.ps1. Details=$($_.Exception.Message)"
+  }
+  $manifestDiagnostic.status = 'verified'
+}
 $node = (Get-Command node -ErrorAction Stop).Source
 $arguments = @($bridgePath, $Action)
 

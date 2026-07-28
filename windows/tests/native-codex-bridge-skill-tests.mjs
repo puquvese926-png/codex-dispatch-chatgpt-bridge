@@ -27,6 +27,36 @@ test("skill defines distinct native Codex and ChatGPT bridge routes", async () =
   assert.match(native, /quick-watch|quick.?watch/i);
 });
 
+test("skill frontmatter covers bridge-specific Chinese trigger phrases without becoming a generic chat trigger", async () => {
+  const skill = await fs.readFile(path.join(skillRoot, "SKILL.md"), "utf8");
+  const frontmatter = skill.match(/^---\r?\n([\s\S]*?)\r?\n---/u)?.[1] || "";
+  assert.match(frontmatter, /^description:/m);
+  for (const phrase of ["子智能体", "子代理", "桥接对话", "ChatGPT桥接", "跨对话", "生图分发", "CODEX_HANDOFF"]) {
+    assert.match(frontmatter, new RegExp(phrase));
+  }
+  assert.doesNotMatch(frontmatter, /所有聊天|任意聊天|普通聊天都触发/);
+});
+
+test("installation and unknown-after-submit guidance does not promise a daemon or automatic resend", async () => {
+  const installer = await fs.readFile(path.join(projectRoot, "scripts", "install-global.ps1"), "utf8");
+  const guide = await fs.readFile(
+    path.join(projectRoot, "docs", "dispatch-chatgpt-bridge-guide.md"),
+    "utf8",
+  );
+  const playbook = await fs.readFile(
+    path.join(skillRoot, "references", "failure-playbook.md"),
+    "utf8",
+  );
+  assert.doesNotMatch(installer, /AGENTS\.md/);
+  assert.match(guide, /安装器.*修改.*AGENTS\.md/s);
+  assert.match(guide, /BRIDGE_BATCH_UNKNOWN_AFTER_SUBMIT/);
+  assert.match(guide, /not-recovered/);
+  assert.match(guide, /不.*自动重发/);
+  assert.match(playbook, /BRIDGE_BATCH_UNKNOWN_AFTER_SUBMIT/);
+  assert.match(playbook, /without `-AllowSend`/);
+  assert.match(playbook, /not a persistent daemon/);
+});
+
 test("native route contract prevents delegation metadata spoofing and route drift", async () => {
   const native = await fs.readFile(
     path.join(skillRoot, "references", "native-codex-bridge.md"),

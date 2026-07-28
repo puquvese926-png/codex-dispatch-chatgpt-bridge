@@ -7,60 +7,30 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-$sourceRoot = Join-Path $repositoryRoot 'skills\dispatch-chatgpt-bridge'
-$targetRoot = Join-Path $GlobalSkillsRoot 'dispatch-chatgpt-bridge'
+. (Join-Path $repositoryRoot 'skills\dispatch-chatgpt-bridge\scripts\deployment-manifest.ps1')
+
+$sourceSkillRoot = Join-Path $repositoryRoot 'skills\dispatch-chatgpt-bridge'
 $sourceRuntimeRoot = Join-Path $repositoryRoot 'windows\scripts'
-$targetRuntimeRoot = Join-Path $GlobalRuntimeRoot 'windows\scripts'
+$targetSkillRoot = ConvertTo-BridgeAbsolutePath -Path (Join-Path $GlobalSkillsRoot 'dispatch-chatgpt-bridge') -Label 'Skill target'
+$targetRuntimeRoot = ConvertTo-BridgeAbsolutePath -Path $GlobalRuntimeRoot -Label 'Runtime target'
 
-if (-not (Test-Path -LiteralPath $sourceRoot -PathType Container)) {
-    throw "Source Skill directory was not found: $sourceRoot"
+try {
+    $manifest = Assert-DeploymentPair `
+        -SkillRoot $targetSkillRoot `
+        -RuntimeRoot $targetRuntimeRoot `
+        -RepositoryRoot $repositoryRoot `
+        -RequireSourceMatch
+    [ordered]@{
+        pass = $true
+        bridgeVersion = [string]$manifest.bridgeVersion
+        protocolVersion = [string]$manifest.protocolVersion
+        sourceCommit = [string]$manifest.sourceCommit
+        sourceCommitStatus = [string]$manifest.sourceCommitStatus
+        manifestHash = [string]$manifest.manifestHash
+        skillTarget = $targetSkillRoot
+        runtimeTarget = $targetRuntimeRoot
+        extraFiles = 'ignored-and-never-modified'
+    } | ConvertTo-Json -Compress
+} catch {
+    throw "Global bridge verification failed. Skill=$targetSkillRoot Runtime=$targetRuntimeRoot. Repair with: .\scripts\install-global.ps1; then: .\scripts\verify-global-install.ps1. Details=$($_.Exception.Message)"
 }
-if (-not (Test-Path -LiteralPath $targetRoot -PathType Container)) {
-    throw "Global Skill directory was not found: $targetRoot"
-}
-if (-not (Test-Path -LiteralPath $sourceRuntimeRoot -PathType Container)) {
-    throw "Source bridge runtime directory was not found: $sourceRuntimeRoot"
-}
-if (-not (Test-Path -LiteralPath $targetRuntimeRoot -PathType Container)) {
-    throw "Global bridge runtime directory was not found: $targetRuntimeRoot"
-}
-
-function Compare-Tree {
-    param(
-        [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Target,
-        [Parameter(Mandatory = $true)][string]$Label
-    )
-
-    $sourceFiles = @(Get-ChildItem -LiteralPath $Source -File -Recurse)
-    $targetFiles = @(Get-ChildItem -LiteralPath $Target -File -Recurse)
-    $sourceRelative = @($sourceFiles | ForEach-Object { $_.FullName.Substring($Source.Length).TrimStart('\') })
-    $targetRelative = @($targetFiles | ForEach-Object { $_.FullName.Substring($Target.Length).TrimStart('\') })
-
-    $missing = @($sourceRelative | Where-Object { $_ -notin $targetRelative })
-    $extra = @($targetRelative | Where-Object { $_ -notin $sourceRelative })
-    $mismatch = @()
-
-    foreach ($relativePath in $sourceRelative) {
-        if ($relativePath -in $targetRelative) {
-            $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Source $relativePath)).Hash
-            $targetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Target $relativePath)).Hash
-            if ($sourceHash -ne $targetHash) {
-                $mismatch += $relativePath
-            }
-        }
-    }
-
-    if ($missing.Count -gt 0 -or $extra.Count -gt 0 -or $mismatch.Count -gt 0) {
-        if ($missing.Count -gt 0) { Write-Output "$Label missing: $($missing -join ', ')" }
-        if ($extra.Count -gt 0) { Write-Output "$Label extra: $($extra -join ', ')" }
-        if ($mismatch.Count -gt 0) { Write-Output "$Label hash mismatch: $($mismatch -join ', ')" }
-        throw "$Label verification failed."
-    }
-
-    return $sourceFiles.Count
-}
-
-$skillCount = Compare-Tree -Source $sourceRoot -Target $targetRoot -Label 'Global Skill'
-$runtimeCount = Compare-Tree -Source $sourceRuntimeRoot -Target $targetRuntimeRoot -Label 'Global runtime'
-Write-Output "PASS: $skillCount Skill files and $runtimeCount runtime files match."

@@ -98,3 +98,19 @@ GPT 规划 → 用户批准 → Codex 执行 → 测试验收 → 回读结果
 ## 安全边界
 
 所有发送都需要明确授权和精确目标身份；`watch` 与 `resume` 保持只读；`unknown-after-submit` 和 `timeout-after-submit` 不自动重发；不手写或抓取 `<codex_delegation>` 元数据。
+
+## 版本清单与安装门禁
+
+安装会在 Skill 目录和 Runtime 根目录各写一份相同的
+`deployment-manifest.json`。它记录 `schemaVersion`、`bridgeVersion`、
+`protocolVersion`、源提交状态、实际部署目标、受管文件及 SHA-256，
+`manifestHash` 由排除自身后的规范化内容计算。Runtime 清单中的路径以
+Runtime 部署根为准，例如 `windows/scripts/chatgpt-bridge.mjs`，这就是
+runner 实际执行的文件路径。dirty worktree 会明确标为 `dirty-worktree`，
+文件哈希才是这次安装内容的真相。
+
+安装是“同卷 staging + 双目标切换 + journal 回滚”的事务式流程，不是假装
+两个目录能真正原子切换。任何版本、路径、文件集或哈希不一致都会在 Node/CDP
+启动前 fail closed；`discover`/`probe` 可以作为只读诊断继续运行。安装不会自动
+重启 Codex，跨目录切换或进程被强杀后的恢复边界见
+[全局安装与版本同步](docs/global-install.md)。

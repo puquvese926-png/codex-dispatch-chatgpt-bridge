@@ -1,6 +1,6 @@
 ---
 name: dispatch-chatgpt-bridge
-description: "Coordinate three bridge families across native Codex tasks and integrated ChatGPT: Codex subagents, durable Codex-to-Codex conversation transfer, Codex-to-GPT dispatch including image generation, and GPT-to-Codex CODEX_HANDOFF. Use when users mention 子智能体、Codex 对话转交、原生 delegation、GPT 聊天调度、桥接调度、多聊天并行、生图分发、结果回收、GPT 规划 Codex 执行、持续监听、任务交接、CODEX_HANDOFF or handoff watch."
+description: "Coordinate three bridge families across native Codex tasks and integrated ChatGPT: Codex subagents, durable Codex-to-Codex conversation transfer, Codex-to-GPT dispatch including image generation, and GPT-to-Codex CODEX_HANDOFF. Use when users mention 子智能体、子代理、Codex 对话转交、桥接对话、跨对话、跨 Codex 对话、原生 delegation、ChatGPT桥接、GPT 聊天调度、桥接调度、多聊天并行、生图分发、结果回收、GPT 规划 Codex 执行、持续监听、任务交接、CODEX_HANDOFF or handoff watch."
 ---
 
 # Dispatch ChatGPT Bridge
@@ -74,6 +74,19 @@ detached worker before Codex is closed. Treat the durable
 `%LOCALAPPDATA%\CodexChatGPTBridge\restart-report.json` as authoritative because
 the calling command can disappear with the old Codex window. Do not ask the user
 to reopen Codex manually while the report is still in a running state.
+
+Before any operational action, the installed Skill and selected Runtime must
+pass the deployment-manifest gate. The two canonical manifests must match in
+bridge/protocol version, target binding and managed-file SHA-256; Runtime paths
+are relative to its deployment root and therefore include `windows/scripts/...`.
+`plan`, `batch`, `resume`, `watch`, `approve` and `cleanup` fail closed before
+Node/CDP when the pair is missing, stale or inconsistent. `discover` and `probe`
+remain the only manifest-diagnostic exceptions. Install or upgrade with the
+repository `scripts/install-global.ps1`, verify with
+`scripts/verify-global-install.ps1`, and never bypass a failed gate with a
+project-private Runtime or manual manifest edit. A dirty source worktree is
+recorded as `dirty-worktree`; file hashes, not the HEAD label, identify the
+installed content.
 
 ## Dispatch workflow
 

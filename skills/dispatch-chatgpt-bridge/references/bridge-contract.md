@@ -335,3 +335,40 @@ when `-ExperimentalQuickChat` is explicitly selected and the current route plan
 allows an attempt. Existing user windows reduce capacity and are never closed or
 deleted by the bridge. The production default remains one serial main-surface
 job at a time.
+
+## Deployment version gate
+
+The repository is the distribution source. `bridge-version.json` is the only
+version metadata source and supplies `bridgeVersion` and `protocolVersion`.
+`install-global.ps1` creates one canonical `deployment-manifest.json` for both
+the Skill target and the Runtime target. Its manifest hash is computed from
+canonical content with `manifestHash` excluded, so either copy can verify it
+without a self-hash cycle. The manifest includes the schema/version fields,
+source commit status, normalized absolute target bindings, and the SHA-256 of
+every managed file. Skill inventory paths are relative to the Skill root;
+Runtime inventory paths are relative to the Runtime deployment root and include
+`windows/scripts/...`, which is the path the runner executes. The two manifests
+must be byte-equivalent after canonicalization. Extra files under either target
+are preserved and ignored; they are never used to satisfy a managed entry or
+overwritten as part of an upgrade.
+
+`sourceCommitStatus=exact-clean` means the recorded Git HEAD was read from a
+clean worktree. `dirty-worktree` means the HEAD is only provenance and the file
+hashes are authoritative; `unavailable` means Git could not provide a commit.
+No dirty tree is presented as an exact release.
+
+Installation is transactional but not two-directory atomic: it builds both
+trees in same-volume sibling staging paths, validates the complete pair, journals
+precise backup/target paths, switches the two targets, then removes owned
+residue. On failure it restores the old pair. A journal left by process death is
+recovered only when its transaction ID, parent, prefix, target and manifest are
+verified; unknown/corrupt residue is refused, not blindly deleted. The next
+install is the recovery command. It does not restart Codex.
+
+Before Node, CDP, UI mutation or business output, `run-bridge.ps1` requires the
+current Skill manifest and selected Runtime manifest to match in canonical hash,
+bridge/protocol version, target binding and managed-file hashes. `plan`,
+`batch`, `resume`, `watch`, `approve` and `cleanup` fail closed with zero Node/CDP
+calls when this gate fails. `discover` and `probe` are the only allowed
+manifest-diagnostic paths; an explicit `-Root` does not bypass the gate for
+mutating or operational actions.

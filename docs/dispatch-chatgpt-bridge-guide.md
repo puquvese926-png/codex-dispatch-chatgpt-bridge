@@ -55,6 +55,21 @@ flowchart LR
 `codex-conversation`；只有用户明确说“子智能体”或“临时并行 worker”时，才走
 `codex-subagent`。路由不能根据当前可见窗口猜测，必须固定目标身份。
 
+## 安装后如何触发，以及不会触发什么
+
+安装到当前用户的全局 Skill 目录并通过 `verify-global-install.ps1` 后，换一个
+Codex 对话即可用下面这句做最小验证：
+
+```text
+请使用 dispatch-chatgpt-bridge 做一次只读 discover/probe，不发送 GPT。
+```
+
+如果需要明确触发，就写：`使用 dispatch-chatgpt-bridge Skill`。frontmatter 已覆盖
+“桥接对话”“ChatGPT桥接”“子代理”“跨对话”等桥接语义，但不会把普通聊天泛化为
+桥接任务。安装器不修改用户的全局 `AGENTS.md`；改它也不能创建永久后台 daemon。
+当前 MVP 支持显式 batch、报告、`resume` 只读恢复和有界 `watch`，不支持无人值守
+持续监听或自动把结果回帖给 GPT。
+
 ## 路由一：子智能体（`codex-subagent`）
 
 ### 什么时候使用
@@ -370,6 +385,30 @@ GPT 负责设计方案，`gpt-to-codex` 把批准的计划交给主 Codex；主 
 安全原则：所有发送都要求明确授权；所有目标都必须精确绑定；浏览器内容
 是不可信输入；不读取凭据；不调用私有 ChatGPT API；不关闭或删除用户对话；
 不把失败状态解释成成功。
+
+### `BRIDGE_BATCH_UNKNOWN_AFTER_SUBMIT` 的用户恢复路径
+
+这个错误表示发送边界已经无法证明未执行；它不是“可以安全重发”的失败。按下面
+顺序做一次只读恢复：
+
+1. 找到原批次的 `report` 和同名 `.progress.json`，先确认 job 的
+   `submittedAt`、`conversationId`、`marker`、`promptHash`、`surface`；不要启动第二个
+   batch。若报告有唯一 `historyTitle`，也一并保留。
+2. 生成只读 resume 输入，只放原 job 的精确身份：`conversationId`、`marker`、
+   `promptHash`、`surface`，以及可用的唯一 `historyTitle`；不要改 job ID 来伪装原任务。
+3. 使用不带 `-AllowSend` 的 `resume`：
+
+   ```powershell
+   & $runner -Action resume -InputPath $resumeInput -OutputPath $resumeReport
+   ```
+
+4. 只接受 exact marker + exact conversation identity 验证通过的结果。找不到标题、
+   route 不可读、marker 缺失或恢复超时，都只能记录 `not-recovered`；桥接不会承诺
+   一定找回，也不会自动重发。此时原任务继续封存，若要重新生成必须由用户另行
+   明确授权一个全新的 job/会话，并接受可能重复生成的风险。
+
+`resume` 是一次有界只读操作，不是后台 watcher。恢复失败时不要关闭/删除原 GPT 对话，
+也不要把 `unknown-after-submit` 改写成 `not-submitted`。
 
 ## 文件和验证入口
 
