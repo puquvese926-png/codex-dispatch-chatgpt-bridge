@@ -23,10 +23,10 @@ function Assert-NoReparseAncestors {
         throw "$Label traverses a reparse point."
       }
       if ($item.PSIsContainer -eq $false) {
-        if (Test-SameBridgePath -Left $current -Right $Path) { return }
-        throw "$Label has a non-directory ancestor."
+        if (-not (Test-SameBridgePath -Left $current -Right $Path)) {
+          throw "$Label has a non-directory ancestor."
+        }
       }
-      return
     }
     $parent = Split-Path -Parent $current
     if ([string]::IsNullOrWhiteSpace($parent) -or (Test-SameBridgePath -Left $parent -Right $current)) {
@@ -82,6 +82,7 @@ function Read-BoundedText {
     [int64]$MaxBytes = 1048576,
     [string]$Label = 'file'
   )
+  Assert-NoReparseAncestors -Path $Path -Label $Label
   $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
   if ($item.PSIsContainer) { throw "$Label is not a file." }
   if ($item.Length -gt $MaxBytes) { throw "$Label exceeds the bounded read limit." }
@@ -91,6 +92,24 @@ function Read-BoundedText {
 function Test-LaunchProperty {
   param([Parameter(Mandatory = $true)][object]$Record, [Parameter(Mandatory = $true)][string]$Name)
   return $null -ne $Record.PSObject.Properties[$Name]
+}
+
+function Test-JsonInteger {
+  param([AllowNull()][object]$Value)
+  return $Value -is [byte] -or $Value -is [int16] -or $Value -is [int32] -or $Value -is [int64] -or
+    $Value -is [uint16] -or $Value -is [uint32] -or $Value -is [uint64]
+}
+
+function Assert-LaunchNullableString {
+  param([AllowNull()][object]$Value, [Parameter(Mandatory = $true)][string]$Label)
+  if ($null -ne $Value -and $Value -isnot [string]) { throw "launch record $Label must be a string or null." }
+}
+
+function Assert-LaunchString {
+  param([AllowNull()][object]$Value, [Parameter(Mandatory = $true)][string]$Label)
+  if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+    throw "launch record $Label must be a non-empty string."
+  }
 }
 
 function Assert-LaunchRecord {
@@ -107,13 +126,50 @@ function Assert-LaunchRecord {
   )
   $unknown = @($Record.PSObject.Properties.Name | Where-Object { $_ -notin $allowed })
   if ($unknown.Count -gt 0) { throw 'launch record contains an unknown field.' }
-  if ($Record.schemaVersion -ne 1) { throw 'launch record schemaVersion is invalid.' }
-  if ($Record.launchId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+  $required = @(
+    'schemaVersion', 'launchId', 'command', 'state', 'pid', 'processStartedAt',
+    'launchPath', 'reportPath', 'progressPath', 'stdoutPath', 'stderrPath',
+    'startedAt', 'updatedAt', 'authorization', 'inputPath', 'statePath',
+    'timeoutMs', 'pollMs', 'error', 'errorClass', 'wrapperPid'
+  )
+  $missing = @($required | Where-Object { -not (Test-LaunchProperty -Record $Record -Name $_) })
+  if ($missing.Count -gt 0) { throw 'launch record is missing a required field.' }
+  if (-not (Test-JsonInteger $Record.schemaVersion) -or [int64]$Record.schemaVersion -ne 1) {
+    throw 'launch record schemaVersion is invalid.'
+  }
+  Assert-LaunchString -Value $Record.launchId -Label 'launchId'
+  if ([string]$Record.launchId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
     throw 'launch record launchId is invalid.'
   }
+  Assert-LaunchString -Value $Record.command -Label 'command'
+  Assert-LaunchString -Value $Record.state -Label 'state'
   if ($Record.command -notin @('batch', 'resume', 'watch')) { throw 'launch record command is invalid.' }
-  if ($Record.state -notin @('starting', 'running', 'failed', 'complete')) {
+  if ($Record.state -notin @('starting', 'running', 'failed')) {
     throw 'launch record state is invalid.'
+  }
+  if (-not (Test-JsonInteger $Record.timeoutMs) -or [int64]$Record.timeoutMs -lt 5000 -or [int64]$Record.timeoutMs -gt 900000) {
+    throw 'launch record timeoutMs is invalid.'
+  }
+  if (-not (Test-JsonInteger $Record.pollMs) -or [int64]$Record.pollMs -lt 250 -or [int64]$Record.pollMs -gt 30000) {
+    throw 'launch record pollMs is invalid.'
+  }
+  foreach ($field in @('launchPath', 'reportPath', 'stdoutPath', 'stderrPath', 'startedAt', 'updatedAt', 'inputPath')) {
+    Assert-LaunchString -Value $Record.$field -Label $field
+  }
+  foreach ($field in @('statePath', 'processStartedAt', 'error', 'errorClass', 'wrapperPid', 'pid')) {
+    if ($field -in @('pid', 'wrapperPid')) { continue }
+    Assert-LaunchNullableString -Value $Record.$field -Label $field
+  }
+  if ($Record.command -eq 'batch') {
+    Assert-LaunchString -Value $Record.progressPath -Label 'progressPath'
+  } elseif ($null -ne $Record.progressPath) {
+    throw 'resume and watch launch records must not claim a progressPath.'
+  }
+  if ($Record.pid -isnot [int] -and $Record.pid -isnot [long] -and $null -ne $Record.pid) {
+    throw 'launch record pid must be an integer or null.'
+  }
+  if ($Record.wrapperPid -isnot [int] -and $Record.wrapperPid -isnot [long] -and $null -ne $Record.wrapperPid) {
+    throw 'launch record wrapperPid must be an integer or null.'
   }
   $normalizedRequested = Get-NormalizedBridgePath -Value $RequestedPath -Label 'LaunchPath'
   $normalizedLaunch = Get-NormalizedBridgePath -Value ([string]$Record.launchPath) -Label 'launchPath'
@@ -127,8 +183,12 @@ function Assert-LaunchRecord {
   if ([IO.Path]::GetFileName($launchDirectory) -ine ([string]$Record.launchId)) {
     throw 'launch record directory is not bound to launchId.'
   }
-  foreach ($field in @('reportPath', 'stdoutPath', 'stderrPath')) {
+  Assert-NoReparseAncestors -Path $normalizedLaunch -Label 'launchPath'
+  Assert-NoReparseAncestors -Path $launchDirectory -Label 'launch directory'
+  foreach ($field in @('reportPath', 'stdoutPath', 'stderrPath', 'inputPath', 'statePath')) {
+    if ($null -eq $Record.$field) { continue }
     $value = Get-NormalizedBridgePath -Value ([string]$Record.$field) -Label $field
+    Assert-NoReparseAncestors -Path $value -Label $field
     if (Test-SameBridgePath -Left $value -Right $normalizedLaunch) {
       throw "launch record $field collides with launchPath."
     }
@@ -146,13 +206,11 @@ function Assert-LaunchRecord {
     throw 'report path collides with launch logs.'
   }
   if ($Record.command -eq 'batch') {
-    if ([string]::IsNullOrWhiteSpace([string]$Record.progressPath)) { throw 'batch launch progressPath is missing.' }
     $progress = Get-NormalizedBridgePath -Value ([string]$Record.progressPath) -Label 'progressPath'
+    Assert-NoReparseAncestors -Path $progress -Label 'progressPath'
     if (-not (Test-SameBridgePath -Left $progress -Right ($report + '.progress.json'))) {
       throw 'batch launch progressPath is not derived from reportPath.'
     }
-  } elseif ($null -ne $Record.progressPath) {
-    throw 'resume and watch launch records must not claim a progressPath.'
   }
   foreach ($field in @('startedAt', 'updatedAt')) {
     try {
@@ -188,7 +246,7 @@ function Assert-LaunchRecord {
       throw 'launch record processStartedAt is invalid.'
     }
   }
-  if ($null -eq $Record.authorization -or $Record.authorization -is [Array]) {
+  if ($null -eq $Record.authorization -or $Record.authorization -is [Array] -or $Record.authorization -isnot [pscustomobject]) {
     throw 'launch record authorization is invalid.'
   }
   $authFields = @($Record.authorization.PSObject.Properties.Name)
@@ -196,13 +254,29 @@ function Assert-LaunchRecord {
       $Record.authorization.allowSend -isnot [bool] -or $Record.authorization.allowDelete -isnot [bool]) {
     throw 'launch record authorization is invalid.'
   }
-  if ($null -ne $Record.inputPath) { Get-NormalizedBridgePath -Value ([string]$Record.inputPath) -Label 'inputPath' | Out-Null }
-  if ($null -ne $Record.statePath) { Get-NormalizedBridgePath -Value ([string]$Record.statePath) -Label 'statePath' | Out-Null }
   if ($null -ne $Record.error -and ([string]$Record.error).Length -gt 1000) {
     throw 'launch record error is too long.'
   }
   if ($null -ne $Record.errorClass -and $Record.errorClass -notin @('not-created', 'created-but-unattributed')) {
     throw 'launch record errorClass is invalid.'
+  }
+  if (($null -eq $Record.pid) -xor ($null -eq $Record.processStartedAt)) {
+    throw 'launch record pid and processStartedAt must be both null or both present.'
+  }
+  if ($Record.state -eq 'running' -and $null -eq $Record.pid) {
+    throw 'running launch record must identify a process.'
+  }
+  if ($Record.state -eq 'starting' -and $null -ne $Record.pid) {
+    throw 'starting launch record must not claim an attributed final process.'
+  }
+  if ($Record.state -eq 'failed' -and $Record.errorClass -ne 'not-created') {
+    throw 'failed launch record must explicitly prove not-created.'
+  }
+  if ($Record.errorClass -eq 'not-created' -and ($Record.state -ne 'failed' -or $null -ne $Record.pid -or $null -ne $Record.wrapperPid)) {
+    throw 'not-created launch record has an invalid state combination.'
+  }
+  if ($Record.errorClass -eq 'created-but-unattributed' -and ($Record.state -ne 'starting' -or $null -eq $Record.wrapperPid -or $null -ne $Record.pid)) {
+    throw 'created-but-unattributed launch record has an invalid state combination.'
   }
   return $Record
 }
@@ -222,16 +296,24 @@ function Read-LaunchRecord {
 function Get-AmbiguousJobSummaries {
   param([AllowNull()][object]$Jobs)
   $ambiguous = @()
+  $seen = @{}
   foreach ($job in @($Jobs)) {
     if ($null -eq $job) { continue }
     $status = [string]$job.status
     if ($status -notin @('unknown-after-submit', 'timeout-after-submit', 'unknown')) { continue }
+    if ($job.id -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$job.id)) { continue }
+    if ($null -ne $job.marker -and $job.marker -isnot [string]) { continue }
+    $marker = if ($null -ne $job.marker) { [string]$job.marker } else { $null }
+    $key = '{0}|{1}|{2}' -f [string]$job.id, $status, $marker
+    if ($seen.ContainsKey($key)) { continue }
+    $seen[$key] = $true
     $ambiguous += [ordered]@{
-      id = if ($job.id) { [string]$job.id } else { $null }
+      id = [string]$job.id
       status = $status
-      conversationId = if ($job.conversationId) { [string]$job.conversationId } elseif ($job.expectedConversationId) { [string]$job.expectedConversationId } else { $null }
-      marker = if ($job.marker) { [string]$job.marker } else { $null }
-      historyTitle = if ($job.historyTitle) { [string]$job.historyTitle } else { $null }
+      conversationId = if ($job.conversationId -is [string]) { [string]$job.conversationId } else { $null }
+      expectedConversationId = if ($job.expectedConversationId -is [string]) { [string]$job.expectedConversationId } else { $null }
+      marker = $marker
+      historyTitle = if ($job.historyTitle -is [string]) { [string]$job.historyTitle } else { $null }
     }
   }
   return @($ambiguous)
@@ -257,7 +339,8 @@ function New-ArtifactReadResult {
 function Get-ReportSummary {
   param(
     [Parameter(Mandatory = $true)][string]$Path,
-    [Parameter(Mandatory = $true)][string]$Command
+    [Parameter(Mandatory = $true)][string]$Command,
+    [Parameter(Mandatory = $true)][string]$LaunchId
   )
   if (-not (Test-Path -LiteralPath $Path)) {
     return New-ArtifactReadResult -Exists $false -Valid $false -Corrupt $false -Summary $null -ErrorCode $null
@@ -265,11 +348,16 @@ function Get-ReportSummary {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
     return New-ArtifactReadResult -Exists $true -Valid $false -Corrupt $true -Summary $null -ErrorCode 'report-corrupt'
   }
+  $errorCode = 'report-corrupt'
   try {
     $text = Read-BoundedText -Path $Path -MaxBytes 16777216 -Label 'bridge report'
     $value = $text | ConvertFrom-Json
     if ($null -eq $value -or $value -is [Array] -or $value.pass -isnot [bool] -or [string]$value.command -ne $Command) {
       throw 'invalid report shape'
+    }
+    if ($value.launchId -isnot [string] -or [string]$value.launchId -ne $LaunchId) {
+      $errorCode = 'report-rebound'
+      throw 'report launch identity does not match.'
     }
     $summary = [ordered]@{
       pass = [bool]$value.pass
@@ -282,23 +370,31 @@ function Get-ReportSummary {
     }
     return New-ArtifactReadResult -Exists $true -Valid $true -Corrupt $false -Summary $summary -ErrorCode $null
   } catch {
-    return New-ArtifactReadResult -Exists $true -Valid $false -Corrupt $true -Summary $null -ErrorCode 'report-corrupt'
+    return New-ArtifactReadResult -Exists $true -Valid $false -Corrupt $true -Summary $null -ErrorCode $errorCode
   }
 }
 
 function Get-ProgressSummary {
-  param([Parameter(Mandatory = $true)][string]$Path)
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$LaunchId
+  )
   if (-not (Test-Path -LiteralPath $Path)) {
     return New-ArtifactReadResult -Exists $false -Valid $false -Corrupt $false -Summary $null -ErrorCode $null
   }
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
     return New-ArtifactReadResult -Exists $true -Valid $false -Corrupt $true -Summary $null -ErrorCode 'progress-corrupt'
   }
+  $errorCode = 'progress-corrupt'
   try {
     $text = Read-BoundedText -Path $Path -MaxBytes 8388608 -Label 'batch progress'
     $value = $text | ConvertFrom-Json
     if ($null -eq $value -or $value -is [Array] -or [string]$value.command -ne 'batch') {
       throw 'invalid progress shape'
+    }
+    if ($value.launchId -isnot [string] -or [string]$value.launchId -ne $LaunchId) {
+      $errorCode = 'progress-rebound'
+      throw 'progress launch identity does not match.'
     }
     $ambiguous = @(Get-AmbiguousJobSummaries -Jobs $value.jobs)
     $summary = [ordered]@{
@@ -311,7 +407,7 @@ function Get-ProgressSummary {
     }
     return New-ArtifactReadResult -Exists $true -Valid $true -Corrupt $false -Summary $summary -ErrorCode $null
   } catch {
-    return New-ArtifactReadResult -Exists $true -Valid $false -Corrupt $true -Summary $null -ErrorCode 'progress-corrupt'
+    return New-ArtifactReadResult -Exists $true -Valid $false -Corrupt $true -Summary $null -ErrorCode $errorCode
   }
 }
 
@@ -335,9 +431,9 @@ function Test-LaunchProcessAlive {
 function Get-LaunchStatus {
   param([Parameter(Mandatory = $true)][string]$Path)
   $record = Read-LaunchRecord -Path $Path
-  $reportResult = Get-ReportSummary -Path ([string]$record.reportPath) -Command ([string]$record.command)
+  $reportResult = Get-ReportSummary -Path ([string]$record.reportPath) -Command ([string]$record.command) -LaunchId ([string]$record.launchId)
   $progressResult = if ($record.command -eq 'batch') {
-    Get-ProgressSummary -Path ([string]$record.progressPath)
+    Get-ProgressSummary -Path ([string]$record.progressPath) -LaunchId ([string]$record.launchId)
   } else {
     New-ArtifactReadResult -Exists $false -Valid $false -Corrupt $false -Summary $null -ErrorCode $null
   }
@@ -351,8 +447,10 @@ function Get-LaunchStatus {
   } else { $progress }
 
   $ambiguous = @()
-  if ($null -ne $report) { $ambiguous += @($report.ambiguousJobs) }
-  if ($null -ne $progress) { $ambiguous += @($progress.ambiguousJobs) }
+  $ambiguous = @(Get-AmbiguousJobSummaries -Jobs @(
+    if ($null -ne $report) { @($report.ambiguousJobs) }
+    if ($null -ne $progress) { @($progress.ambiguousJobs) }
+  ))
   $recoveryRequired = $ambiguous.Count -gt 0
 
   $base = [ordered]@{
@@ -386,6 +484,13 @@ function Get-LaunchStatus {
   if ($reportResult.corrupt) {
     $base.reason = $reportResult.error
     $base.reportCorrupt = $true
+    if ($reportResult.error -eq 'report-rebound') { $base.reportRebound = $true }
+    return $base
+  }
+  if ($progressResult.corrupt -and $progressResult.error -eq 'progress-rebound') {
+    $base.reason = 'progress-rebound'
+    $base.progressCorrupt = $true
+    $base.progressRebound = $true
     return $base
   }
   if ($null -ne $report) {
@@ -406,8 +511,14 @@ function Get-LaunchStatus {
   if ($progressResult.corrupt) {
     $base.reason = $progressResult.error
     $base.progressCorrupt = $true
-  } elseif ($record.state -eq 'failed') {
+  } elseif ($record.state -eq 'failed' -and $record.errorClass -eq 'not-created') {
     $base.reason = 'launch-failed'
+    $base.retryAllowed = $true
+  } else {
+    $base.state = 'unknown-after-launch'
+    $base.reason = 'launch-outcome-unknown'
+    $base.recoveryRequired = $true
+    $base.retryAllowed = $false
   }
   return $base
 }
@@ -438,70 +549,149 @@ function Get-ProcessStartedAtText {
   return ([DateTimeOffset]$Process.StartTime.ToUniversalTime()).ToString('o')
 }
 
-function ConvertTo-DetachedArgumentString {
-  param([Parameter(Mandatory = $true)][object[]]$Arguments)
-  return (($Arguments | ForEach-Object {
-    $value = [string]$_
-    '"' + $value.Replace('"', '\"') + '"'
-  }) -join ' ')
+function ConvertTo-WindowsProcessArgument {
+  param([Parameter(Mandatory = $true)][string]$Value)
+  $builder = New-Object System.Text.StringBuilder
+  [void]$builder.Append('"')
+  $backslashes = 0
+  foreach ($character in $Value.ToCharArray()) {
+    if ($character -eq [char]92) {
+      $backslashes++
+      continue
+    }
+    if ($character -eq '"') {
+      for ($index = 0; $index -lt ($backslashes * 2 + 1); $index++) { [void]$builder.Append([char]92) }
+      [void]$builder.Append('"')
+      $backslashes = 0
+      continue
+    }
+    for ($index = 0; $index -lt $backslashes; $index++) { [void]$builder.Append([char]92) }
+    [void]$builder.Append($character)
+    $backslashes = 0
+  }
+  for ($index = 0; $index -lt ($backslashes * 2); $index++) { [void]$builder.Append([char]92) }
+  [void]$builder.Append('"')
+  return $builder.ToString()
+}
+
+function ConvertTo-PowerShellLiteral {
+  param([Parameter(Mandatory = $true)][string]$Value)
+  return "'" + $Value.Replace("'", "''") + "'"
 }
 
 function Start-DetachedNodeWorker {
   param(
     [Parameter(Mandatory = $true)][string]$NodePath,
-    [Parameter(Mandatory = $true)][string]$ArgumentString,
+    [Parameter(Mandatory = $true)][object[]]$Arguments,
     [Parameter(Mandatory = $true)][string]$LaunchToken,
     [Parameter(Mandatory = $true)][string]$StdoutPath,
     [Parameter(Mandatory = $true)][string]$StderrPath,
     [Parameter(Mandatory = $true)][bool]$SimulateAttributionFailure
   )
-  $cmdPath = Join-Path $env:WINDIR 'System32\cmd.exe'
-  $nodeValue = '"' + $NodePath.Replace('"', '\"') + '"'
-  $commandLine = '"' + $cmdPath.Replace('"', '\"') + '" /d /s /c "' +
-    $nodeValue + ' ' + $ArgumentString +
-    ' 1>"' + $StdoutPath.Replace('"', '\"') + '" 2>"' + $StderrPath.Replace('"', '\"') + '""'
+  $workerScript = Join-Path $PSScriptRoot 'detached-node-worker.ps1'
+  if (-not (Test-Path -LiteralPath $workerScript -PathType Leaf)) {
+    throw 'detached worker script is missing.'
+  }
+  $launchDirectory = [IO.Path]::GetDirectoryName($StdoutPath)
+  $configPath = Join-Path $launchDirectory 'worker-config.json'
+  $handshakePath = Join-Path $launchDirectory 'worker-handshake.json'
+  $workerErrorPath = Join-Path $launchDirectory 'worker-error.json'
+  $workerStartedPath = Join-Path $launchDirectory 'worker-started.json'
+  $workerStdoutPath = Join-Path $launchDirectory 'worker-stdout.log'
+  $workerStderrPath = Join-Path $launchDirectory 'worker-stderr.log'
+  Assert-NoReparseAncestors -Path $configPath -Label 'worker config'
+  Assert-NoReparseAncestors -Path $handshakePath -Label 'worker handshake'
+  Assert-NoReparseAncestors -Path $workerErrorPath -Label 'worker error'
+  Assert-NoReparseAncestors -Path $workerStartedPath -Label 'worker started marker'
+  Assert-NoReparseAncestors -Path $workerStdoutPath -Label 'worker stdout'
+  Assert-NoReparseAncestors -Path $workerStderrPath -Label 'worker stderr'
+  Write-LaunchRecordAtomically -Path $configPath -Record ([ordered]@{
+    schemaVersion = 1
+    launchId = $LaunchToken
+    nodePath = $NodePath
+    arguments = @($Arguments | ForEach-Object { [string]$_ })
+    stdoutPath = $StdoutPath
+    stderrPath = $StderrPath
+    handshakePath = $handshakePath
+    workerErrorPath = $workerErrorPath
+    workerStartedPath = $workerStartedPath
+    workerStdoutPath = $workerStdoutPath
+    workerStderrPath = $workerStderrPath
+  })
+  # Win32_Process.Create is used for the final Node process itself. This
+  # removes the unreliable PowerShell trampoline/argv boundary: the PID
+  # returned by CIM is the PID we monitor and the launch token is on that
+  # exact command line. The strict worker script remains available for direct
+  # validation tests, but is not a second attribution point in production.
+  foreach ($logPath in @($workerStdoutPath, $workerStderrPath)) {
+    if (-not (Test-Path -LiteralPath $logPath -PathType Leaf)) {
+      [IO.File]::WriteAllText($logPath, '')
+    }
+  }
+  $nodeCommandLine = (ConvertTo-WindowsProcessArgument -Value $NodePath) + ' ' +
+    ((@($Arguments | ForEach-Object {
+      ConvertTo-WindowsProcessArgument -Value ([string]$_)
+    })) -join ' ')
   try {
-    $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine } -ErrorAction Stop
+    $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $nodeCommandLine } -ErrorAction Stop
   } catch {
-    $errorRecord = New-Object System.Exception('detached worker was not created.')
+    $errorRecord = New-Object System.Exception('detached Node was not created.')
     $errorRecord.Data['launchClass'] = 'not-created'
     throw $errorRecord
   }
   if ($null -eq $created -or [int]$created.ReturnValue -ne 0) {
-    $errorRecord = New-Object System.Exception('detached worker was not created.')
+    $errorRecord = New-Object System.Exception('detached Node was not created.')
     $errorRecord.Data['launchClass'] = 'not-created'
     throw $errorRecord
   }
   $wrapperPid = [int]$created.ProcessId
-  $nodeName = [IO.Path]::GetFileName($NodePath)
-  if ($SimulateAttributionFailure) {
-    $errorRecord = New-Object System.Exception('detached Node process was created but could not be attributed.')
-    $errorRecord.Data['launchClass'] = 'created-but-unattributed'
-    $errorRecord.Data['wrapperPid'] = [int]$created.ProcessId
-    throw $errorRecord
-  }
-  $deadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
-  while ([DateTimeOffset]::UtcNow -lt $deadline) {
-    $processes = @(Get-CimInstance Win32_Process -Filter ("Name = '{0}'" -f $nodeName) -ErrorAction SilentlyContinue)
-    foreach ($process in $processes) {
-      if ($process.CommandLine -and
-          $process.CommandLine.IndexOf($LaunchToken, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-        try {
-          $startedAt = Get-ProcessStartedAtText -Process (Get-Process -Id ([int]$process.ProcessId) -ErrorAction Stop)
-          return [ordered]@{
-            pid = [int]$process.ProcessId
-            processStartedAt = $startedAt
-            wrapperPid = $wrapperPid
-          }
-        } catch {}
-      }
+  try {
+    if ($wrapperPid -le 0) { throw 'detached Node creation returned no attributable PID.' }
+    Write-LaunchRecordAtomically -Path $workerStartedPath -Record ([ordered]@{
+      schemaVersion = 1
+      state = 'created'
+      launchId = $LaunchToken
+      pid = $wrapperPid
+    })
+    if ($SimulateAttributionFailure) {
+      $errorRecord = New-Object System.Exception('detached Node process was created but attribution was intentionally withheld.')
+      $errorRecord.Data['launchClass'] = 'created-but-unattributed'
+      $errorRecord.Data['wrapperPid'] = $wrapperPid
+      throw $errorRecord
     }
-    Start-Sleep -Milliseconds 100
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
+    while ([DateTimeOffset]::UtcNow -lt $deadline) {
+      try {
+        $process = Get-Process -Id $wrapperPid -ErrorAction Stop
+        $processStartedAt = Get-ProcessStartedAtText -Process $process
+        Write-LaunchRecordAtomically -Path $handshakePath -Record ([ordered]@{
+          schemaVersion = 1
+          launchId = $LaunchToken
+          pid = $wrapperPid
+          processStartedAt = $processStartedAt
+          workerPid = $PID
+        })
+        return [ordered]@{
+          pid = $wrapperPid
+          processStartedAt = $processStartedAt
+          wrapperPid = $wrapperPid
+        }
+      } catch {
+        # The process may need one short scheduling turn before Get-Process can
+        # resolve its start time. A missing attribution remains ambiguous.
+      }
+      Start-Sleep -Milliseconds 100
+    }
+    throw 'detached Node process was created but could not be attributed.'
+  } catch {
+    if ($null -eq $_.Exception.Data -or -not $_.Exception.Data.Contains('launchClass')) {
+      $_.Exception.Data['launchClass'] = 'created-but-unattributed'
+    }
+    if ($null -eq $_.Exception.Data -or -not $_.Exception.Data.Contains('wrapperPid')) {
+      $_.Exception.Data['wrapperPid'] = $wrapperPid
+    }
+    throw
   }
-  $errorRecord = New-Object System.Exception('detached Node process was created but could not be attributed.')
-  $errorRecord.Data['launchClass'] = 'created-but-unattributed'
-  $errorRecord.Data['wrapperPid'] = $wrapperPid
-  throw $errorRecord
 }
 
 
@@ -638,7 +828,7 @@ function Start-DetachedLaunch {
     $launchArguments = @($Arguments + @('--bridge-launch-token', $launchId))
     $workerParameters = @{
       NodePath = $NodePath
-      ArgumentString = ConvertTo-DetachedArgumentString -Arguments $launchArguments
+      Arguments = $launchArguments
       LaunchToken = $launchId
       StdoutPath = $stdoutPath
       StderrPath = $stderrPath
@@ -673,7 +863,11 @@ function Start-DetachedLaunch {
         $record.wrapperPid = [int]$child.wrapperPid
       }
       $record.state = 'starting'
-      $record.error = 'detached Node was created but final PID attribution failed; do not retry automatically.'
+      $record.error = if ($message -match 'failed before final Node handshake') {
+        'detached worker was created but failed before final Node handshake; do not retry automatically.'
+      } else {
+        'detached Node was created but final PID attribution failed; do not retry automatically.'
+      }
       Write-LaunchRecordAtomically -Path $launchPath -Record $record
       return Convert-LaunchRecordToPublic -Record $record -Pass $false
     }

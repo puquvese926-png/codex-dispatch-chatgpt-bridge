@@ -372,6 +372,7 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: null,
     output: null,
     statePath: null,
+    launchToken: null,
     experimentalQuickChat: false,
     timeoutMs: 600000,
   });
@@ -389,6 +390,7 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\jobs\\batch.json",
     output: "C:\\jobs\\report.json",
     statePath: null,
+    launchToken: null,
     experimentalQuickChat: false,
     timeoutMs: 240000,
   });
@@ -408,6 +410,7 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\jobs\\resume.json",
     output: "C:\\jobs\\recovered.json",
     statePath: null,
+    launchToken: null,
     experimentalQuickChat: false,
     timeoutMs: 600000,
   });
@@ -426,6 +429,7 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\state\\conversations.json",
     output: "C:\\reports\\cleanup.json",
     statePath: null,
+    launchToken: null,
     experimentalQuickChat: false,
     timeoutMs: 600000,
   });
@@ -445,6 +449,7 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\handoff\\watch.json",
     output: "C:\\handoff\\report.json",
     statePath: null,
+    launchToken: null,
     experimentalQuickChat: false,
     timeoutMs: 5000,
     pollMs: 1000,
@@ -464,6 +469,7 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\handoff\\approve.json",
     output: "C:\\handoff\\approve-report.json",
     statePath: null,
+    launchToken: null,
     experimentalQuickChat: false,
     timeoutMs: 600000,
   });
@@ -481,6 +487,7 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\jobs\\batch.json",
     output: "C:\\jobs\\plan.json",
     statePath: null,
+    launchToken: null,
     experimentalQuickChat: false,
     timeoutMs: 600000,
   });
@@ -497,6 +504,18 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     "--experimental-quick-chat",
     "--allow-send",
   ]).experimentalQuickChat, true);
+  const launchToken = "11111111-1111-4111-8111-111111111111";
+  assert.equal(parseBridgeArgs([
+    "batch",
+    "--input", "C:\\jobs\\batch.json",
+    "--output", "C:\\jobs\\report.json",
+    "--allow-send",
+    "--bridge-launch-token", launchToken,
+  ]).launchToken, launchToken);
+  assert.throws(() => parseBridgeArgs([
+    "batch", "--input", "C:\\jobs\\batch.json", "--output", "C:\\jobs\\report.json",
+    "--allow-send", "--bridge-launch-token", "not-a-uuid",
+  ]), /launch token.*UUID/i);
   assert.throws(() => parseBridgeArgs([
     "resume",
     "--input", "C:\\jobs\\resume.json",

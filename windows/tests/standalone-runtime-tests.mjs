@@ -140,6 +140,8 @@ function writeRunningLaunchFixture(root, command = "batch") {
     timeoutMs: 600000,
     pollMs: 5000,
     error: null,
+    errorClass: null,
+    wrapperPid: null,
   };
   writeFileSync(launchPath, JSON.stringify(record), "utf8");
   return { launchPath, reportPath, record };
@@ -156,7 +158,12 @@ function canonicalize(value) {
 function manifestHash(manifest) {
   const { manifestHash: ignored, ...withoutHash } = manifest;
   return crypto.createHash("sha256")
-    .update(JSON.stringify(canonicalize(withoutHash)), "utf8")
+    // PowerShell ConvertTo-Json escapes these HTML-sensitive characters;
+    // keep the test-side recomputation byte-identical to the installer.
+    .update(JSON.stringify(canonicalize(withoutHash))
+      .replaceAll("&", "\\u0026")
+      .replaceAll("<", "\\u003c")
+      .replaceAll(">", "\\u003e"), "utf8")
     .digest("hex");
 }
 
@@ -913,8 +920,10 @@ function makeDetachedReportRuntime(root, delayMs = 250) {
     "const command = args[0];",
     "const outputIndex = args.indexOf('--output');",
     "const output = outputIndex >= 0 ? args[outputIndex + 1] : null;",
+    "const tokenIndex = args.indexOf('--bridge-launch-token');",
+    "const launchId = tokenIndex >= 0 ? args[tokenIndex + 1] : null;",
     "setTimeout(() => {",
-    "  if (output) fs.writeFileSync(output, JSON.stringify({ pass: true, command, jobs: [] }));",
+    "  if (output) fs.writeFileSync(output, JSON.stringify({ pass: true, command, launchId, jobs: [] }));",
     "  process.exit(0);",
     "}, " + String(delayMs) + ");",
     "",
@@ -1115,6 +1124,109 @@ test("launch validation fails closed for path rebound, corrupt and oversized han
   }
 });
 
+test("status rejects launch schema type and state combinations before Node", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-schema-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const cases = [
+      { name: "schema-type", mutate: (record) => { record.schemaVersion = "1"; } },
+      { name: "command-type", mutate: (record) => { record.command = 1; } },
+      { name: "timeout-type", mutate: (record) => { record.timeoutMs = "600000"; } },
+      { name: "pid-type", mutate: (record) => { record.pid = String(record.pid); } },
+      { name: "complete-record", mutate: (record) => { record.state = "complete"; } },
+      { name: "failed-without-not-created", mutate: (record) => { record.state = "failed"; } },
+      { name: "not-created-starting", mutate: (record) => { record.state = "starting"; record.pid = null; record.processStartedAt = null; record.errorClass = "not-created"; } },
+      { name: "unattributed-without-wrapper", mutate: (record) => { record.state = "starting"; record.pid = null; record.processStartedAt = null; record.errorClass = "created-but-unattributed"; record.wrapperPid = null; } },
+    ];
+    for (const testCase of cases) {
+      const caseRoot = path.join(temporaryRoot, testCase.name);
+      mkdirSync(caseRoot, { recursive: true });
+      const fixture = writeRunningLaunchFixture(caseRoot);
+      const record = { ...fixture.record };
+      testCase.mutate(record);
+      writeFileSync(fixture.launchPath, JSON.stringify(record), "utf8");
+      const marker = path.join(caseRoot, "node-called.txt");
+      const fakeBin = makeFakeNode(caseRoot, marker);
+      const result = runPowerShell(runner, ["-Action", "status", "-LaunchPath", fixture.launchPath], {
+        PATH: `${fakeBin};${process.env.PATH}`,
+      });
+      assert.notEqual(result.status, 0, testCase.name);
+      assert.match(result.stderr + result.stdout, /launch|schema|state|invalid|type/i, testCase.name);
+      assert.equal(existsSync(marker), false, testCase.name);
+    }
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("starting launch without a durable not-created proof is unknown after launch", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-crash-fixture-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    const fixture = writeRunningLaunchFixture(temporaryRoot);
+    const record = { ...fixture.record, state: "starting", pid: null, processStartedAt: null };
+    writeFileSync(fixture.launchPath, JSON.stringify(record), "utf8");
+    const marker = path.join(temporaryRoot, "node-called.txt");
+    const fakeBin = makeFakeNode(temporaryRoot, marker);
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const result = runPowerShell(runner, ["-Action", "status", "-LaunchPath", fixture.launchPath], {
+      PATH: `${fakeBin};${process.env.PATH}`,
+    });
+    assertPowerShellSuccess(result);
+    const status = JSON.parse(result.stdout);
+    assert.equal(status.state, "unknown-after-launch");
+    assert.equal(status.reason, "launch-outcome-unknown");
+    assert.equal(status.retryAllowed, false);
+    assert.equal(status.recoveryRequired, true);
+    assert.equal(existsSync(marker), false);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("status rejects junction parents for existing files and missing leaves", (t) => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-reparse-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    const outside = path.join(temporaryRoot, "outside");
+    const junction = path.join(temporaryRoot, "junction-parent");
+    mkdirSync(path.join(outside, "existing-child"), { recursive: true });
+    try {
+      symlinkSync(outside, junction, "junction");
+    } catch (error) {
+      t.skip(`junction creation is unavailable: ${error.code || error.message}`);
+      return;
+    }
+    const fixture = writeRunningLaunchFixture(outside, "resume");
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const aliasedLaunch = path.join(junction, "launches", path.basename(path.dirname(fixture.launchPath)), "launch.json");
+    let result = runPowerShell(runner, ["-Action", "status", "-LaunchPath", aliasedLaunch]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr + result.stdout, /reparse|junction|launch/i);
+
+    const record = { ...fixture.record, reportPath: path.join(junction, "report.json") };
+    writeFileSync(fixture.launchPath, JSON.stringify(record), "utf8");
+    writeFileSync(record.reportPath, JSON.stringify({ pass: true, command: "resume", launchId: fixture.record.launchId }), "utf8");
+    result = runPowerShell(runner, ["-Action", "status", "-LaunchPath", fixture.launchPath]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr + result.stdout, /reparse|junction|report/i);
+
+    const missingLeaf = path.join(junction, "existing-child", "missing-leaf", "launch.json");
+    result = runPowerShell(runner, ["-Action", "status", "-LaunchPath", missingLeaf]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr + result.stdout, /reparse|junction|launch/i);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("detached launch keeps legacy output log paths from overwriting input", () => {
   const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-log-isolation-"));
   let childPid = null;
@@ -1179,6 +1291,8 @@ test("wait returns a bounded timeout without resume, resend or launch-record mut
       timeoutMs: 600000,
       pollMs: 5000,
       error: null,
+      errorClass: null,
+      wrapperPid: null,
     };
     writeFileSync(launchPath, JSON.stringify(beforeRecord), "utf8");
     const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
@@ -1196,7 +1310,7 @@ test("wait returns a bounded timeout without resume, resend or launch-record mut
   }
 });
 
-test("status rejects a reused PID start time as failed no-report", () => {
+test("status rejects a reused PID start time as unknown after launch", () => {
   const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-pid-"));
   try {
     const skills = path.join(temporaryRoot, "skills");
@@ -1210,8 +1324,10 @@ test("status rejects a reused PID start time as failed no-report", () => {
     const status = runPowerShell(runner, ["-Action", "status", "-LaunchPath", fixture.launchPath]);
     assertPowerShellSuccess(status);
     const result = JSON.parse(status.stdout);
-    assert.equal(result.state, "failed");
-    assert.equal(result.reason, "no-report");
+    assert.equal(result.state, "unknown-after-launch");
+    assert.equal(result.reason, "launch-outcome-unknown");
+    assert.equal(result.retryAllowed, false);
+    assert.equal(result.recoveryRequired, true);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
@@ -1248,6 +1364,49 @@ test("status exposes corrupt report and progress instead of treating them as abs
     assert.equal(progressResult.progressCorrupt, true);
     assert.equal(progressResult.progress.error, "progress-corrupt");
     assert.doesNotMatch(progressStatus.stdout, /not-json/);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("status rejects rebound report and progress identities without exposing their contents", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-rebound-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const reportFixture = writeRunningLaunchFixture(temporaryRoot, "resume");
+    writeFileSync(reportFixture.record.reportPath, JSON.stringify({
+      pass: true,
+      command: "resume",
+      launchId: crypto.randomUUID(),
+      secret: "DO_NOT_READ_REBOUND_REPORT",
+    }), "utf8");
+    const reportStatus = runPowerShell(runner, ["-Action", "status", "-LaunchPath", reportFixture.launchPath]);
+    assertPowerShellSuccess(reportStatus);
+    const reportResult = JSON.parse(reportStatus.stdout);
+    assert.equal(reportResult.state, "failed");
+    assert.equal(reportResult.reason, "report-rebound");
+    assert.equal(reportResult.reportRebound, true);
+    assert.doesNotMatch(reportStatus.stdout, /DO_NOT_READ_REBOUND_REPORT/);
+
+    const progressRoot = path.join(temporaryRoot, "progress");
+    mkdirSync(progressRoot, { recursive: true });
+    const progressFixture = writeRunningLaunchFixture(progressRoot, "batch");
+    writeFileSync(progressFixture.record.progressPath, JSON.stringify({
+      command: "batch",
+      launchId: crypto.randomUUID(),
+      secret: "DO_NOT_READ_REBOUND_PROGRESS",
+      jobs: [],
+    }), "utf8");
+    const progressStatus = runPowerShell(runner, ["-Action", "status", "-LaunchPath", progressFixture.launchPath]);
+    assertPowerShellSuccess(progressStatus);
+    const progressResult = JSON.parse(progressStatus.stdout);
+    assert.equal(progressResult.state, "failed");
+    assert.equal(progressResult.reason, "progress-rebound");
+    assert.equal(progressResult.progressRebound, true);
+    assert.doesNotMatch(progressStatus.stdout, /DO_NOT_READ_REBOUND_PROGRESS/);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
@@ -1348,6 +1507,7 @@ test("status exposes ambiguous batch recovery facts without constructing a resen
     writeFileSync(fixture.record.progressPath, JSON.stringify({
       schemaVersion: 1,
       command: "batch",
+      launchId: fixture.record.launchId,
       state: "running",
       runId: "run-ambiguous",
       requestedJobs: 1,
@@ -1357,6 +1517,7 @@ test("status exposes ambiguous batch recovery facts without constructing a resen
         id: "shot-1",
         status: "unknown-after-submit",
         conversationId: "local-chatgpt:11111111-1111-4111-8111-111111111111",
+        expectedConversationId: "local-chatgpt:22222222-2222-4222-8222-222222222222",
         marker: "CODEX-BRIDGE-run-ambiguous-shot-1",
         historyTitle: "test title",
       }],
@@ -1367,6 +1528,7 @@ test("status exposes ambiguous batch recovery facts without constructing a resen
     assert.equal(result.state, "running");
     assert.equal(result.recoveryRequired, true);
     assert.equal(result.ambiguousJobs[0].conversationId, "local-chatgpt:11111111-1111-4111-8111-111111111111");
+    assert.equal(result.ambiguousJobs[0].expectedConversationId, "local-chatgpt:22222222-2222-4222-8222-222222222222");
     assert.equal(result.ambiguousJobs[0].marker, "CODEX-BRIDGE-run-ambiguous-shot-1");
     assert.equal(result.ambiguousJobs[0].historyTitle, "test title");
     assert.equal(result.ambiguousJobs[0].prompt, undefined);
@@ -1411,4 +1573,91 @@ test("two concurrent detached launches with one output path still keep token-bou
     for (const pid of childPids) stopProcess(pid);
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
+});
+
+test("detached worker preserves spaces ampersands and percent signs without cmd expansion", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-quoting-"));
+  let childPid = null;
+  let wrapperPid = null;
+  try {
+    const specialRoot = path.join(temporaryRoot, "桥接 & percent %");
+    const skills = path.join(specialRoot, "skills & %");
+    const runtime = path.join(specialRoot, "runtime & %");
+    const launchRoot = path.join(specialRoot, "launches & %");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    makeDetachedReportRuntime(runtime, 1200);
+    refreshDeployedRuntimeEntry(skills, runtime);
+    const inputPath = path.join(specialRoot, "input & percent %.json");
+    const outputPath = path.join(specialRoot, "report & percent %.json");
+    mkdirSync(specialRoot, { recursive: true });
+    writeFileSync(inputPath, "{}\n", "utf8");
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const launched = runDetachedRunner(runner, runtime, "batch", inputPath, outputPath, launchRoot, ["-AllowSend"]);
+    assertPowerShellSuccess(launched);
+    const launch = JSON.parse(launched.stdout);
+    childPid = launch.pid;
+    wrapperPid = launch.wrapperPid;
+    const waited = runPowerShell(runner, [
+      "-Action", "wait", "-LaunchPath", launch.launchPath, "-TimeoutMs", "15000", "-PollMs", "250",
+    ]);
+    assertPowerShellSuccess(waited);
+    const status = JSON.parse(waited.stdout);
+    assert.equal(status.state, "complete");
+    assert.equal(JSON.parse(readFileSync(outputPath, "utf8")).launchId, launch.launchId);
+  } finally {
+    stopProcess(childPid);
+    stopProcess(wrapperPid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("detached worker rejects unknown config fields before starting Node", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-worker-schema-"));
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    const worker = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "detached-node-worker.ps1");
+    const configPath = path.join(temporaryRoot, "worker-config.json");
+    const handshakePath = path.join(temporaryRoot, "handshake.json");
+    writeFileSync(configPath, JSON.stringify({
+      schemaVersion: 1,
+      launchId: "11111111-1111-4111-8111-111111111111",
+      nodePath: process.execPath,
+      arguments: [],
+      stdoutPath: path.join(temporaryRoot, "stdout.log"),
+      stderrPath: path.join(temporaryRoot, "stderr.log"),
+      handshakePath,
+      workerStartedPath: path.join(temporaryRoot, "worker-started.json"),
+      workerStdoutPath: path.join(temporaryRoot, "worker-stdout.log"),
+      workerStderrPath: path.join(temporaryRoot, "worker-stderr.log"),
+      unknown: "reject-me",
+    }), "utf8");
+    const result = runPowerShell(worker, ["-ConfigPath", configPath, "-Execute"]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr + result.stdout, /unknown|config|invalid/i);
+    assert.equal(existsSync(handshakePath), false);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("Windows CRT quoting preserves trailing backslashes and embedded quotes", () => {
+  const launchControl = path.join(repositoryRoot, "skills", "dispatch-chatgpt-bridge", "scripts", "launch-control.ps1");
+  const workerLibrary = path.join(repositoryRoot, "skills", "dispatch-chatgpt-bridge", "scripts", "detached-node-worker-library.ps1");
+  const command = [
+    `. '${launchControl.replaceAll("'", "''")}'`,
+    `$one = ConvertTo-WindowsProcessArgument -Value 'C:\\quoted path\\'`,
+    `$two = ConvertTo-WindowsProcessArgument -Value ('C:\\quoted path\\' + [char]34 + 'tail')`,
+    `. '${workerLibrary.replaceAll("'", "''")}'`,
+    `$three = ConvertTo-WindowsProcessArgument -Value 'C:\\quoted path\\'`,
+    `$four = ConvertTo-WindowsProcessArgument -Value ('C:\\quoted path\\' + [char]34 + 'tail')`,
+    "Write-Output $one; Write-Output $two; Write-Output $three; Write-Output $four",
+  ].join("; ");
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const lines = result.stdout.trim().split(/\r?\n/);
+  const trailing = ['"', "C:", "\\", "quoted path", "\\", "\\", '"'].join("");
+  const embedded = ['"', "C:", "\\", "quoted path", "\\", "\\", "\\", '"', "tail", '"'].join("");
+  assert.deepEqual(lines, [trailing, embedded, trailing, embedded]);
 });

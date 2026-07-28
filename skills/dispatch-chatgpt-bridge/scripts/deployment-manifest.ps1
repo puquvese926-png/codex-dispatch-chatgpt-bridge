@@ -314,7 +314,7 @@ function Read-BridgeDeploymentManifest {
   param([Parameter(Mandatory = $true)][string]$Root, [string]$Label = 'deployment manifest')
   $path = Join-Path $Root 'deployment-manifest.json'
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "$Label is missing: $path" }
-  try { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json) }
+  try { return (Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json) }
   catch { throw "$Label is not valid JSON: $path" }
 }
 

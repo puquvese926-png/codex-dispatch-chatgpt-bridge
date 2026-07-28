@@ -240,6 +240,13 @@ report path; two callers sharing an output path cannot adopt each other's PID.
 The record may retain the exact cmd wrapper PID only as a diagnostic; the
 monitored PID is always the final Node process. Logs live inside the random
 launch directory, not beside the business output.
+On Windows the production detached path creates the final Node process directly
+through `Win32_Process.Create`; it does not pass the command through `cmd.exe`
+or rely on a PowerShell argument-list join. Arguments use Windows CRT quoting,
+including trailing backslashes before quotes. The adjacent worker config,
+started marker and handshake are strict, launch-bound audit records. The
+worker stdout/stderr files are reserved diagnostic paths; the durable report,
+not an assumed redirected console stream, is the result source.
 The launch record is atomically rewritten from `starting` to `running` (or a
 durable `failed` record if start fails). `status` reads only a bounded,
 strictly validated launch record; `wait` performs the same inspection in a

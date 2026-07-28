@@ -150,6 +150,7 @@ export function buildBatchProgress(value) {
   return {
     schemaVersion: 1,
     command: "batch",
+    launchId: value.launchId || null,
     state,
     runId: value.runId,
     reportPath,
@@ -175,6 +176,7 @@ export function parseBridgeArgs(argv) {
     input: null,
     output: null,
     statePath: null,
+    launchToken: null,
     experimentalQuickChat: false,
     timeoutMs: DEFAULT_TIMEOUT_MS,
   };
@@ -194,6 +196,7 @@ export function parseBridgeArgs(argv) {
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(launchToken || "")) {
         throw new Error("bridge launch token must be a UUID");
       }
+      options.launchToken = launchToken;
     }
     else if (argument === "--timeout-ms") options.timeoutMs = Number(argv[++index]);
     else if (argument === "--poll-ms") options.pollMs = Number(argv[++index]);
@@ -3232,6 +3235,7 @@ async function runWatch(options, discovery, manifest) {
             schemaVersion: 1,
             pass: false,
             command: "watch",
+            launchId: options.launchToken,
             runId,
             startedAt,
             completedAt: new Date().toISOString(),
@@ -3254,6 +3258,7 @@ async function runWatch(options, discovery, manifest) {
           schemaVersion: 1,
           pass: true,
           command: "watch",
+          launchId: options.launchToken,
           runId,
           startedAt,
           completedAt: deliveredAt,
@@ -3282,6 +3287,7 @@ async function runWatch(options, discovery, manifest) {
     schemaVersion: 1,
     pass: true,
     command: "watch",
+    launchId: options.launchToken,
     runId,
     startedAt,
     completedAt: new Date().toISOString(),
@@ -3571,6 +3577,7 @@ async function runBatch(options, discovery, batch, preloadedLifecycleLedger = nu
   const persistBatchProgress = async (state = "running", error = null) => {
     await writeJsonAtomically(progressPath, buildBatchProgress({
       runId,
+      launchId: options.launchToken,
       reportPath: options.output,
       startedAt,
       updatedAt: new Date().toISOString(),
@@ -3761,6 +3768,7 @@ async function runBatch(options, discovery, batch, preloadedLifecycleLedger = nu
     schemaVersion: 1,
     pass: completedCount === batch.jobs.length,
     command: "batch",
+    launchId: options.launchToken,
     runId,
     startedAt,
     completedAt: new Date().toISOString(),
@@ -3951,6 +3959,7 @@ async function runResume(options, discovery, manifest, preloadedLifecycleLedger 
     schemaVersion: 1,
     pass: completedCount === manifest.jobs.length,
     command: "resume",
+    launchId: options.launchToken,
     runId,
     startedAt,
     completedAt: new Date().toISOString(),
