@@ -1063,7 +1063,7 @@ function buildExactSubmissionRootSource(surface, conversationId) {
         return null;
       }
     };
-    const hasChatGptMode = (root) => [...root.querySelectorAll('button')].some((node) => {
+    const hasChatGptMode = (root) => [...root.querySelectorAll('button,[role="button"]')].some((node) => {
       if (!visible(node)) return false;
       const label = [
         node.getAttribute('aria-label'),

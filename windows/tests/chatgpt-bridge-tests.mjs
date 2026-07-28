@@ -878,6 +878,50 @@ test("main active sidebar identity authorizes only an explicit ChatGPT mode root
   assert.equal(chatSend.clickCount, 1);
 });
 
+test("main active sidebar identity accepts a non-button ChatGPT mode control", () => {
+  const activeThread = createDomElement("button", {
+    attributes: {
+      "data-app-action-sidebar-thread-id": EXACT_LOCAL_ID,
+      "aria-current": "page",
+    },
+  });
+  const modeControl = createDomElement("div", {
+    attributes: {
+      role: "button",
+      "aria-label": "当前模式：ChatGPT",
+    },
+  });
+  const chatComposer = createComposer(EXACT_MARKER, {
+    "aria-label": "给 ChatGPT 发消息",
+  });
+  const chatSend = createSendButton();
+  const chatRoot = createDomElement("main", {
+    children: [modeControl, chatComposer, chatSend],
+  });
+  const harness = createDomHarness([activeThread, chatRoot]);
+
+  const focus = harness.evaluate(buildComposerFocusExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+  ));
+  const readiness = harness.evaluate(buildComposerReadinessExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+    EXACT_MARKER,
+  ));
+  const clicked = harness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(focus.ok, true);
+  assert.equal(readiness.ok, true);
+  assert.equal(clicked.clicked, true);
+  assert.equal(harness.document.activeElement, chatComposer);
+  assert.equal(chatSend.clickCount, 1);
+});
+
 test("main local thread identity submits only through its bound ChatGPT root", () => {
   const chatComposer = createComposer(EXACT_MARKER);
   const chatSend = createSendButton();
