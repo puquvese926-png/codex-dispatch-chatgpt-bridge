@@ -105,8 +105,11 @@ function progressJob(value) {
     promptHash: typeof job.promptHash === "string" ? job.promptHash : null,
     marker: typeof job.marker === "string" ? job.marker : null,
     conversationId: typeof job.conversationId === "string" ? job.conversationId : null,
+    expectedConversationId: typeof job.expectedConversationId === "string" ?
+      job.expectedConversationId : null,
     surface: typeof job.surface === "string" ? job.surface : null,
     status: typeof job.status === "string" ? job.status : "pending",
+    attemptedAt: typeof job.attemptedAt === "string" ? job.attemptedAt : null,
     submittedAt: typeof job.submittedAt === "string" ? job.submittedAt : null,
     completedAt: typeof job.completedAt === "string" ? job.completedAt : null,
     historyTitle: typeof job.historyTitle === "string" ? job.historyTitle : null,
@@ -955,16 +958,34 @@ export function buildMainChatConversationIdExpression() {
   })()`;
 }
 
-export function buildComposerFocusExpression() {
-  return `(() => {
+function validateSubmissionExpressionInput(surface, conversationId, marker = null) {
+  if (!new Set(["chatgpt-quick-chat", "chatgpt-main-chat"]).has(surface)) {
+    throw new Error("submission surface is invalid");
+  }
+  const validConversationId = surface === "chatgpt-quick-chat" ?
+    LOCAL_CHATGPT_ID_PATTERN.test(conversationId) :
+    LOCAL_CHATGPT_ID_PATTERN.test(conversationId) || LOCAL_THREAD_ID_PATTERN.test(conversationId);
+  if (!validConversationId) throw new Error("submission conversation identity is invalid");
+  if (marker !== null &&
+      (typeof marker !== "string" || !marker || marker.length > 200 ||
+        /[\u0000-\u001f\u007f]/u.test(marker))) {
+    throw new Error("submission marker is invalid");
+  }
+}
+
+function buildExactSubmissionRootSource(surface, conversationId) {
+  validateSubmissionExpressionInput(surface, conversationId);
+  return `
+    const surface = ${JSON.stringify(surface)};
+    const expectedConversationId = ${JSON.stringify(conversationId)};
     const visible = (node) => {
-      if (!node || node.disabled || node.getAttribute('aria-hidden') === 'true') return false;
+      if (!node || node.getAttribute?.('aria-hidden') === 'true') return false;
       const style = getComputedStyle(node);
       if (style.display === 'none' || style.visibility === 'hidden') return false;
       const rect = node.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
     };
-    const selectors = [
+    const composerSelectors = [
       '[contenteditable="true"][data-lexical-editor="true"]',
       '[contenteditable="true"][role="textbox"]',
       '[contenteditable="true"][aria-label="给 ChatGPT 发消息"]',
@@ -972,10 +993,162 @@ export function buildComposerFocusExpression() {
       'textarea[data-testid="prompt-textarea"]',
       'textarea'
     ];
-    const composer = selectors.map((selector) => document.querySelector(selector)).find(visible) || null;
-    if (!composer) return false;
-    composer.focus();
-    return document.activeElement === composer || composer.contains(document.activeElement);
+    const sendSelectors = [
+      'button[data-testid="send-button"]',
+      'button[aria-label="发送"]',
+      'button[aria-label="Send"]',
+      'button[type="submit"]'
+    ];
+    const uniqueVisible = (root, selectors) => {
+      const matches = [];
+      const seen = new Set();
+      for (const selector of selectors) {
+        for (const node of root.querySelectorAll(selector)) {
+          if (!seen.has(node) && visible(node)) {
+            seen.add(node);
+            matches.push(node);
+          }
+        }
+      }
+      return matches;
+    };
+    const composersIn = (root) => uniqueVisible(root, composerSelectors)
+      .filter((composer) => !composer.disabled);
+    const sendsIn = (root) => {
+      const sends = uniqueVisible(root, sendSelectors);
+      const seen = new Set(sends);
+      for (const button of root.querySelectorAll('button')) {
+        const label = [
+          button.getAttribute('aria-label'),
+          button.getAttribute('title'),
+          button.textContent
+        ].filter(Boolean).join(' ');
+        if (!seen.has(button) && visible(button) && /(?:send|发送|提交)/iu.test(label)) {
+          seen.add(button);
+          sends.push(button);
+        }
+      }
+      return sends;
+    };
+    const normalizeIdentity = (rawValue) => {
+      const raw = String(rawValue || '').trim();
+      const quick = /^chatgpt:(local-chatgpt:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/iu.exec(raw);
+      if (quick) return quick[1];
+      if (/^local:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(raw)) {
+        return raw;
+      }
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(raw)) {
+        return 'local:' + raw;
+      }
+      return null;
+    };
+    const hasChatGptMode = (root) => [...root.querySelectorAll('button')].some((node) => {
+      if (!visible(node)) return false;
+      const label = [
+        node.getAttribute('aria-label'),
+        node.getAttribute('title'),
+        node.textContent
+      ].filter(Boolean).join(' ').trim();
+      return /(?:当前模式\\s*[:：]?\\s*ChatGPT|current mode\\s*[:：]?\\s*ChatGPT)/iu.test(label);
+    });
+    const isExplicitChatGptComposer = (composer) => {
+      const label = [
+        composer.getAttribute('aria-label'),
+        composer.getAttribute('title')
+      ].filter(Boolean).join(' ');
+      return /ChatGPT/iu.test(label);
+    };
+    const ownerForComposer = (composer) => {
+      const quickChat = composer.closest('[data-pip-obstacle="quick-chat"]');
+      if (quickChat) return quickChat;
+      const dialog = composer.closest('[role="dialog"]');
+      if (dialog) return dialog;
+      const identityOwner = composer.closest('[data-above-composer-conversation-id]');
+      if (identityOwner) return identityOwner;
+      if (surface !== 'chatgpt-main-chat') return null;
+      let current = composer.parentElement;
+      while (current && current !== document) {
+        if (current.matches?.('main, [role="main"], section') && hasChatGptMode(current)) {
+          return current;
+        }
+        current = current.parentElement;
+      }
+      return null;
+    };
+    const rootHasExpectedIdentity = (root) => {
+      const identityNodes = [];
+      if (root.matches?.('[data-above-composer-conversation-id]')) identityNodes.push(root);
+      identityNodes.push(...root.querySelectorAll('[data-above-composer-conversation-id]'));
+      const identities = [...new Set(identityNodes
+        .map((node) => normalizeIdentity(node.getAttribute('data-above-composer-conversation-id')))
+        .filter(Boolean))];
+      if (identities.includes(expectedConversationId)) return true;
+      if (surface !== 'chatgpt-main-chat' ||
+          !expectedConversationId.startsWith('local:') ||
+          !hasChatGptMode(root)) {
+        return false;
+      }
+      const rootComposers = composersIn(root);
+      if (rootComposers.length !== 1 || !isExplicitChatGptComposer(rootComposers[0])) return false;
+      const activeIds = [...new Set([...document.querySelectorAll(
+        '[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-active="true"], [data-app-action-sidebar-thread-id][aria-current="page"]'
+      )].filter(visible).map((node) =>
+        normalizeIdentity(node.getAttribute('data-app-action-sidebar-thread-id'))
+      ).filter(Boolean))];
+      return activeIds.length === 1 && activeIds[0] === expectedConversationId;
+    };
+    const resolveExactOwner = (requireSend) => {
+      if (surface === 'chatgpt-quick-chat') {
+        const composers = composersIn(document);
+        if (composers.length !== 1) {
+          return { ok: false, reason: 'composer-count', rootCount: 1, composerCount: composers.length };
+        }
+        const sends = requireSend ? sendsIn(document) : [];
+        if (requireSend && sends.length !== 1) {
+          return { ok: false, reason: 'send-count', rootCount: 1, sendCount: sends.length };
+        }
+        return { ok: true, root: document, composer: composers[0], send: sends[0] || null };
+      }
+      const candidateRoots = [];
+      const seenRoots = new Set();
+      for (const composer of composersIn(document)) {
+        const root = ownerForComposer(composer);
+        if (root && !seenRoots.has(root)) {
+          seenRoots.add(root);
+          candidateRoots.push(root);
+        }
+      }
+      const exactRoots = candidateRoots.filter(rootHasExpectedIdentity);
+      if (exactRoots.length !== 1) {
+        return { ok: false, reason: 'exact-root-count', rootCount: exactRoots.length };
+      }
+      const root = exactRoots[0];
+      const composers = composersIn(root);
+      if (composers.length !== 1) {
+        return { ok: false, reason: 'composer-count', rootCount: 1, composerCount: composers.length };
+      }
+      const sends = requireSend ? sendsIn(root) : [];
+      if (requireSend && sends.length !== 1) {
+        return { ok: false, reason: 'send-count', rootCount: 1, sendCount: sends.length };
+      }
+      return { ok: true, root, composer: composers[0], send: sends[0] || null };
+    };`;
+}
+
+export function buildComposerFocusExpression(surface, conversationId) {
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
+  return `(() => {
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return resolved;
+    resolved.composer.focus();
+    const focused = document.activeElement === resolved.composer ||
+      resolved.composer.contains(document.activeElement);
+    return {
+      ok: focused,
+      reason: focused ? 'focused' : 'focus-rejected',
+      conversationId: expectedConversationId
+    };
   })()`;
 }
 
@@ -1005,71 +1178,60 @@ export function buildComposerAvailabilityExpression(requireBlank = true) {
   })()`;
 }
 
-export function buildComposerReadinessExpression(marker) {
-  if (typeof marker !== "string" || !marker || marker.length > 200 || /[\u0000-\u001f\u007f]/u.test(marker)) {
-    throw new Error("composer marker is invalid");
-  }
+export function buildComposerReadinessExpression(surface, conversationId, marker) {
+  validateSubmissionExpressionInput(surface, conversationId, marker);
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
     const marker = ${JSON.stringify(marker)};
-    const visible = (node) => {
-      if (!node || node.disabled || node.getAttribute('aria-hidden') === 'true') return false;
-      const style = getComputedStyle(node);
-      if (style.display === 'none' || style.visibility === 'hidden') return false;
-      const rect = node.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
-    };
-    const composerSelectors = [
-      '[contenteditable="true"][data-lexical-editor="true"]',
-      '[contenteditable="true"][role="textbox"]',
-      '[contenteditable="true"][aria-label="给 ChatGPT 发消息"]',
-      '[contenteditable="true"][aria-label*="ChatGPT"]',
-      'textarea[data-testid="prompt-textarea"]',
-      'textarea'
-    ];
-    const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(visible) || null;
-    const directSend = [
-      'button[data-testid="send-button"]',
-      'button[aria-label="发送"]',
-      'button[aria-label="Send"]',
-      'button[type="submit"]'
-    ].map((selector) => document.querySelector(selector)).find(visible) || null;
-    const semanticSend = [...document.querySelectorAll('button')].find((button) => {
-      const label = [button.getAttribute('aria-label'), button.getAttribute('title'), button.textContent]
-        .filter(Boolean).join(' ');
-      return visible(button) && /(?:send|发送|提交)/i.test(label);
-    }) || null;
-    const send = directSend || semanticSend;
-    const composerText = composer
-      ? ('value' in composer ? composer.value : (composer.innerText || composer.textContent || ''))
-      : '';
-    return Boolean(composer && send && !send.disabled && composerText.includes(marker));
+    ${rootSource}
+    const resolved = resolveExactOwner(true);
+    if (!resolved.ok) return resolved;
+    const composerText = 'value' in resolved.composer ?
+      resolved.composer.value :
+      (resolved.composer.innerText || resolved.composer.textContent || '');
+    if (!composerText.includes(marker)) {
+      return { ok: false, reason: 'marker-mismatch', conversationId: expectedConversationId };
+    }
+    if (resolved.send.disabled) {
+      return { ok: false, reason: 'send-disabled', conversationId: expectedConversationId };
+    }
+    return { ok: true, reason: 'ready', conversationId: expectedConversationId };
   })()`;
 }
 
-export function buildSendClickExpression() {
+export function buildSendClickExpression(surface, conversationId, marker) {
+  validateSubmissionExpressionInput(surface, conversationId, marker);
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
-    const visible = (node) => {
-      if (!node || node.disabled || node.getAttribute('aria-hidden') === 'true') return false;
-      const style = getComputedStyle(node);
-      if (style.display === 'none' || style.visibility === 'hidden') return false;
-      const rect = node.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
+    const marker = ${JSON.stringify(marker)};
+    ${rootSource}
+    const resolved = resolveExactOwner(true);
+    if (!resolved.ok) return { clicked: false, ...resolved };
+    const composerText = 'value' in resolved.composer ?
+      resolved.composer.value :
+      (resolved.composer.innerText || resolved.composer.textContent || '');
+    if (!composerText.includes(marker)) {
+      return {
+        clicked: false,
+        reason: 'marker-mismatch',
+        conversationId: expectedConversationId
+      };
+    }
+    if (resolved.send.disabled ||
+        !resolved.root.contains(resolved.composer) ||
+        !resolved.root.contains(resolved.send)) {
+      return {
+        clicked: false,
+        reason: 'owner-mismatch',
+        conversationId: expectedConversationId
+      };
+    }
+    resolved.send.click();
+    return {
+      clicked: true,
+      reason: 'clicked',
+      conversationId: expectedConversationId
     };
-    const directSend = [
-      'button[data-testid="send-button"]',
-      'button[aria-label="发送"]',
-      'button[aria-label="Send"]',
-      'button[type="submit"]'
-    ].map((selector) => document.querySelector(selector)).find(visible) || null;
-    const semanticSend = [...document.querySelectorAll('button')].find((button) => {
-      const label = [button.getAttribute('aria-label'), button.getAttribute('title'), button.textContent]
-        .filter(Boolean).join(' ');
-      return visible(button) && /(?:send|发送|提交)/i.test(label);
-    }) || null;
-    const send = directSend || semanticSend;
-    if (!send || send.disabled) return false;
-    send.click();
-    return true;
   })()`;
 }
 
@@ -2087,7 +2249,12 @@ async function openNativeQuickChat(discovery, conversationId, index, {
         buildComposerAvailabilityExpression(requireBlank),
         "composer-readiness",
       );
-      return ready ? { url, conversationId, surface: "chatgpt-quick-chat" } : null;
+      return ready ? {
+        url,
+        conversationId,
+        surface: "chatgpt-quick-chat",
+        exactRouteVerified: requireExpectedRoute,
+      } : null;
     }, 30000, requireBlank ? "native blank ChatGPT conversation" : "native ChatGPT conversation");
     return { session, prepared };
   } catch (error) {
@@ -2269,33 +2436,111 @@ async function attachJobReferences(session, job) {
     15000, `reference attachment acknowledgement for ${job.id}`);
 }
 
+function validatePreparedSubmission(prepared) {
+  if (!isPlainObject(prepared)) throw new Error("prepared submission is invalid");
+  validateSubmissionExpressionInput(prepared.surface, prepared.conversationId);
+  if (prepared.surface === "chatgpt-quick-chat" && prepared.exactRouteVerified !== true) {
+    throw new Error("quick-chat submission route was not exactly verified");
+  }
+  return prepared;
+}
+
+export async function attemptExactSendClick(
+  session,
+  prepared,
+  marker,
+  now = () => new Date().toISOString(),
+) {
+  validatePreparedSubmission(prepared);
+  const expression = buildSendClickExpression(
+    prepared.surface,
+    prepared.conversationId,
+    marker,
+  );
+  const attemptedAt = now();
+  if (typeof attemptedAt !== "string" || !attemptedAt) {
+    throw new Error("submission attempt timestamp is invalid");
+  }
+  const identity = {
+    attemptedAt,
+    expectedConversationId: prepared.conversationId,
+    expectedSurface: prepared.surface,
+    marker,
+  };
+  try {
+    const result = await session.evaluate(expression, true);
+    if (result?.clicked !== true) {
+      return Object.freeze({
+        ...identity,
+        clicked: false,
+        submittedAt: null,
+        status: "not-submitted",
+        error: `ChatGPT send control rejected submission: ${result?.reason || "clicked-false"}`,
+      });
+    }
+    return Object.freeze({
+      ...identity,
+      clicked: true,
+      submittedAt: attemptedAt,
+      status: "submitted",
+      error: null,
+    });
+  } catch (error) {
+    return Object.freeze({
+      ...identity,
+      clicked: null,
+      submittedAt: attemptedAt,
+      status: "unknown-after-submit",
+      error: `send-click-attempt: ${error.message}`,
+    });
+  }
+}
+
 async function submitJob(session, prepared, job, runId) {
+  validatePreparedSubmission(prepared);
   const marker = bridgeMarker(runId, job.id);
   const effectivePrompt = `${job.prompt}\n\n任务追踪标记：${marker}。不要在回答中复述该标记。`;
   await attachJobReferences(session, job);
-  const composerFocused = await session.evaluate(buildComposerFocusExpression(), true);
-  if (!composerFocused) throw new Error("ChatGPT composer is unavailable before submission");
+  const composerFocused = await session.evaluate(buildComposerFocusExpression(
+    prepared.surface,
+    prepared.conversationId,
+  ), true);
+  if (!composerFocused?.ok) {
+    throw new Error(
+      `ChatGPT composer is unavailable before submission: ${composerFocused?.reason || "unknown"}`,
+    );
+  }
   await session.send("Input.insertText", { text: effectivePrompt });
-  const ready = await waitFor(async () => session.evaluate(
-    buildComposerReadinessExpression(marker),
-  ), 5000, `composer readiness for ${job.id}`);
+  const ready = await waitFor(async () => {
+    const result = await session.evaluate(buildComposerReadinessExpression(
+      prepared.surface,
+      prepared.conversationId,
+      marker,
+    ));
+    return result?.ok ? result : null;
+  }, 5000, `composer readiness for ${job.id}`);
   if (!ready) throw new Error(`ChatGPT composer did not accept job ${job.id}`);
 
-  const submittedAt = new Date().toISOString();
-  const clicked = await session.evaluate(buildSendClickExpression(), true);
-  if (!clicked) throw new Error(`ChatGPT send control did not submit job ${job.id}`);
-
+  const attempt = await attemptExactSendClick(session, prepared, marker);
   const submission = {
     id: job.id,
     promptHash: createHash("sha256").update(job.prompt, "utf8").digest("hex"),
     marker,
     references: job.references || [],
     conversationId: prepared.conversationId,
+    expectedConversationId: attempt.expectedConversationId,
     url: prepared.url,
-    surface: prepared.surface || "chatgpt-quick-chat",
-    submittedAt,
-    status: "submitted",
+    surface: prepared.surface,
+    attemptedAt: attempt.attemptedAt,
+    submittedAt: attempt.submittedAt,
+    status: attempt.status,
   };
+  if (attempt.status !== "submitted") {
+    return Object.freeze({
+      ...submission,
+      error: attempt.error,
+    });
+  }
   try {
     const acknowledged = await waitFor(async () => {
       if (submission.surface === "chatgpt-main-chat") {

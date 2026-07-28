@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import vm from "node:vm";
 
+import * as bridgeRuntime from "../scripts/chatgpt-bridge.mjs";
 import {
   browserIdFromVersion,
   buildChatProbeExpression,
@@ -70,6 +72,158 @@ import {
   validateHandoffApprovalManifest,
   validateHandoffWatchManifest,
 } from "../scripts/chatgpt-handoff-protocol.mjs";
+
+const EXACT_CHATGPT_ID = "local-chatgpt:11111111-1111-4111-8111-111111111111";
+const EXACT_LOCAL_ID = "local:22222222-2222-4222-8222-222222222222";
+const EXACT_MARKER = "CODEX-BRIDGE-exact-root-marker";
+
+function createDomElement(tagName, {
+  attributes = {},
+  children = [],
+  text = "",
+  value,
+  visible = true,
+  disabled = false,
+} = {}) {
+  const element = {
+    tagName: tagName.toUpperCase(),
+    attributes: { ...attributes },
+    children: [],
+    parentElement: null,
+    ownerDocument: null,
+    textContent: text,
+    innerText: text,
+    disabled,
+    visible,
+    clickCount: 0,
+    getAttribute(name) {
+      return Object.hasOwn(this.attributes, name) ? this.attributes[name] : null;
+    },
+    getBoundingClientRect() {
+      return this.visible ? { width: 200, height: 40 } : { width: 0, height: 0 };
+    },
+    getClientRects() {
+      return this.visible ? [{}] : [];
+    },
+    matches(selector) {
+      const alternatives = selector.split(",").map((part) => part.trim()).filter(Boolean);
+      return alternatives.some((part) => {
+        const tag = /^[a-z0-9-]+/iu.exec(part)?.[0];
+        if (tag && this.tagName !== tag.toUpperCase()) return false;
+        const attributesInSelector = [...part.matchAll(/\[([^\]=*]+)(?:(\*=|=)"([^"]*)")?\]/gu)];
+        return attributesInSelector.every((match) => {
+          const [, name, operator, expected] = match;
+          const actual = this.getAttribute(name);
+          if (!operator) return actual !== null;
+          if (actual === null) return false;
+          return operator === "=" ? actual === expected : actual.includes(expected);
+        });
+      });
+    },
+    querySelectorAll(selector) {
+      const matches = [];
+      const visit = (node) => {
+        for (const child of node.children) {
+          if (child.matches(selector)) matches.push(child);
+          visit(child);
+        }
+      };
+      visit(this);
+      return matches;
+    },
+    querySelector(selector) {
+      return this.querySelectorAll(selector)[0] || null;
+    },
+    closest(selector) {
+      let current = this;
+      while (current) {
+        if (current.matches(selector)) return current;
+        current = current.parentElement;
+      }
+      return null;
+    },
+    contains(node) {
+      let current = node;
+      while (current) {
+        if (current === this) return true;
+        current = current.parentElement;
+      }
+      return false;
+    },
+    focus() {
+      this.ownerDocument.activeElement = this;
+    },
+    click() {
+      this.clickCount += 1;
+    },
+  };
+  if (value !== undefined) element.value = value;
+  for (const child of children) {
+    child.parentElement = element;
+    element.children.push(child);
+  }
+  return element;
+}
+
+function createDomHarness(children) {
+  const document = createDomElement("document", { children });
+  document.activeElement = null;
+  const assignDocument = (node) => {
+    node.ownerDocument = document;
+    for (const child of node.children) assignDocument(child);
+  };
+  assignDocument(document);
+  return {
+    document,
+    evaluate(expression) {
+      return vm.runInNewContext(expression, {
+        document,
+        getComputedStyle(node) {
+          return {
+            display: node.visible ? "block" : "none",
+            visibility: node.visible ? "visible" : "hidden",
+          };
+        },
+        Set,
+      });
+    },
+  };
+}
+
+function createComposer(text = "", attributes = {}) {
+  return createDomElement("div", {
+    attributes: {
+      contenteditable: "true",
+      role: "textbox",
+      ...attributes,
+    },
+    text,
+  });
+}
+
+function createSendButton(attributes = {}) {
+  return createDomElement("button", {
+    attributes: {
+      "data-testid": "send-button",
+      "aria-label": "Send",
+      ...attributes,
+    },
+  });
+}
+
+function createExactDialog(conversationId, composer, send) {
+  const rawIdentity = conversationId.startsWith("local-chatgpt:") ?
+    `chatgpt:${conversationId}` :
+    conversationId.slice("local:".length);
+  const identityRoot = createDomElement("div", {
+    attributes: { "data-above-composer-conversation-id": rawIdentity },
+    children: [composer, send],
+  });
+  return createDomElement("div", {
+    attributes: { role: "dialog", "data-pip-obstacle": "quick-chat" },
+    children: [identityRoot],
+  });
+}
 
 test("annotates bridge evaluation failures with the exact recovery stage", () => {
   const error = annotateBridgeStageError("history-title-list", new Error("CDP command timed out: Runtime.evaluate"));
@@ -460,11 +614,245 @@ test("attachment acknowledgement recognizes rendered attachment cards", () => {
   assert.doesNotMatch(expression, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
 });
 
+test("composer focus selects only the exact leased ChatGPT root", () => {
+  const codexComposer = createComposer();
+  const codexSend = createSendButton();
+  const codexRoot = createDomElement("main", { children: [codexComposer, codexSend] });
+  const chatComposer = createComposer();
+  const chatSend = createSendButton();
+  const chatRoot = createExactDialog(EXACT_CHATGPT_ID, chatComposer, chatSend);
+  const harness = createDomHarness([codexRoot, chatRoot]);
+
+  const result = harness.evaluate(buildComposerFocusExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  ));
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.document.activeElement, chatComposer);
+  assert.notEqual(harness.document.activeElement, codexComposer);
+});
+
+test("send click ignores an earlier Codex send button", () => {
+  const codexComposer = createComposer(EXACT_MARKER);
+  const codexSend = createSendButton();
+  const codexRoot = createDomElement("main", { children: [codexComposer, codexSend] });
+  const chatComposer = createComposer(EXACT_MARKER);
+  const chatSend = createSendButton();
+  const chatRoot = createExactDialog(EXACT_CHATGPT_ID, chatComposer, chatSend);
+  const harness = createDomHarness([codexRoot, chatRoot]);
+
+  const result = harness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(result.clicked, true);
+  assert.equal(codexSend.clickCount, 0);
+  assert.equal(chatSend.clickCount, 1);
+});
+
+test("send click rejects zero or multiple exact roots before submission", () => {
+  const missingComposer = createComposer(EXACT_MARKER);
+  const missingSend = createSendButton();
+  const missingHarness = createDomHarness([
+    createExactDialog(
+      "local-chatgpt:33333333-3333-4333-8333-333333333333",
+      missingComposer,
+      missingSend,
+    ),
+  ]);
+  const missingResult = missingHarness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+  assert.equal(missingResult.clicked, false);
+  assert.equal(missingSend.clickCount, 0);
+
+  const composerA = createComposer(EXACT_MARKER);
+  const sendA = createSendButton();
+  const composerB = createComposer(EXACT_MARKER);
+  const sendB = createSendButton();
+  const multipleHarness = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, composerA, sendA),
+    createExactDialog(EXACT_CHATGPT_ID, composerB, sendB),
+  ]);
+  const multipleResult = multipleHarness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+  assert.equal(multipleResult.clicked, false);
+  assert.equal(sendA.clickCount + sendB.clickCount, 0);
+});
+
+test("send click revalidates exact conversation identity and marker atomically", () => {
+  const wrongMarkerComposer = createComposer("different marker");
+  const wrongMarkerSend = createSendButton();
+  const markerHarness = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, wrongMarkerComposer, wrongMarkerSend),
+  ]);
+  const markerResult = markerHarness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+  assert.equal(markerResult.clicked, false);
+  assert.equal(wrongMarkerSend.clickCount, 0);
+
+  const wrongIdentityComposer = createComposer(EXACT_MARKER);
+  const wrongIdentitySend = createSendButton();
+  const identityHarness = createDomHarness([
+    createExactDialog(
+      "local-chatgpt:44444444-4444-4444-8444-444444444444",
+      wrongIdentityComposer,
+      wrongIdentitySend,
+    ),
+  ]);
+  const identityResult = identityHarness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+  assert.equal(identityResult.clicked, false);
+  assert.equal(wrongIdentitySend.clickCount, 0);
+});
+
+test("main local thread identity cannot authorize a Codex composer", () => {
+  const codexComposer = createComposer(EXACT_MARKER);
+  const codexSend = createSendButton();
+  const modeControl = createDomElement("button", {
+    attributes: { "aria-label": "当前模式：ChatGPT" },
+  });
+  const codexRoot = createDomElement("main", {
+    children: [modeControl, codexComposer, codexSend],
+  });
+  const activeThread = createDomElement("button", {
+    attributes: {
+      "data-app-action-sidebar-thread-id": EXACT_LOCAL_ID,
+      "aria-current": "page",
+    },
+  });
+  const harness = createDomHarness([activeThread, codexRoot]);
+
+  const result = harness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(result.clicked, false);
+  assert.equal(codexSend.clickCount, 0);
+});
+
+test("main local thread identity submits only through its bound ChatGPT root", () => {
+  const chatComposer = createComposer(EXACT_MARKER);
+  const chatSend = createSendButton();
+  const chatRoot = createExactDialog(EXACT_LOCAL_ID, chatComposer, chatSend);
+  const harness = createDomHarness([chatRoot]);
+
+  const result = harness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(result.clicked, true);
+  assert.equal(chatSend.clickCount, 1);
+});
+
+test("CDP loss during the click attempt seals unknown-after-submit", async () => {
+  assert.equal(typeof bridgeRuntime.attemptExactSendClick, "function");
+  const session = {
+    async evaluate() {
+      throw new Error("CDP websocket closed");
+    },
+  };
+  const result = await bridgeRuntime.attemptExactSendClick(
+    session,
+    {
+      surface: "chatgpt-main-chat",
+      conversationId: EXACT_CHATGPT_ID,
+    },
+    EXACT_MARKER,
+    () => "2026-07-28T12:00:00.000Z",
+  );
+
+  assert.equal(result.status, "unknown-after-submit");
+  assert.equal(result.attemptedAt, "2026-07-28T12:00:00.000Z");
+  assert.equal(result.submittedAt, "2026-07-28T12:00:00.000Z");
+  assert.equal(result.expectedConversationId, EXACT_CHATGPT_ID);
+  assert.equal(result.marker, EXACT_MARKER);
+});
+
+test("explicit clicked false remains not-submitted", async () => {
+  assert.equal(typeof bridgeRuntime.attemptExactSendClick, "function");
+  const session = {
+    async evaluate() {
+      return { clicked: false, reason: "exact-root-count" };
+    },
+  };
+  const result = await bridgeRuntime.attemptExactSendClick(
+    session,
+    {
+      surface: "chatgpt-main-chat",
+      conversationId: EXACT_CHATGPT_ID,
+    },
+    EXACT_MARKER,
+    () => "2026-07-28T12:01:00.000Z",
+  );
+
+  assert.equal(result.status, "not-submitted");
+  assert.equal(result.submittedAt, null);
+  assert.equal(result.expectedConversationId, EXACT_CHATGPT_ID);
+  assert.equal(result.marker, EXACT_MARKER);
+});
+
+test("quick-chat send attempt requires an externally verified exact route", async () => {
+  await assert.rejects(
+    bridgeRuntime.attemptExactSendClick(
+      { async evaluate() { return { clicked: true }; } },
+      {
+        surface: "chatgpt-quick-chat",
+        conversationId: EXACT_CHATGPT_ID,
+        exactRouteVerified: false,
+      },
+      EXACT_MARKER,
+    ),
+    /route was not exactly verified/i,
+  );
+});
+
+test("submission expressions reject invalid identity inputs at build time", () => {
+  assert.throws(
+    () => buildComposerFocusExpression("chatgpt-main-chat", "not-a-conversation"),
+    /conversation identity is invalid/i,
+  );
+  assert.throws(
+    () => buildComposerReadinessExpression("chatgpt-quick-chat", EXACT_LOCAL_ID, EXACT_MARKER),
+    /conversation identity is invalid/i,
+  );
+  assert.throws(
+    () => buildSendClickExpression("unknown-surface", EXACT_CHATGPT_ID, EXACT_MARKER),
+    /surface is invalid/i,
+  );
+});
+
 test("composer discovery tolerates ChatGPT editor and send-control selector drift", () => {
-  const focus = buildComposerFocusExpression();
+  const focus = buildComposerFocusExpression("chatgpt-main-chat", EXACT_CHATGPT_ID);
   const blank = buildComposerAvailabilityExpression(true);
-  const ready = buildComposerReadinessExpression("CODEX-BRIDGE-test-marker");
-  const send = buildSendClickExpression();
+  const ready = buildComposerReadinessExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    "CODEX-BRIDGE-test-marker",
+  );
+  const send = buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    "CODEX-BRIDGE-test-marker",
+  );
 
   for (const expression of [focus, blank, ready]) {
     assert.match(expression, /data-lexical-editor/);
@@ -675,7 +1063,9 @@ test("product batch defaults to a long image-generation window and writes durabl
         promptHash: "a".repeat(64),
         marker: "CODEX-BRIDGE-run-progress-shot-1",
         conversationId: "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de",
+        expectedConversationId: "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de",
         surface: "chatgpt-main-chat",
+        attemptedAt: "2026-07-27T00:00:29.000Z",
         submittedAt: "2026-07-27T00:00:30.000Z",
         status: "submitted",
       },
@@ -692,6 +1082,9 @@ test("product batch defaults to a long image-generation window and writes durabl
   assert.equal(progress.submittedJobs, 1);
   assert.equal(progress.completedJobs, 0);
   assert.equal(progress.jobs[0].conversationId, "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de");
+  assert.equal(progress.jobs[0].expectedConversationId, "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de");
+  assert.equal(progress.jobs[0].attemptedAt, "2026-07-27T00:00:29.000Z");
+  assert.equal(progress.jobs[0].marker, "CODEX-BRIDGE-run-progress-shot-1");
   assert.equal(progress.jobs[1].status, "pending");
   assert.equal(
     summarizeBatchError(null, [{ id: "shot-1", status: "timeout-after-submit" }]),

@@ -193,6 +193,24 @@ therefore remain usable without broadening the selector to unrelated Codex
 buttons. A successful click is not enough: blank-surface and new exact-identity
 checks remain mandatory before send.
 
+Ordinary batch submission binds composer focus, readiness and send to the
+prepared job's exact `surface` and `conversationId`; readiness and send also bind
+the original marker. A native Quick Chat renderer may use its document root only
+after the outer CDP session has verified the exact conversation route. Embedded
+Quick Chat and the full main ChatGPT surface must resolve exactly one visible
+ChatGPT owner whose real DOM identity equals the expected `local-chatgpt:<uuid>`
+or `local:<uuid>`. Composer and send must be unique descendants of that same
+owner. A global active sidebar identity, an earlier Codex composer, another
+dialog, or a second matching owner cannot authorize submission.
+
+The send expression rechecks exact identity, same-root composer marker and
+same-root send ownership atomically before clicking. A returned `clicked: false`
+is durable `not-submitted`. Once the bridge enters that click-capable
+`Runtime.evaluate`, a lost or exceptional CDP response is
+`unknown-after-submit`; the report preserves `attemptedAt`, expected conversation
+identity, surface and marker and must never be downgraded by an outer pre-submit
+catch or retried automatically.
+
 The pinned client currently permits two owned Quick Chat windows per wave only
 when `-ExperimentalQuickChat` is explicitly selected and the current route plan
 allows an attempt. Existing user windows reduce capacity and are never closed or
