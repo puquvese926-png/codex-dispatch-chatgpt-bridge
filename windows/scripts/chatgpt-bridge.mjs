@@ -3123,6 +3123,15 @@ async function openHandoffApprovalConversation(discovery, manifest) {
   );
 }
 
+export function takeHandoffApprovalSession(opened) {
+  const session = opened?.session;
+  if (!session || typeof session.close !== "function" ||
+      typeof session.evaluate !== "function" || typeof session.send !== "function") {
+    throw new Error("handoff approval session is invalid");
+  }
+  return session;
+}
+
 async function runApprove(options, discovery) {
   const manifest = validateHandoffApprovalManifest(await readStrictJson(options.input));
   const runId = randomUUID();
@@ -3136,11 +3145,11 @@ async function runApprove(options, discovery) {
   let errorText = null;
   try {
     const opened = await openHandoffApprovalConversation(discovery, manifest);
+    session = takeHandoffApprovalSession(opened);
     if (!opened?.prepared || opened.prepared.conversationId !== manifest.conversationId) {
       throw new Error("handoff approval prepared conversation identity mismatch");
     }
     validateSubmissionExpressionInput(opened.prepared.surface, opened.prepared.conversationId);
-    session = opened.session;
     const observation = await evaluateAtStage(
       session,
       buildHandoffUnitsExpression(opened.prepared.surface, manifest.conversationId),

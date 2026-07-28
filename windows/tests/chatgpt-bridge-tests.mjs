@@ -20,6 +20,7 @@ import {
   buildHandoffApprovalFocusExpression,
   buildHandoffApprovalSubmitExpression,
   attemptHandoffApprovalClick,
+  takeHandoffApprovalSession,
   buildHandoffUnitsExpression,
   buildMarkerPresenceExpression,
   buildAttachmentAcknowledgementExpression,
@@ -1970,6 +1971,23 @@ test("runApprove binds every approval action to the opened prepared identity and
   assert.match(approveSource, /attemptHandoffApprovalClick\(\s*session,\s*opened\.prepared,\s*manifest\.taskId/);
   assert.doesNotMatch(approveSource, /buildHandoffApprovalFocusExpression\(manifest\.conversationId\)/);
   assert.doesNotMatch(approveSource, /buildHandoffApprovalSubmitExpression\(manifest\.conversationId/);
+});
+
+test("runApprove takes ownership of its session before prepared validation", () => {
+  const close = () => {};
+  const session = { close, evaluate() {}, send() {} };
+  assert.equal(takeHandoffApprovalSession({ session }), session);
+  assert.throws(() => takeHandoffApprovalSession({ session: null }), /session/i);
+  assert.throws(() => takeHandoffApprovalSession({ session: { evaluate() {} } }), /session/i);
+
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function runApprove");
+  const end = source.indexOf("async function recordGenerationLifecycle", start);
+  const approveSource = source.slice(start, end);
+  const adoption = approveSource.indexOf("session = takeHandoffApprovalSession(opened);");
+  const preparedGuard = approveSource.indexOf("opened.prepared.conversationId !== manifest.conversationId");
+  const surfaceGuard = approveSource.indexOf("validateSubmissionExpressionInput(opened.prepared.surface, opened.prepared.conversationId)");
+  assert.ok(adoption >= 0 && preparedGuard > adoption && surfaceGuard > preparedGuard);
 });
 
 test("handoff checkpoint prevents duplicate delivery and task rebinding", () => {
