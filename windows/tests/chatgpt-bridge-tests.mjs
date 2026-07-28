@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
@@ -373,6 +375,8 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     output: null,
     statePath: null,
     launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
     experimentalQuickChat: false,
     timeoutMs: 600000,
   });
@@ -391,6 +395,8 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     output: "C:\\jobs\\report.json",
     statePath: null,
     launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
     experimentalQuickChat: false,
     timeoutMs: 240000,
   });
@@ -411,6 +417,8 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     output: "C:\\jobs\\recovered.json",
     statePath: null,
     launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
     experimentalQuickChat: false,
     timeoutMs: 600000,
   });
@@ -430,6 +438,8 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     output: "C:\\reports\\cleanup.json",
     statePath: null,
     launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
     experimentalQuickChat: false,
     timeoutMs: 600000,
   });
@@ -450,6 +460,8 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     output: "C:\\handoff\\report.json",
     statePath: null,
     launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
     experimentalQuickChat: false,
     timeoutMs: 5000,
     pollMs: 1000,
@@ -470,6 +482,8 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     output: "C:\\handoff\\approve-report.json",
     statePath: null,
     launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
     experimentalQuickChat: false,
     timeoutMs: 600000,
   });
@@ -488,6 +502,8 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     output: "C:\\jobs\\plan.json",
     statePath: null,
     launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
     experimentalQuickChat: false,
     timeoutMs: 600000,
   });
@@ -512,6 +528,29 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     "--allow-send",
     "--bridge-launch-token", launchToken,
   ]).launchToken, launchToken);
+  const launchLogRoot = "C:\\Users\\HP\\AppData\\Local\\CodexChatGPTBridge\\launches\\11111111-1111-4111-8111-111111111111";
+  const parsedLaunchLogs = parseBridgeArgs([
+    "batch",
+    "--input", "C:\\jobs\\batch.json",
+    "--output", "C:\\jobs\\report.json",
+    "--allow-send",
+    "--bridge-launch-token", launchToken,
+    "--bridge-stdout-log", `${launchLogRoot}\\stdout.log`,
+    "--bridge-stderr-log", `${launchLogRoot}\\stderr.log`,
+  ]);
+  assert.equal(parsedLaunchLogs.stdoutLogPath, `${launchLogRoot}\\stdout.log`);
+  assert.equal(parsedLaunchLogs.stderrLogPath, `${launchLogRoot}\\stderr.log`);
+  assert.throws(() => parseBridgeArgs([
+    "batch", "--input", "C:\\jobs\\batch.json", "--output", "C:\\jobs\\report.json",
+    "--allow-send", "--bridge-launch-token", launchToken,
+    "--bridge-stdout-log", `${launchLogRoot}\\stdout.log`,
+  ]), /both|pair|stderr/i);
+  assert.throws(() => parseBridgeArgs([
+    "batch", "--input", "C:\\jobs\\batch.json", "--output", "C:\\jobs\\report.json",
+    "--allow-send", "--bridge-launch-token", launchToken,
+    "--bridge-stdout-log", `${launchLogRoot}\\business.json`,
+    "--bridge-stderr-log", `${launchLogRoot}\\stderr.log`,
+  ]), /log|stdout|launch/i);
   assert.throws(() => parseBridgeArgs([
     "batch", "--input", "C:\\jobs\\batch.json", "--output", "C:\\jobs\\report.json",
     "--allow-send", "--bridge-launch-token", "not-a-uuid",
@@ -522,6 +561,23 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     "--output", "C:\\jobs\\report.json",
     "--experimental-quick-chat",
   ]), /experimental.*Quick Chat|quick chat/i);
+});
+
+test("oversized launcher log events degrade to one bounded safe record", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-log-bound-"));
+  try {
+    const logPath = path.join(temporaryRoot, "stdout.log");
+    bridgeRuntime.appendBridgeLaunchLog(logPath, { pass: true, detail: "x".repeat(200000) });
+    const lines = readFileSync(logPath, "utf8").trim().split(/\r?\n/).filter(Boolean);
+    assert.equal(lines.length, 1);
+    assert.ok(Buffer.byteLength(lines[0], "utf8") <= 65536);
+    assert.deepEqual(JSON.parse(lines[0]), {
+      pass: false,
+      error: "bridge launch log payload exceeded the bounded limit",
+    });
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
 });
 
 test("validates strict unique batch jobs without rewriting prompts", () => {

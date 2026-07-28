@@ -472,6 +472,7 @@ function Get-LaunchStatus {
     progress = $progressObservation
     recoveryRequired = $recoveryRequired
     ambiguousJobs = $ambiguous
+    retryAllowed = $false
   }
 
   if ($reportResult.corrupt) {
@@ -574,12 +575,7 @@ function ConvertTo-WindowsProcessArgument {
   return $builder.ToString()
 }
 
-function ConvertTo-PowerShellLiteral {
-  param([Parameter(Mandatory = $true)][string]$Value)
-  return "'" + $Value.Replace("'", "''") + "'"
-}
-
-function Start-DetachedNodeWorker {
+function Start-DetachedFinalNodeProcess {
   param(
     [Parameter(Mandatory = $true)][string]$NodePath,
     [Parameter(Mandatory = $true)][object[]]$Arguments,
@@ -588,48 +584,26 @@ function Start-DetachedNodeWorker {
     [Parameter(Mandatory = $true)][string]$StderrPath,
     [Parameter(Mandatory = $true)][bool]$SimulateAttributionFailure
   )
-  $workerScript = Join-Path $PSScriptRoot 'detached-node-worker.ps1'
-  if (-not (Test-Path -LiteralPath $workerScript -PathType Leaf)) {
-    throw 'detached worker script is missing.'
-  }
   $launchDirectory = [IO.Path]::GetDirectoryName($StdoutPath)
-  $configPath = Join-Path $launchDirectory 'worker-config.json'
-  $handshakePath = Join-Path $launchDirectory 'worker-handshake.json'
-  $workerErrorPath = Join-Path $launchDirectory 'worker-error.json'
-  $workerStartedPath = Join-Path $launchDirectory 'worker-started.json'
-  $workerStdoutPath = Join-Path $launchDirectory 'worker-stdout.log'
-  $workerStderrPath = Join-Path $launchDirectory 'worker-stderr.log'
-  Assert-NoReparseAncestors -Path $configPath -Label 'worker config'
-  Assert-NoReparseAncestors -Path $handshakePath -Label 'worker handshake'
-  Assert-NoReparseAncestors -Path $workerErrorPath -Label 'worker error'
-  Assert-NoReparseAncestors -Path $workerStartedPath -Label 'worker started marker'
-  Assert-NoReparseAncestors -Path $workerStdoutPath -Label 'worker stdout'
-  Assert-NoReparseAncestors -Path $workerStderrPath -Label 'worker stderr'
-  Write-LaunchRecordAtomically -Path $configPath -Record ([ordered]@{
-    schemaVersion = 1
-    launchId = $LaunchToken
-    nodePath = $NodePath
-    arguments = @($Arguments | ForEach-Object { [string]$_ })
-    stdoutPath = $StdoutPath
-    stderrPath = $StderrPath
-    handshakePath = $handshakePath
-    workerErrorPath = $workerErrorPath
-    workerStartedPath = $workerStartedPath
-    workerStdoutPath = $workerStdoutPath
-    workerStderrPath = $workerStderrPath
-  })
-  # Win32_Process.Create is used for the final Node process itself. This
-  # removes the unreliable PowerShell trampoline/argv boundary: the PID
-  # returned by CIM is the PID we monitor and the launch token is on that
-  # exact command line. The strict worker script remains available for direct
-  # validation tests, but is not a second attribution point in production.
-  foreach ($logPath in @($workerStdoutPath, $workerStderrPath)) {
+  Assert-NoReparseAncestors -Path $StdoutPath -Label 'stdout log'
+  Assert-NoReparseAncestors -Path $StderrPath -Label 'stderr log'
+  if (-not (Test-SameBridgePath -Left ([IO.Path]::GetDirectoryName($StderrPath)) -Right $launchDirectory) -or
+      [IO.Path]::GetFileName($StdoutPath) -ine 'stdout.log' -or
+      [IO.Path]::GetFileName($StderrPath) -ine 'stderr.log') {
+    throw 'detached Node logs must be stdout.log and stderr.log inside the launch directory.'
+  }
+  foreach ($logPath in @($StdoutPath, $StderrPath)) {
     if (-not (Test-Path -LiteralPath $logPath -PathType Leaf)) {
       [IO.File]::WriteAllText($logPath, '')
     }
   }
+  $launchArguments = @($Arguments + @(
+      '--bridge-launch-token', $LaunchToken,
+      '--bridge-stdout-log', $StdoutPath,
+      '--bridge-stderr-log', $StderrPath
+    ))
   $nodeCommandLine = (ConvertTo-WindowsProcessArgument -Value $NodePath) + ' ' +
-    ((@($Arguments | ForEach-Object {
+    ((@($launchArguments | ForEach-Object {
       ConvertTo-WindowsProcessArgument -Value ([string]$_)
     })) -join ' ')
   try {
@@ -644,37 +618,24 @@ function Start-DetachedNodeWorker {
     $errorRecord.Data['launchClass'] = 'not-created'
     throw $errorRecord
   }
-  $wrapperPid = [int]$created.ProcessId
+  $finalPid = [int]$created.ProcessId
   try {
-    if ($wrapperPid -le 0) { throw 'detached Node creation returned no attributable PID.' }
-    Write-LaunchRecordAtomically -Path $workerStartedPath -Record ([ordered]@{
-      schemaVersion = 1
-      state = 'created'
-      launchId = $LaunchToken
-      pid = $wrapperPid
-    })
+    if ($finalPid -le 0) { throw 'detached Node creation returned no attributable PID.' }
     if ($SimulateAttributionFailure) {
       $errorRecord = New-Object System.Exception('detached Node process was created but attribution was intentionally withheld.')
       $errorRecord.Data['launchClass'] = 'created-but-unattributed'
-      $errorRecord.Data['wrapperPid'] = $wrapperPid
+      $errorRecord.Data['wrapperPid'] = $finalPid
       throw $errorRecord
     }
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
     while ([DateTimeOffset]::UtcNow -lt $deadline) {
       try {
-        $process = Get-Process -Id $wrapperPid -ErrorAction Stop
+        $process = Get-Process -Id $finalPid -ErrorAction Stop
         $processStartedAt = Get-ProcessStartedAtText -Process $process
-        Write-LaunchRecordAtomically -Path $handshakePath -Record ([ordered]@{
-          schemaVersion = 1
-          launchId = $LaunchToken
-          pid = $wrapperPid
-          processStartedAt = $processStartedAt
-          workerPid = $PID
-        })
         return [ordered]@{
-          pid = $wrapperPid
+          pid = $finalPid
           processStartedAt = $processStartedAt
-          wrapperPid = $wrapperPid
+          wrapperPid = $finalPid
         }
       } catch {
         # The process may need one short scheduling turn before Get-Process can
@@ -688,7 +649,7 @@ function Start-DetachedNodeWorker {
       $_.Exception.Data['launchClass'] = 'created-but-unattributed'
     }
     if ($null -eq $_.Exception.Data -or -not $_.Exception.Data.Contains('wrapperPid')) {
-      $_.Exception.Data['wrapperPid'] = $wrapperPid
+      $_.Exception.Data['wrapperPid'] = $finalPid
     }
     throw
   }
@@ -746,7 +707,10 @@ function Convert-LaunchRecordToPublic {
     [Parameter(Mandatory = $true)][object]$Record,
     [Parameter(Mandatory = $true)][bool]$Pass
   )
-  $public = [ordered]@{ pass = $Pass }
+  $public = [ordered]@{
+    pass = $Pass
+    retryAllowed = [bool]($Record.state -eq 'failed' -and $Record.errorClass -eq 'not-created')
+  }
   if ($Record -is [System.Collections.IDictionary]) {
     foreach ($key in $Record.Keys) {
       $public[$key] = $Record[$key]
@@ -826,7 +790,7 @@ function Start-DetachedLaunch {
       throw 'test-only Start-Process failure'
     }
     $launchArguments = @($Arguments + @('--bridge-launch-token', $launchId))
-    $workerParameters = @{
+    $finalNodeParameters = @{
       NodePath = $NodePath
       Arguments = $launchArguments
       LaunchToken = $launchId
@@ -834,7 +798,7 @@ function Start-DetachedLaunch {
       StderrPath = $stderrPath
       SimulateAttributionFailure = $SimulateAttributionFailure
     }
-    $handshake = Start-DetachedNodeWorker @workerParameters
+    $handshake = Start-DetachedFinalNodeProcess @finalNodeParameters
     $child = $handshake
     $record.pid = [int]$handshake.pid
     $record.processStartedAt = [string]$handshake.processStartedAt
@@ -863,11 +827,7 @@ function Start-DetachedLaunch {
         $record.wrapperPid = [int]$child.wrapperPid
       }
       $record.state = 'starting'
-      $record.error = if ($message -match 'failed before final Node handshake') {
-        'detached worker was created but failed before final Node handshake; do not retry automatically.'
-      } else {
-        'detached Node was created but final PID attribution failed; do not retry automatically.'
-      }
+      $record.error = 'detached final Node was created but PID attribution failed; do not retry automatically.'
       Write-LaunchRecordAtomically -Path $launchPath -Record $record
       return Convert-LaunchRecordToPublic -Record $record -Pass $false
     }

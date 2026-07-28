@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -77,6 +78,7 @@ const defaultStatePath = path.join(
   "state.json",
 );
 export const DEFAULT_TIMEOUT_MS = 600000;
+const MAX_LAUNCH_LOG_BYTES = 64 * 1024;
 const PNG_DATA_PREFIX = "data:image/png;base64,";
 const MAX_RENDERED_DATA_URL_LENGTH = PNG_DATA_PREFIX.length + IMAGE_LIMITS.maxBase64Length;
 const MAX_BLOB_CHUNK_SIZE = 1024 * 1024;
@@ -108,6 +110,64 @@ function requireAbsolute(value, label) {
     throw new Error(`${label} must be an absolute path`);
   }
   return path.win32.normalize(value);
+}
+
+function validateLaunchLogOptions(options) {
+  const hasStdout = options.stdoutLogPath !== null;
+  const hasStderr = options.stderrLogPath !== null;
+  if (hasStdout !== hasStderr) {
+    throw new Error("bridge stdout/stderr log paths must be supplied as a pair");
+  }
+  if (!hasStdout) return options;
+  if (!options.launchToken) throw new Error("bridge launch logs require a launch token");
+  const stdout = requireAbsolute(options.stdoutLogPath, "bridge stdout log path");
+  const stderr = requireAbsolute(options.stderrLogPath, "bridge stderr log path");
+  const launchDirectory = path.win32.dirname(stdout);
+  if (path.win32.dirname(stderr).toLowerCase() !== launchDirectory.toLowerCase()) {
+    throw new Error("bridge stdout/stderr logs must share the launch directory");
+  }
+  if (path.win32.basename(stdout).toLowerCase() !== "stdout.log" ||
+      path.win32.basename(stderr).toLowerCase() !== "stderr.log") {
+    throw new Error("bridge launch log names must be stdout.log and stderr.log");
+  }
+  if (path.win32.basename(launchDirectory).toLowerCase() !== options.launchToken.toLowerCase()) {
+    throw new Error("bridge launch log directory must match the launch token");
+  }
+  options.stdoutLogPath = stdout;
+  options.stderrLogPath = stderr;
+  return options;
+}
+
+function launchLogPathsFromArgv(argv) {
+  try {
+    let launchToken = null;
+    let stdoutLogPath = null;
+    let stderrLogPath = null;
+    for (let index = 1; index < argv.length; index += 1) {
+      if (argv[index] === "--bridge-launch-token") launchToken = argv[index + 1] ?? null;
+      if (argv[index] === "--bridge-stdout-log") stdoutLogPath = argv[index + 1] ?? null;
+      if (argv[index] === "--bridge-stderr-log") stderrLogPath = argv[index + 1] ?? null;
+    }
+    return validateLaunchLogOptions({ launchToken, stdoutLogPath, stderrLogPath });
+  } catch {
+    return null;
+  }
+}
+
+function safeLaunchLogError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/[\r\n]+/gu, " ").slice(0, 2000) || "bridge operation failed";
+}
+
+export function appendBridgeLaunchLog(logPath, value) {
+  if (typeof logPath !== "string" || !path.win32.isAbsolute(logPath)) {
+    throw new Error("bridge launch log path must be absolute");
+  }
+  const line = JSON.stringify(value);
+  const bounded = Buffer.byteLength(line, "utf8") <= MAX_LAUNCH_LOG_BYTES
+    ? line
+    : JSON.stringify({ pass: false, error: "bridge launch log payload exceeded the bounded limit" });
+  fsSync.appendFileSync(logPath, `${bounded}\n`, { encoding: "utf8", flag: "a" });
 }
 
 export function batchProgressPath(reportPath) {
@@ -177,6 +237,8 @@ export function parseBridgeArgs(argv) {
     output: null,
     statePath: null,
     launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
     experimentalQuickChat: false,
     timeoutMs: DEFAULT_TIMEOUT_MS,
   };
@@ -198,6 +260,8 @@ export function parseBridgeArgs(argv) {
       }
       options.launchToken = launchToken;
     }
+    else if (argument === "--bridge-stdout-log") options.stdoutLogPath = argv[++index];
+    else if (argument === "--bridge-stderr-log") options.stderrLogPath = argv[++index];
     else if (argument === "--timeout-ms") options.timeoutMs = Number(argv[++index]);
     else if (argument === "--poll-ms") options.pollMs = Number(argv[++index]);
     else throw new Error(`Unknown argument: ${argument}`);
@@ -245,6 +309,7 @@ export function parseBridgeArgs(argv) {
       options.allowDelete || options.experimentalQuickChat) {
     throw new Error(`${options.command} does not accept batch mutation arguments`);
   }
+  validateLaunchLogOptions(options);
   return options;
 }
 
@@ -4174,14 +4239,33 @@ export async function runBridgeMain(argv, { discover = discoverBridge } = {}) {
 }
 
 async function main() {
-  const result = await runBridgeMain(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const launchLogs = launchLogPathsFromArgv(argv);
+  const result = await runBridgeMain(argv);
+  if (launchLogs) {
+    appendBridgeLaunchLog(launchLogs.stdoutLogPath, {
+      pass: true,
+      command: argv[0] || null,
+      launchId: launchLogs.launchToken,
+    });
+  }
   console.log(JSON.stringify(result, null, 2));
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 if (isMain) {
   main().catch((error) => {
-    console.error(JSON.stringify({ pass: false, error: error.message }, null, 2));
+    const argv = process.argv.slice(2);
+    const launchLogs = launchLogPathsFromArgv(argv);
+    const safeError = { pass: false, command: argv[0] || null, launchId: launchLogs?.launchToken || null, error: safeLaunchLogError(error) };
+    if (launchLogs) {
+      try {
+        appendBridgeLaunchLog(launchLogs.stderrLogPath, safeError);
+      } catch {
+        // Preserve the original stderr result if a launcher log cannot be written.
+      }
+    }
+    console.error(JSON.stringify(safeError, null, 2));
     process.exitCode = 1;
   });
 }

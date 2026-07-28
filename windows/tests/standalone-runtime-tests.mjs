@@ -922,10 +922,30 @@ function makeDetachedReportRuntime(root, delayMs = 250) {
     "const output = outputIndex >= 0 ? args[outputIndex + 1] : null;",
     "const tokenIndex = args.indexOf('--bridge-launch-token');",
     "const launchId = tokenIndex >= 0 ? args[tokenIndex + 1] : null;",
+    "const stdoutIndex = args.indexOf('--bridge-stdout-log');",
+    "const stderrIndex = args.indexOf('--bridge-stderr-log');",
+    "const stdoutLog = stdoutIndex >= 0 ? args[stdoutIndex + 1] : null;",
+    "const stderrLog = stderrIndex >= 0 ? args[stderrIndex + 1] : null;",
     "setTimeout(() => {",
     "  if (output) fs.writeFileSync(output, JSON.stringify({ pass: true, command, launchId, jobs: [] }));",
+    "  if (stdoutLog) fs.appendFileSync(stdoutLog, JSON.stringify({ pass: true, launchId }) + '\\n');",
+    "  if (stderrLog) fs.appendFileSync(stderrLog, '');",
     "  process.exit(0);",
     "}, " + String(delayMs) + ");",
+    "",
+  ].join("\n"), "utf8");
+  return fakeScript;
+}
+
+function makeCrashBeforeReportRuntime(root) {
+  const fakeScript = path.join(root, "windows", "scripts", "chatgpt-bridge.mjs");
+  writeFileSync(fakeScript, [
+    'import fs from "node:fs";',
+    "const args = process.argv.slice(2);",
+    "const stderrIndex = args.indexOf('--bridge-stderr-log');",
+    "const stderrLog = stderrIndex >= 0 ? args[stderrIndex + 1] : null;",
+    "if (stderrLog) fs.appendFileSync(stderrLog, JSON.stringify({ pass: false, error: 'fake-before-report' }) + '\\n');",
+    "process.exit(1);",
     "",
   ].join("\n"), "utf8");
   return fakeScript;
@@ -979,6 +999,8 @@ test("detached batch, resume and watch each receive a durable launch handle with
       assert.equal(path.basename(path.dirname(launch.launchPath)), launch.launchId);
       assert.equal(path.dirname(launch.stdoutPath), path.dirname(launch.launchPath));
       assert.equal(path.dirname(launch.stderrPath), path.dirname(launch.launchPath));
+      assert.equal(existsSync(launch.stdoutPath), true, action);
+      assert.equal(existsSync(launch.stderrPath), true, action);
       assert.equal(launch.reportPath, outputPath);
       if (action === "batch") {
         assert.equal(launch.progressPath, outputPath + ".progress.json");
@@ -1016,7 +1038,7 @@ test("detach returns the launch handle before a long child report is written", (
     const result = runDetachedRunner(runner, runtime, "batch", inputPath, outputPath, launchRoot, ["-AllowSend"]);
     const elapsedMs = Date.now() - startedAt;
     const launch = JSON.parse(result.stdout);
-    assert.equal(result.status, 0, result.stderr + result.stdout + "\\nworker stderr: " + (existsSync(launch.stderrPath) ? readFileSync(launch.stderrPath, "utf8") : "<missing>"));
+    assert.equal(result.status, 0, result.stderr + result.stdout + "\\nlaunch stderr: " + (existsSync(launch.stderrPath) ? readFileSync(launch.stderrPath, "utf8") : "<missing>"));
     childPid = launch.pid;
     wrapperPid = launch.wrapperPid;
     assert.ok(elapsedMs < 6000, `detach waited for child: ${elapsedMs}ms`);
@@ -1025,6 +1047,82 @@ test("detach returns the launch handle before a long child report is written", (
   } finally {
     stopProcess(childPid);
     stopProcess(wrapperPid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("final Node failure before report leaves a bounded public stderr log and no retry permission", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-crash-log-"));
+  let childPid = null;
+  try {
+    const skills = path.join(temporaryRoot, "skills");
+    const runtime = path.join(temporaryRoot, "runtime");
+    const launchRoot = path.join(temporaryRoot, "launches");
+    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
+    makeCrashBeforeReportRuntime(runtime);
+    refreshDeployedRuntimeEntry(skills, runtime);
+    const inputPath = path.join(temporaryRoot, "input.json");
+    const outputPath = path.join(temporaryRoot, "report.json");
+    writeFileSync(inputPath, "{}\n", "utf8");
+    const runner = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "run-bridge.ps1");
+    const launched = runDetachedRunner(runner, runtime, "batch", inputPath, outputPath, launchRoot, ["-AllowSend"]);
+    assertPowerShellSuccess(launched);
+    const launch = JSON.parse(launched.stdout);
+    childPid = launch.pid;
+    const waited = runPowerShell(runner, [
+      "-Action", "wait", "-LaunchPath", launch.launchPath, "-TimeoutMs", "15000", "-PollMs", "250",
+    ]);
+    assertPowerShellSuccess(waited);
+    const status = JSON.parse(waited.stdout);
+    assert.equal(status.state, "unknown-after-launch");
+    assert.equal(status.retryAllowed, false);
+    assert.equal(existsSync(launch.stdoutPath), true);
+    assert.equal(existsSync(launch.stderrPath), true);
+    const stderr = readFileSync(launch.stderrPath, "utf8");
+    assert.ok(stderr.length > 0 && Buffer.byteLength(stderr, "utf8") <= 1048576);
+    assert.match(stderr, /fake-before-report/);
+    assert.doesNotMatch(stderr, /input\.json|report\.json/);
+  } finally {
+    stopProcess(childPid);
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("real bridge top-level failure writes one safe bounded stderr JSON record", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-real-error-log-"));
+  try {
+    const launchId = crypto.randomUUID();
+    const launchDirectory = path.join(temporaryRoot, "launches", launchId);
+    mkdirSync(launchDirectory, { recursive: true });
+    const stdoutPath = path.join(launchDirectory, "stdout.log");
+    const stderrPath = path.join(launchDirectory, "stderr.log");
+    writeFileSync(stdoutPath, "", "utf8");
+    writeFileSync(stderrPath, "", "utf8");
+    const inputPath = path.join(temporaryRoot, "missing-input.json");
+    const outputPath = path.join(temporaryRoot, "report.json");
+    const result = spawnSync(process.execPath, [
+      runtimeScript,
+      "batch",
+      "--input", inputPath,
+      "--output", outputPath,
+      "--allow-send",
+      "--bridge-launch-token", launchId,
+      "--bridge-stdout-log", stdoutPath,
+      "--bridge-stderr-log", stderrPath,
+    ], { encoding: "utf8", env: { ...process.env, LOCALAPPDATA: temporaryRoot } });
+    assert.notEqual(result.status, 0, result.stdout);
+    const stderrLines = readFileSync(stderrPath, "utf8").trim().split(/\r?\n/).filter(Boolean);
+    assert.equal(stderrLines.length, 1);
+    assert.ok(Buffer.byteLength(stderrLines[0], "utf8") <= 65536);
+    const logged = JSON.parse(stderrLines[0]);
+    assert.equal(logged.pass, false);
+    assert.equal(logged.command, "batch");
+    assert.equal(logged.launchId, launchId);
+    assert.equal(typeof logged.error, "string");
+    assert.ok(logged.error.length > 0);
+    assert.equal(readFileSync(stdoutPath, "utf8"), "");
+    assert.equal(existsSync(outputPath), false);
+  } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
 });
@@ -1064,7 +1162,7 @@ test("status and wait are runner-only read-only actions and survive manifest mis
     assert.equal(existsSync(marker), false);
 
     const waited = runPowerShell(runner, [
-      "-Action", "wait", "-LaunchPath", launch.launchPath, "-TimeoutMs", "5000", "-PollMs", "250",
+      "-Action", "wait", "-LaunchPath", launch.launchPath, "-TimeoutMs", "15000", "-PollMs", "250",
     ], { PATH: fakeBin + ";" + process.env.PATH });
     assertPowerShellSuccess(waited);
     const waitedValue = JSON.parse(waited.stdout);
@@ -1442,7 +1540,7 @@ test("unattributed launches still expose report and progress corruption explicit
     const corruptStatus = JSON.parse(corruptResult.stdout);
     assert.equal(corruptStatus.reason, "report-corrupt");
     assert.equal(corruptStatus.reportCorrupt, true);
-    assert.equal(corruptStatus.retryAllowed, undefined);
+    assert.equal(corruptStatus.retryAllowed, false);
     assert.doesNotMatch(corruptResult.stdout, /not-json/);
 
     const reboundRoot = path.join(temporaryRoot, "report-rebound");
@@ -1459,7 +1557,7 @@ test("unattributed launches still expose report and progress corruption explicit
     const reboundStatus = JSON.parse(reboundResult.stdout);
     assert.equal(reboundStatus.reason, "report-rebound");
     assert.equal(reboundStatus.reportRebound, true);
-    assert.equal(reboundStatus.retryAllowed, undefined);
+    assert.equal(reboundStatus.retryAllowed, false);
     assert.doesNotMatch(reboundResult.stdout, /DO_NOT_READ_UNATTRIBUTED_REPORT/);
 
     const progressRoot = path.join(temporaryRoot, "progress-rebound");
@@ -1476,14 +1574,14 @@ test("unattributed launches still expose report and progress corruption explicit
     const progressStatus = JSON.parse(progressResult.stdout);
     assert.equal(progressStatus.reason, "progress-rebound");
     assert.equal(progressStatus.progressRebound, true);
-    assert.equal(progressStatus.retryAllowed, undefined);
+    assert.equal(progressStatus.retryAllowed, false);
     assert.doesNotMatch(progressResult.stdout, /DO_NOT_READ_UNATTRIBUTED_PROGRESS/);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
 });
 
-test("detached worker creation failure leaves a failed launch record under the test-only gate", () => {
+test("direct final Node creation failure leaves a failed launch record under the test-only gate", () => {
   const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-start-fail-"));
   try {
     const skills = path.join(temporaryRoot, "skills");
@@ -1551,7 +1649,7 @@ test("created but unattributed launch is durable and cannot be treated as retrya
     assert.equal(launch.state, "starting");
     assert.equal(launch.errorClass, "created-but-unattributed");
     assert.equal(launch.pass, false);
-    assert.equal(launch.retryAllowed, undefined);
+    assert.equal(launch.retryAllowed, false);
     assert.ok(wrapperPid > 0);
     const status = runPowerShell(runner, ["-Action", "status", "-LaunchPath", launch.launchPath]);
     assertPowerShellSuccess(status);
@@ -1646,7 +1744,7 @@ test("two concurrent detached launches with one output path still keep token-bou
   }
 });
 
-test("detached worker preserves spaces ampersands and percent signs without cmd expansion", () => {
+test("direct detached Node preserves spaces ampersands and percent signs without cmd expansion", () => {
   const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-launch-quoting-"));
   let childPid = null;
   let wrapperPid = null;
@@ -1682,53 +1780,34 @@ test("detached worker preserves spaces ampersands and percent signs without cmd 
   }
 });
 
-test("detached worker rejects unknown config fields before starting Node", () => {
-  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-worker-schema-"));
-  try {
-    const skills = path.join(temporaryRoot, "skills");
-    const runtime = path.join(temporaryRoot, "runtime");
-    assertPowerShellSuccess(runPowerShell(installScript, installArgs(skills, runtime)));
-    const worker = path.join(skills, "dispatch-chatgpt-bridge", "scripts", "detached-node-worker.ps1");
-    const configPath = path.join(temporaryRoot, "worker-config.json");
-    const handshakePath = path.join(temporaryRoot, "handshake.json");
-    writeFileSync(configPath, JSON.stringify({
-      schemaVersion: 1,
-      launchId: "11111111-1111-4111-8111-111111111111",
-      nodePath: process.execPath,
-      arguments: [],
-      stdoutPath: path.join(temporaryRoot, "stdout.log"),
-      stderrPath: path.join(temporaryRoot, "stderr.log"),
-      handshakePath,
-      workerStartedPath: path.join(temporaryRoot, "worker-started.json"),
-      workerStdoutPath: path.join(temporaryRoot, "worker-stdout.log"),
-      workerStderrPath: path.join(temporaryRoot, "worker-stderr.log"),
-      unknown: "reject-me",
-    }), "utf8");
-    const result = runPowerShell(worker, ["-ConfigPath", configPath, "-Execute"]);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr + result.stdout, /unknown|config|invalid/i);
-    assert.equal(existsSync(handshakePath), false);
-  } finally {
-    rmSync(temporaryRoot, { recursive: true, force: true });
-  }
+test("direct CIM launch has no dead detached worker script dependency", () => {
+  const launchControl = readFileSync(
+    path.join(repositoryRoot, "skills", "dispatch-chatgpt-bridge", "scripts", "launch-control.ps1"),
+    "utf8",
+  );
+  assert.doesNotMatch(launchControl, /detached-node-worker\.ps1|worker-config\.json|worker-handshake\.json/);
+  const installedWorker = path.join(
+    repositoryRoot,
+    "skills",
+    "dispatch-chatgpt-bridge",
+    "scripts",
+    "detached-node-worker.ps1",
+  );
+  assert.equal(existsSync(installedWorker), false);
 });
 
 test("Windows CRT quoting preserves trailing backslashes and embedded quotes", () => {
   const launchControl = path.join(repositoryRoot, "skills", "dispatch-chatgpt-bridge", "scripts", "launch-control.ps1");
-  const workerLibrary = path.join(repositoryRoot, "skills", "dispatch-chatgpt-bridge", "scripts", "detached-node-worker-library.ps1");
   const command = [
     `. '${launchControl.replaceAll("'", "''")}'`,
     `$one = ConvertTo-WindowsProcessArgument -Value 'C:\\quoted path\\'`,
     `$two = ConvertTo-WindowsProcessArgument -Value ('C:\\quoted path\\' + [char]34 + 'tail')`,
-    `. '${workerLibrary.replaceAll("'", "''")}'`,
-    `$three = ConvertTo-WindowsProcessArgument -Value 'C:\\quoted path\\'`,
-    `$four = ConvertTo-WindowsProcessArgument -Value ('C:\\quoted path\\' + [char]34 + 'tail')`,
-    "Write-Output $one; Write-Output $two; Write-Output $three; Write-Output $four",
+    "Write-Output $one; Write-Output $two",
   ].join("; ");
   const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr || result.stdout);
   const lines = result.stdout.trim().split(/\r?\n/);
   const trailing = ['"', "C:", "\\", "quoted path", "\\", "\\", '"'].join("");
   const embedded = ['"', "C:", "\\", "quoted path", "\\", "\\", "\\", '"', "tail", '"'].join("");
-  assert.deepEqual(lines, [trailing, embedded, trailing, embedded]);
+  assert.deepEqual(lines, [trailing, embedded]);
 });
