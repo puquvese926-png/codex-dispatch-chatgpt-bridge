@@ -165,7 +165,9 @@ function createDomElement(tagName, {
   return element;
 }
 
-function createDomHarness(children) {
+function createDomHarness(children, {
+  href = "app://-/index.html",
+} = {}) {
   const document = createDomElement("document", { children });
   document.activeElement = null;
   const assignDocument = (node) => {
@@ -178,6 +180,7 @@ function createDomHarness(children) {
     evaluate(expression) {
       return vm.runInNewContext(expression, {
         document,
+        location: { href },
         getComputedStyle(node) {
           return {
             display: node.visible ? "block" : "none",
@@ -185,6 +188,7 @@ function createDomHarness(children) {
           };
         },
         Set,
+        URL,
       });
     },
   };
@@ -223,6 +227,11 @@ function createExactDialog(conversationId, composer, send) {
     attributes: { role: "dialog", "data-pip-obstacle": "quick-chat" },
     children: [identityRoot],
   });
+}
+
+function quickChatAppUrl(conversationId) {
+  const route = `/chatgpt/quick-chat/${conversationId}`;
+  return `app://-/index.html?initialRoute=${encodeURIComponent(route)}`;
 }
 
 test("annotates bridge evaluation failures with the exact recovery stage", () => {
@@ -720,6 +729,87 @@ test("send click revalidates exact conversation identity and marker atomically",
   assert.equal(wrongIdentitySend.clickCount, 0);
 });
 
+test("quick-chat send refuses a stale renderer route after preparation", () => {
+  const composer = createComposer(EXACT_MARKER);
+  const send = createSendButton();
+  const staleId = "local-chatgpt:55555555-5555-4555-8555-555555555555";
+  const harness = createDomHarness([composer, send], {
+    href: quickChatAppUrl(staleId),
+  });
+
+  const result = harness.evaluate(buildSendClickExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(result.clicked, false);
+  assert.equal(send.clickCount, 0);
+});
+
+test("quick-chat send succeeds only on the current expected app route", () => {
+  const composer = createComposer(EXACT_MARKER);
+  const send = createSendButton();
+  const harness = createDomHarness([composer, send], {
+    href: quickChatAppUrl(EXACT_CHATGPT_ID),
+  });
+
+  const result = harness.evaluate(buildSendClickExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(result.clicked, true);
+  assert.equal(send.clickCount, 1);
+});
+
+test("malformed prewarm and non-app quick-chat routes fail before click", () => {
+  const invalidRoutes = [
+    "app://-/index.html",
+    "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat-prewarm",
+    "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat%2Fbad%2Fextra",
+    `https://example.com/?initialRoute=${encodeURIComponent(`/chatgpt/quick-chat/${EXACT_CHATGPT_ID}`)}`,
+    `app://user:password@-/index.html?initialRoute=${encodeURIComponent(`/chatgpt/quick-chat/${EXACT_CHATGPT_ID}`)}`,
+  ];
+
+  for (const href of invalidRoutes) {
+    const composer = createComposer(EXACT_MARKER);
+    const send = createSendButton();
+    const harness = createDomHarness([composer, send], { href });
+    const result = harness.evaluate(buildSendClickExpression(
+      "chatgpt-quick-chat",
+      EXACT_CHATGPT_ID,
+      EXACT_MARKER,
+    ));
+    assert.equal(result.clicked, false, href);
+    assert.equal(send.clickCount, 0, href);
+  }
+});
+
+test("quick-chat focus and readiness fail when the current route is not expected", () => {
+  const composer = createComposer(EXACT_MARKER);
+  const send = createSendButton();
+  const staleId = "local-chatgpt:66666666-6666-4666-8666-666666666666";
+  const harness = createDomHarness([composer, send], {
+    href: quickChatAppUrl(staleId),
+  });
+
+  const focus = harness.evaluate(buildComposerFocusExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+  ));
+  const readiness = harness.evaluate(buildComposerReadinessExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(focus.ok, false);
+  assert.equal(readiness.ok, false);
+  assert.equal(harness.document.activeElement, null);
+});
+
 test("main local thread identity cannot authorize a Codex composer", () => {
   const codexComposer = createComposer(EXACT_MARKER);
   const codexSend = createSendButton();
@@ -745,6 +835,47 @@ test("main local thread identity cannot authorize a Codex composer", () => {
 
   assert.equal(result.clicked, false);
   assert.equal(codexSend.clickCount, 0);
+});
+
+test("main active sidebar identity authorizes only an explicit ChatGPT mode root", () => {
+  const activeThread = createDomElement("button", {
+    attributes: {
+      "data-app-action-sidebar-thread-id": EXACT_LOCAL_ID,
+      "aria-current": "page",
+    },
+  });
+  const modeControl = createDomElement("button", {
+    attributes: { "aria-label": "当前模式：ChatGPT" },
+  });
+  const chatComposer = createComposer(EXACT_MARKER, {
+    "aria-label": "给 ChatGPT 发消息",
+  });
+  const chatSend = createSendButton();
+  const chatRoot = createDomElement("main", {
+    children: [modeControl, chatComposer, chatSend],
+  });
+  const harness = createDomHarness([activeThread, chatRoot]);
+
+  const focus = harness.evaluate(buildComposerFocusExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+  ));
+  const readiness = harness.evaluate(buildComposerReadinessExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+    EXACT_MARKER,
+  ));
+  const clicked = harness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(focus.ok, true);
+  assert.equal(readiness.ok, true);
+  assert.equal(clicked.clicked, true);
+  assert.equal(harness.document.activeElement, chatComposer);
+  assert.equal(chatSend.clickCount, 1);
 });
 
 test("main local thread identity submits only through its bound ChatGPT root", () => {

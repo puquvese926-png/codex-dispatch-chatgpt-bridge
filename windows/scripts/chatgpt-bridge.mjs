@@ -1042,6 +1042,27 @@ function buildExactSubmissionRootSource(surface, conversationId) {
       }
       return null;
     };
+    const currentQuickChatConversationId = () => {
+      try {
+        const url = new URL(location.href);
+        if (url.protocol !== 'app:' || url.username || url.password) return null;
+        const initialRoute = url.searchParams.get('initialRoute');
+        if (!initialRoute) return null;
+        let route = initialRoute;
+        try {
+          route = decodeURIComponent(route);
+        } catch {}
+        const match = /^\\/chatgpt\\/quick-chat\\/([^/]+)$/.exec(route);
+        if (!match) return null;
+        const conversationId = match[1];
+        if (!/^(?:local-chatgpt:)?[A-Za-z0-9._-]{1,200}$/.test(conversationId)) {
+          return null;
+        }
+        return conversationId;
+      } catch {
+        return null;
+      }
+    };
     const hasChatGptMode = (root) => [...root.querySelectorAll('button')].some((node) => {
       if (!visible(node)) return false;
       const label = [
@@ -1099,6 +1120,15 @@ function buildExactSubmissionRootSource(surface, conversationId) {
     };
     const resolveExactOwner = (requireSend) => {
       if (surface === 'chatgpt-quick-chat') {
+        const currentConversationId = currentQuickChatConversationId();
+        if (currentConversationId !== expectedConversationId) {
+          return {
+            ok: false,
+            reason: 'quick-chat-route-mismatch',
+            currentConversationId,
+            expectedConversationId
+          };
+        }
         const composers = composersIn(document);
         if (composers.length !== 1) {
           return { ok: false, reason: 'composer-count', rootCount: 1, composerCount: composers.length };

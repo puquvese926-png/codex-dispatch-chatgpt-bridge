@@ -196,8 +196,14 @@ checks remain mandatory before send.
 Ordinary batch submission binds composer focus, readiness and send to the
 prepared job's exact `surface` and `conversationId`; readiness and send also bind
 the original marker. A native Quick Chat renderer may use its document root only
-after the outer CDP session has verified the exact conversation route. Embedded
-Quick Chat and the full main ChatGPT surface must resolve exactly one visible
+after the outer CDP session has verified the exact conversation route, and that
+prepared flag is not a continuing lease. Focus, readiness and send each parse
+their current `location.href` using the same strict `app:`/`initialRoute` rules
+as target discovery and require the live route to equal the expected
+`local-chatgpt:<uuid>`. Missing, malformed, credential-bearing, prewarm,
+non-`app:` and stale routes fail before control use; send repeats this check
+inside the click-capable evaluation. Embedded Quick Chat and the full main
+ChatGPT surface must resolve exactly one visible
 ChatGPT owner whose real DOM identity equals the expected `local-chatgpt:<uuid>`
 or `local:<uuid>`. Composer and send must be unique descendants of that same
 owner. A global active sidebar identity, an earlier Codex composer, another
