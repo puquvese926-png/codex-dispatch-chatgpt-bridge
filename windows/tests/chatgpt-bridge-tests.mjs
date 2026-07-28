@@ -2020,6 +2020,17 @@ test("handoff checkpoint prevents duplicate delivery and task rebinding", () => 
   assert.throws(() => selectNextApprovedHandoff(rebound, delivered), /rebound|reused/i);
 });
 
+test("watch commits against the latest checkpoint through the cross-process transaction", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function runWatch");
+  const end = source.indexOf("async function openHandoffApprovalConversation", start);
+  const watchSource = source.slice(start, end);
+  assert.match(watchSource, /commitHandoffDelivery\(\{[\s\S]*checkpointPath: manifest\.checkpointPath/);
+  assert.match(watchSource, /conversationId: manifest\.conversationId/);
+  assert.doesNotMatch(watchSource, /selectNextApprovedHandoff\(observation\.units/);
+  assert.match(watchSource, /error\?\.code !== "ELOCKBUSY"/);
+});
+
 test("handoff DOM collection is read-only and scoped to rendered conversation units", () => {
   assert.throws(() => buildHandoffUnitsExpression(), /surface|identity/i);
   const expression = buildHandoffUnitsExpression("chatgpt-main-chat", EXACT_CHATGPT_ID);

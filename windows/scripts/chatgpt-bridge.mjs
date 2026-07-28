@@ -13,12 +13,14 @@ import {
 } from "./chatgpt-generation-lifecycle.mjs";
 import {
   createEmptyHandoffCheckpoint,
-  recordDeliveredHandoff,
   selectNextApprovedHandoff,
-  validateHandoffCheckpoint,
   validateHandoffApprovalManifest,
   validateHandoffWatchManifest,
 } from "./chatgpt-handoff-protocol.mjs";
+import {
+  commitHandoffDelivery,
+  writeJsonAtomically,
+} from "./chatgpt-handoff-checkpoint.mjs";
 import {
   acquireBridgeControllerLock,
   buildDispatchPlan,
@@ -2909,30 +2911,12 @@ async function downloadJobImages(job, outputFile) {
   return artifacts;
 }
 
-async function writeJsonAtomically(file, value) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await fs.rename(temporary, file);
-}
-
 async function readLifecycleLedgerOrEmpty(file) {
   try {
     return validateConversationLifecycleLedger(await readStrictJson(file));
   } catch (error) {
     if (error?.code === "ENOENT" || /ENOENT|cannot find|not found/i.test(error?.message || "")) {
       return { schemaVersion: 1, entries: [] };
-    }
-    throw error;
-  }
-}
-
-async function readHandoffCheckpointOrEmpty(file, conversationId) {
-  try {
-    return validateHandoffCheckpoint(await readStrictJson(file), conversationId);
-  } catch (error) {
-    if (error?.code === "ENOENT" || /ENOENT|cannot find|not found/i.test(error?.message || "")) {
-      return createEmptyHandoffCheckpoint(conversationId);
     }
     throw error;
   }
@@ -2967,10 +2951,6 @@ async function readHandoffObservation(discovery, expectedSurface, expectedConver
 
 async function runWatch(options, discovery) {
   const manifest = validateHandoffWatchManifest(await readStrictJson(options.input));
-  let checkpoint = await readHandoffCheckpointOrEmpty(
-    manifest.checkpointPath,
-    manifest.conversationId,
-  );
   const runId = randomUUID();
   const startedAt = new Date().toISOString();
   const deadline = Date.now() + options.timeoutMs;
@@ -2990,33 +2970,37 @@ async function runWatch(options, discovery) {
     lastReadable = observation.readable;
     observedUnits = observation.units.length;
     if (observation.active && observation.readable) {
-      let handoff;
+      let delivery = null;
       try {
-        handoff = selectNextApprovedHandoff(observation.units, checkpoint);
-      } catch (error) {
-        const report = {
-          schemaVersion: 1,
-          pass: false,
-          command: "watch",
-          runId,
-          startedAt,
-          completedAt: new Date().toISOString(),
-          status: "invalid-handoff",
-          conversationId: manifest.conversationId,
-          surface: manifest.surface,
+        delivery = await commitHandoffDelivery({
           checkpointPath: manifest.checkpointPath,
-          polls,
-          observedUnits,
-          error: error.message,
-          handoff: null,
-        };
-        await writeJsonAtomically(options.output, report);
-        return report;
+          conversationId: manifest.conversationId,
+          units: observation.units,
+        });
+      } catch (error) {
+        if (error?.code !== "ELOCKBUSY") {
+          const report = {
+            schemaVersion: 1,
+            pass: false,
+            command: "watch",
+            runId,
+            startedAt,
+            completedAt: new Date().toISOString(),
+            status: "invalid-handoff",
+            conversationId: manifest.conversationId,
+            surface: manifest.surface,
+            checkpointPath: manifest.checkpointPath,
+            polls,
+            observedUnits,
+            error: error.message,
+            handoff: null,
+          };
+          await writeJsonAtomically(options.output, report);
+          return report;
+        }
       }
-      if (handoff) {
+      if (delivery?.status === "handoff-ready") {
         const deliveredAt = new Date().toISOString();
-        checkpoint = recordDeliveredHandoff(checkpoint, handoff, deliveredAt);
-        await writeJsonAtomically(manifest.checkpointPath, checkpoint);
         const report = {
           schemaVersion: 1,
           pass: true,
@@ -3031,8 +3015,11 @@ async function runWatch(options, discovery) {
           polls,
           observedUnits,
           error: null,
-          handoff,
+          handoff: delivery.handoff,
         };
+        // This is deliberately outside the checkpoint transaction catch. If
+        // report persistence fails, the committed checkpoint still prevents a
+        // later watcher from redelivering the same handoff.
         await writeJsonAtomically(options.output, report);
         return report;
       }
