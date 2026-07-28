@@ -76,6 +76,7 @@ export const DEFAULT_TIMEOUT_MS = 600000;
 const PNG_DATA_PREFIX = "data:image/png;base64,";
 const MAX_RENDERED_DATA_URL_LENGTH = PNG_DATA_PREFIX.length + IMAGE_LIMITS.maxBase64Length;
 const MAX_BLOB_CHUNK_SIZE = 1024 * 1024;
+const MATERIALIZED_APP_BLOB = Symbol("materialized-app-blob");
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value) &&
@@ -1731,7 +1732,30 @@ export function classifyJobObservation(observation) {
   return "complete";
 }
 
+function reportedImageDimensions(width, height) {
+  if (Number.isInteger(width) && Number.isInteger(height) && width >= 0 && height >= 0 &&
+      width <= IMAGE_LIMITS.maxDimension && height <= IMAGE_LIMITS.maxDimension &&
+      width * height <= IMAGE_LIMITS.maxPixels) {
+    return { width, height };
+  }
+  return { width: 0, height: 0 };
+}
+
+function consumeRenderedImageBudget(budget, dataUrlLength, decodedBytes) {
+  if (!Number.isInteger(dataUrlLength) || !Number.isInteger(decodedBytes) ||
+      budget.dataUrlLength + dataUrlLength > IMAGE_LIMITS.maxAggregateDataUrlLength ||
+      budget.decodedBytes + decodedBytes > IMAGE_LIMITS.maxAggregateBytes) {
+    throw new Error("rendered image aggregate safety budget exceeded");
+  }
+  budget.dataUrlLength += dataUrlLength;
+  budget.decodedBytes += decodedBytes;
+}
+
 export async function materializeRenderedImages(session, images) {
+  if (!Array.isArray(images) || images.length > IMAGE_LIMITS.maxImages) {
+    throw new Error("rendered image count exceeds the safety limit");
+  }
+  const budget = { dataUrlLength: 0, decodedBytes: 0 };
   const materialized = [];
   for (const image of images) {
     if (isStrictAppBlobSource(image?.src)) {
@@ -1767,9 +1791,14 @@ export async function materializeRenderedImages(session, images) {
       if (!completed || !total || dataUrl.length !== total || !dataUrl.startsWith(PNG_DATA_PREFIX)) {
         throw new Error("Rendered blob image chunks are incomplete");
       }
-      parseStrictImageDataUrl(dataUrl);
-      materialized.push({ ...image, src: dataUrl });
+      const inspected = parseStrictImageDataUrl(dataUrl);
+      consumeRenderedImageBudget(budget, dataUrl.length, inspected.bytes.length);
+      materialized.push({ ...image, src: dataUrl, [MATERIALIZED_APP_BLOB]: true });
     } else {
+      if (typeof image?.src === "string" && image.src.startsWith("data:")) {
+        const inspected = parseStrictImageDataUrl(image.src);
+        consumeRenderedImageBudget(budget, image.src.length, inspected.bytes.length);
+      }
       materialized.push(image);
     }
   }
@@ -1788,12 +1817,13 @@ function normalizeImage(image) {
   }
   const remote = url && isMetadataOnlyImageSource(image.src);
   if (!data && !remote) return null;
-  const width = data ? data.width :
-    Number.isInteger(image.width) && image.width >= 0 && image.width <= IMAGE_LIMITS.maxDimension ? image.width : 0;
-  const height = data ? data.height :
-    Number.isInteger(image.height) && image.height >= 0 && image.height <= IMAGE_LIMITS.maxDimension ? image.height : 0;
+  const dimensions = data ? data : reportedImageDimensions(image.width, image.height);
   const alt = typeof image.alt === "string" ? image.alt.slice(0, 500) : "";
-  return Object.freeze({ src: image.src, width, height, alt });
+  const normalized = { src: image.src, width: dimensions.width, height: dimensions.height, alt };
+  if (data && image[MATERIALIZED_APP_BLOB] === true) {
+    Object.defineProperty(normalized, MATERIALIZED_APP_BLOB, { value: true, enumerable: false });
+  }
+  return Object.freeze(normalized);
 }
 
 function remoteImageMetadata(image) {
@@ -1805,9 +1835,10 @@ function remoteImageMetadata(image) {
     return null;
   }
   if (!isMetadataOnlyImageSource(image.src) || !url.protocol) return null;
+  const dimensions = reportedImageDimensions(image.width, image.height);
   return Object.freeze({
-    width: Number.isInteger(image.width) && image.width >= 0 && image.width <= IMAGE_LIMITS.maxDimension ? image.width : 0,
-    height: Number.isInteger(image.height) && image.height >= 0 && image.height <= IMAGE_LIMITS.maxDimension ? image.height : 0,
+    width: dimensions.width,
+    height: dimensions.height,
     alt: typeof image.alt === "string" ? image.alt.slice(0, 500) : "",
   });
 }
@@ -1837,11 +1868,13 @@ export function summarizeCollectedImages(images) {
   if (!Array.isArray(images)) throw new Error("collected image list is invalid");
   return images.map((image) => {
     const remote = isMetadataOnlyImageSource(image?.src);
+    const dimensions = reportedImageDimensions(image?.width, image?.height);
     return {
-      sourceType: remote ? "remote-image" : "materialized-app-blob",
+      sourceType: remote ? "remote-image" : image?.[MATERIALIZED_APP_BLOB] === true ?
+        "materialized-app-blob" : "renderer-data-url",
       materializationStatus: remote ? "metadata-only" : "materialized",
-      width: Number(image?.width) || 0,
-      height: Number(image?.height) || 0,
+      width: dimensions.width,
+      height: dimensions.height,
       alt: typeof image?.alt === "string" ? image.alt : "",
     };
   });
@@ -2911,15 +2944,37 @@ async function closeOwnedQuickChat(session) {
 export async function materializeJobImages(job, outputFile) {
   const images = job.result?.images || [];
   if (!images.length) return [];
+  if (!Array.isArray(images) || images.length > IMAGE_LIMITS.maxImages) {
+    throw new Error("job image count exceeds the safety limit");
+  }
   const root = path.join(path.dirname(outputFile), `${path.basename(outputFile, path.extname(outputFile))}.assets`, job.id);
   let rootCreated = false;
+  let aggregateBytes = 0;
+  let aggregateBudgetExceeded = false;
   const artifacts = [];
   for (let index = 0; index < images.length; index += 1) {
     const image = images[index];
     const remote = remoteImageMetadata(image);
     if (!remote) {
+      if (aggregateBudgetExceeded) {
+        artifacts.push({
+          index,
+          status: "metadata-only",
+          materializationStatus: "metadata-only",
+          sourceType: "unsupported-image",
+          ...reportedImageDimensions(image?.width, image?.height),
+          alt: typeof image?.alt === "string" ? image.alt : "",
+          error: "job image aggregate safety budget exceeded",
+        });
+        continue;
+      }
       try {
         const inspected = parseStrictImageDataUrl(image?.src);
+        if (aggregateBytes + inspected.bytes.length > IMAGE_LIMITS.maxAggregateBytes) {
+          aggregateBudgetExceeded = true;
+          throw new Error("job image aggregate safety budget exceeded");
+        }
+        aggregateBytes += inspected.bytes.length;
         if (!rootCreated) {
           await fs.mkdir(root, { recursive: true });
           rootCreated = true;
@@ -2932,7 +2987,8 @@ export async function materializeJobImages(job, outputFile) {
           index,
           status: "downloaded",
           materializationStatus: "materialized",
-          sourceType: "materialized-app-blob",
+          sourceType: image?.[MATERIALIZED_APP_BLOB] === true ?
+            "materialized-app-blob" : "renderer-data-url",
           path: file,
           sha256: createHash("sha256").update(inspected.bytes).digest("hex"),
           bytes: inspected.bytes.length,
@@ -2946,8 +3002,7 @@ export async function materializeJobImages(job, outputFile) {
           status: "metadata-only",
           materializationStatus: "metadata-only",
           sourceType: "unsupported-image",
-          width: Number.isInteger(image?.width) && image.width >= 0 && image.width <= IMAGE_LIMITS.maxDimension ? image.width : 0,
-          height: Number.isInteger(image?.height) && image.height >= 0 && image.height <= IMAGE_LIMITS.maxDimension ? image.height : 0,
+          ...reportedImageDimensions(image?.width, image?.height),
           alt: typeof image?.alt === "string" ? image.alt : "",
           error: error.message,
         });

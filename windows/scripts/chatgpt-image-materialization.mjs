@@ -1,14 +1,20 @@
 const MAX_IMAGE_BYTES = 30 * 1024 * 1024;
 const MAX_IMAGE_PIXELS = 40_000_000;
 const MAX_IMAGE_DIMENSION = 16_384;
+const MAX_IMAGE_COUNT = 20;
+const MAX_AGGREGATE_IMAGE_BYTES = 120 * 1024 * 1024;
 const MAX_BASE64_LENGTH = 4 * Math.ceil(MAX_IMAGE_BYTES / 3);
+const MAX_AGGREGATE_DATA_URL_LENGTH = 4 * Math.ceil(MAX_AGGREGATE_IMAGE_BYTES / 3) + MAX_IMAGE_COUNT * 32;
 const PNG_SIGNATURE = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 export const IMAGE_LIMITS = Object.freeze({
   maxBytes: MAX_IMAGE_BYTES,
   maxPixels: MAX_IMAGE_PIXELS,
   maxDimension: MAX_IMAGE_DIMENSION,
+  maxImages: MAX_IMAGE_COUNT,
+  maxAggregateBytes: MAX_AGGREGATE_IMAGE_BYTES,
   maxBase64Length: MAX_BASE64_LENGTH,
+  maxAggregateDataUrlLength: MAX_AGGREGATE_DATA_URL_LENGTH,
 });
 
 const DATA_URL = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]*={0,2})$/u;
@@ -25,13 +31,18 @@ function validDimensions(width, height) {
   return { width, height };
 }
 
+const CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, value) => {
+  let crc = value;
+  for (let bit = 0; bit < 8; bit += 1) {
+    crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return crc >>> 0;
+});
+
 function crc32(bytes, start, end) {
   let crc = 0xffffffff;
   for (let index = start; index < end; index += 1) {
-    crc ^= bytes[index];
-    for (let bit = 0; bit < 8; bit += 1) {
-      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
-    }
+    crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ bytes[index]) & 0xff];
   }
   return (crc ^ 0xffffffff) >>> 0;
 }
@@ -44,6 +55,7 @@ function pngDimensions(bytes) {
   if (bytes.length < 33 || !equalBytes(bytes, PNG_SIGNATURE)) fail("PNG magic or length is invalid");
   let offset = 8;
   let dimensions = null;
+  let sawImageData = false;
   let sawEnd = false;
   while (offset + 12 <= bytes.length) {
     const length = new DataView(bytes.buffer, bytes.byteOffset + offset, 4).getUint32(0);
@@ -60,6 +72,7 @@ function pngDimensions(bytes) {
       const view = new DataView(bytes.buffer, bytes.byteOffset + dataStart, 13);
       dimensions = validDimensions(view.getUint32(0), view.getUint32(4));
     }
+    if (type === "IDAT") sawImageData = true;
     offset = chunkEnd;
     if (type === "IEND") {
       if (length !== 0 || offset !== bytes.length) fail("PNG IEND or trailing data is invalid");
@@ -67,7 +80,7 @@ function pngDimensions(bytes) {
       break;
     }
   }
-  if (!dimensions || !sawEnd) fail("PNG is incomplete");
+  if (!dimensions || !sawImageData || !sawEnd) fail("PNG is incomplete");
   return dimensions;
 }
 
@@ -80,6 +93,7 @@ function jpegDimensions(bytes) {
   if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) fail("JPEG magic or length is invalid");
   let offset = 2;
   let dimensions = null;
+  let frameComponentIds = null;
   let sawScan = false;
   while (offset < bytes.length) {
     if (bytes[offset] !== 0xff) fail("JPEG marker is invalid");
@@ -93,8 +107,18 @@ function jpegDimensions(bytes) {
     const segmentLength = (bytes[offset] << 8) | bytes[offset + 1];
     if (segmentLength < 2 || offset + segmentLength > bytes.length) fail("JPEG segment is truncated");
     if (isJpegSof(marker)) {
-      if (segmentLength < 8 || dimensions) fail("JPEG frame header is invalid");
+      if (segmentLength < 11 || dimensions) fail("JPEG frame header is invalid");
       const precision = bytes[offset + 2];
+      const componentCount = bytes[offset + 7];
+      if (componentCount < 1 || componentCount > 4 || segmentLength !== 8 + 3 * componentCount) {
+        fail("JPEG frame component structure is invalid");
+      }
+      frameComponentIds = new Set();
+      for (let index = 0; index < componentCount; index += 1) {
+        const componentId = bytes[offset + 8 + 3 * index];
+        if (frameComponentIds.has(componentId)) fail("JPEG frame component IDs are invalid");
+        frameComponentIds.add(componentId);
+      }
       if (precision < 1) fail("JPEG precision is invalid");
       dimensions = validDimensions(
         (bytes[offset + 5] << 8) | bytes[offset + 6],
@@ -102,6 +126,16 @@ function jpegDimensions(bytes) {
       );
     }
     if (marker === 0xda) {
+      const componentCount = bytes[offset + 2];
+      if (!frameComponentIds || componentCount < 1 || componentCount > 4 ||
+          segmentLength !== 6 + 2 * componentCount) {
+        fail("JPEG scan component structure is invalid");
+      }
+      for (let index = 0; index < componentCount; index += 1) {
+        if (!frameComponentIds.has(bytes[offset + 3 + 2 * index])) {
+          fail("JPEG scan component ID is invalid");
+        }
+      }
       sawScan = true;
       offset += segmentLength;
       break;
@@ -126,7 +160,8 @@ function webpDimensions(bytes) {
   const riffSize = new DataView(bytes.buffer, bytes.byteOffset + 4, 4).getUint32(0, true);
   if (riffSize !== bytes.length - 8) fail("WebP RIFF is truncated or has trailing data");
   let offset = 12;
-  let dimensions = null;
+  let canvasDimensions = null;
+  let payloadDimensions = null;
   while (offset < bytes.length) {
     if (offset + 8 > bytes.length) fail("WebP chunk header is truncated");
     const type = String.fromCharCode(...bytes.slice(offset, offset + 4));
@@ -135,31 +170,34 @@ function webpDimensions(bytes) {
     const dataStart = offset + 8;
     const chunkEnd = dataStart + paddedSize;
     if (size < 1 || chunkEnd > bytes.length) fail("WebP chunk is truncated");
-    if (type === "VP8 " && !dimensions) {
-      if (size < 10 || bytes[dataStart + 3] !== 0x9d || bytes[dataStart + 4] !== 0x01 || bytes[dataStart + 5] !== 0x2a) {
+    if (type === "ANIM" || type === "ANMF") {
+      fail("animated WebP is unsupported");
+    }
+    if (type === "VP8 ") {
+      if (size < 11 || bytes[dataStart + 3] !== 0x9d || bytes[dataStart + 4] !== 0x01 || bytes[dataStart + 5] !== 0x2a) {
         fail("WebP VP8 frame header is invalid");
       }
-      dimensions = validDimensions(
+      payloadDimensions = validDimensions(
         new DataView(bytes.buffer, bytes.byteOffset + dataStart + 6, 2).getUint16(0, true) & 0x3fff,
         new DataView(bytes.buffer, bytes.byteOffset + dataStart + 8, 2).getUint16(0, true) & 0x3fff,
       );
-    } else if (type === "VP8L" && !dimensions) {
-      if (size < 5 || bytes[dataStart] !== 0x2f) fail("WebP VP8L frame header is invalid");
+    } else if (type === "VP8L") {
+      if (size < 6 || bytes[dataStart] !== 0x2f) fail("WebP VP8L frame header is invalid");
       const width = 1 + (bytes[dataStart + 1] | ((bytes[dataStart + 2] & 0x3f) << 8));
       const height = 1 + ((bytes[dataStart + 2] >> 6) | (bytes[dataStart + 3] << 2) |
         ((bytes[dataStart + 4] & 0x0f) << 10));
-      dimensions = validDimensions(width, height);
-    } else if (type === "VP8X" && !dimensions) {
+      payloadDimensions = validDimensions(width, height);
+    } else if (type === "VP8X") {
       if (size < 10) fail("WebP VP8X frame header is invalid");
-      dimensions = validDimensions(
+      canvasDimensions = validDimensions(
         1 + readUint24LE(bytes, dataStart + 4),
         1 + readUint24LE(bytes, dataStart + 7),
       );
     }
     offset = chunkEnd;
   }
-  if (!dimensions) fail("WebP has no supported frame header");
-  return dimensions;
+  if (!payloadDimensions) fail("WebP has no supported image payload");
+  return canvasDimensions || payloadDimensions;
 }
 
 export function inspectImageBytes(mime, input) {

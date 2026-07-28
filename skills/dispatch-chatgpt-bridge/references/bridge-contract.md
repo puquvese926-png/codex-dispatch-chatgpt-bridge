@@ -161,6 +161,10 @@ Image materialization is deliberately local and bounded. Only a strict
 into that PNG data form, may become a local artifact. MIME, magic bytes, header
 dimensions and the decoded limits are checked before allocation and before the
 `wx` write: at most 30 MiB, 40,000,000 pixels and 16,384 pixels on either side.
+Across one result, at most 20 images and 120 MiB of decoded image bytes are
+accepted. Direct strict data URLs are reported as `sourceType:
+"renderer-data-url"`; only data produced by the exact app-blob materializer is
+reported as `sourceType: "materialized-app-blob"`.
 PNG IHDR, JPEG SOF and WebP VP8/VP8L/VP8X headers are the dimension authority;
 DOM-reported dimensions do not authorize a file.
 

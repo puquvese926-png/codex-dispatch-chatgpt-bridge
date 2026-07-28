@@ -2680,7 +2680,7 @@ test("keeps image metadata in reports without embedding image bytes", () => {
     { src: VALID_PNG_DATA_URL, width: 1672, height: 941, alt: "已生成图像 1" },
     { src: "https://files.oaiusercontent.com/image.png", width: 1024, height: 1024, alt: "generated" },
   ]), [
-    { sourceType: "materialized-app-blob", materializationStatus: "materialized", width: 1672, height: 941, alt: "已生成图像 1" },
+    { sourceType: "renderer-data-url", materializationStatus: "materialized", width: 1672, height: 941, alt: "已生成图像 1" },
     { sourceType: "remote-image", materializationStatus: "metadata-only", width: 1024, height: 1024, alt: "generated" },
   ]);
 });
