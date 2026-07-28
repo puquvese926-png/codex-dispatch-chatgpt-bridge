@@ -22,6 +22,48 @@ cache, and writes a route decision containing:
 `batch` recomputes this plan immediately before submission and embeds it in the
 progress sidecar and final report. A stale plan never authorizes a send.
 
+## Preflight path ownership
+
+Every command with a business input or output runs this order before discovery,
+controller/checkpoint locking, CDP access, UI evaluation or output writes:
+
+1. parse and normalize CLI arguments;
+2. read the command input once and strictly validate it;
+3. resolve and audit the complete role-tagged path set;
+4. preload state needed by the operation when the contract permits it;
+5. discover the bridge and only then acquire locks, touch the UI or write results.
+
+`discover` and `probe` have no business manifest; their read-only preflight only
+audits the standalone bridge state path. A prepared manifest object, rather than
+its path, is passed to every plan, batch, resume, watch, approve and cleanup
+runner. Batch lifecycle state is also preloaded before discovery so the runner
+does not reread the manifest or ledger by path after discovery.
+
+The audit assigns roles to the CLI input, report/output, derived progress file,
+standalone state, controller lock, capability cache, schema-v2 lifecycle ledger,
+watch checkpoint and its lock/audit metadata, reference files and cleanup
+artifacts. It compares three identities: case-insensitive normalized Win32
+lexical identity, canonical identity from `realpath` (including the nearest
+existing ancestor for a missing output), and physical `dev:ino` identity for
+existing files. Symlink/junction/reparse aliases and hardlinks therefore fail
+closed. Two references or two artifacts that resolve to the same identity also
+fail. A path used once for one logical object is represented by one role; the
+audit does not manufacture a self-collision.
+
+Preflight is read-only: it may use `lstat`, `stat` and `realpath`, but never
+creates directories or files and never renames, unlinks or deletes. A collision
+returns `EPATHCOLLISION` with the conflicting roles; discovery, CDP, UI and
+output writes must all remain at zero. Missing output/progress/ledger/checkpoint
+paths may be audited from their nearest existing ancestor but are not
+pre-created.
+
+This protects the command from accidental aliases and path-role collisions at
+the time of preflight. It is not a claim to defeat a malicious concurrent file
+system replacement after preflight (TOCTOU). The runner uses the validated
+in-memory manifest thereafter; callers needing stronger hostile-filesystem
+guarantees must add an operation-specific identity recheck immediately before
+the write.
+
 ## Generic batch schema v1
 
 Use for independent text, review or transformation jobs:

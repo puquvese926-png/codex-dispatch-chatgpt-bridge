@@ -19,6 +19,7 @@ import {
 } from "./chatgpt-handoff-protocol.mjs";
 import {
   commitHandoffDelivery,
+  checkpointLockPath,
   writeJsonAtomically,
 } from "./chatgpt-handoff-checkpoint.mjs";
 import {
@@ -30,10 +31,13 @@ import {
 import {
   acquireBridgeControllerLock,
   buildDispatchPlan,
+  bridgeCapabilityCachePath,
+  bridgeControllerLockPath,
   readQuickChatHealth,
   recordQuickChatHealth,
   releaseBridgeControllerLock,
 } from "./chatgpt-bridge-product-control.mjs";
+import { auditPathSet } from "./chatgpt-path-safety.mjs";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 const ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -2571,6 +2575,134 @@ export async function requestExactAttachmentInputNode(session, prepared) {
   }
 }
 
+function checkpointAuditEntries(checkpointPath) {
+  const lockPath = checkpointLockPath(checkpointPath);
+  return [
+    { role: "watch.checkpoint", path: checkpointPath, allowMissing: true },
+    { role: "watch.checkpoint-lock", path: lockPath, allowMissing: true },
+    { role: "watch.checkpoint-lock-owner", path: path.win32.join(lockPath, "owner.json"), allowMissing: true },
+  ];
+}
+
+function commandPathEntries(options, statePath) {
+  const entries = [
+    { role: "bridge.state", path: statePath, allowMissing: false },
+  ];
+  if (["plan", "batch", "resume", "watch", "approve", "cleanup"].includes(options.command)) {
+    entries.push({
+      role: options.command === "cleanup" ? "cleanup.ledger-input" : "command.input",
+      path: options.input,
+      allowMissing: false,
+    });
+    entries.push({ role: "command.output", path: options.output, allowMissing: true });
+  }
+  if (["plan", "batch", "resume", "approve", "cleanup"].includes(options.command)) {
+    entries.push({
+      role: "bridge.controller-lock",
+      path: bridgeControllerLockPath(statePath),
+      allowMissing: true,
+    });
+  }
+  if (["plan", "batch"].includes(options.command)) {
+    entries.push({
+      role: "bridge.capability-cache",
+      path: bridgeCapabilityCachePath(statePath),
+      allowMissing: true,
+    });
+  }
+  if (options.command === "batch") {
+    entries.push({ role: "batch.progress", path: batchProgressPath(options.output), allowMissing: true });
+  }
+  return entries;
+}
+
+function addBatchPathEntries(entries, batch) {
+  if (batch.schemaVersion !== 2) return;
+  entries.push({ role: "generation.lifecycle-ledger", path: batch.lifecycleLedgerPath, allowMissing: true });
+  for (const job of batch.jobs) {
+    for (let index = 0; index < (job.references || []).length; index += 1) {
+      entries.push({
+        role: `batch.job.${job.id}.reference.${index}`,
+        path: job.references[index].path,
+        allowMissing: false,
+      });
+    }
+  }
+}
+
+function addResumePathEntries(entries, manifest) {
+  if (manifest.lifecycleLedgerPath) {
+    entries.push({ role: "resume.lifecycle-ledger", path: manifest.lifecycleLedgerPath, allowMissing: true });
+  }
+}
+
+function addCleanupPathEntries(entries, cleanupManifest) {
+  for (const job of cleanupManifest.jobs) {
+    for (let index = 0; index < job.artifacts.length; index += 1) {
+      entries.push({
+        role: `cleanup.job.${job.id}.artifact.${index}`,
+        path: job.artifacts[index].path,
+        allowMissing: false,
+      });
+    }
+  }
+}
+
+export async function prepareBridgeCommand(options) {
+  if (!isPlainObject(options) || typeof options.command !== "string") {
+    throw new Error("bridge command options are invalid");
+  }
+  const statePath = options.statePath || defaultStatePath;
+  const entries = commandPathEntries(options, statePath);
+  let manifest = null;
+  let ledger = null;
+  let lifecycleLedger = null;
+  let cleanupManifest = null;
+  if (options.command === "plan" || options.command === "batch") {
+    manifest = validateBridgeBatch(await readStrictJson(options.input));
+    addBatchPathEntries(entries, manifest);
+  } else if (options.command === "resume") {
+    manifest = validateResumeManifest(await readStrictJson(options.input));
+    addResumePathEntries(entries, manifest);
+  } else if (options.command === "watch") {
+    manifest = validateHandoffWatchManifest(await readStrictJson(options.input));
+    entries.push(...checkpointAuditEntries(manifest.checkpointPath));
+  } else if (options.command === "approve") {
+    manifest = validateHandoffApprovalManifest(await readStrictJson(options.input));
+  } else if (options.command === "cleanup") {
+    ledger = validateConversationLifecycleLedger(await readStrictJson(options.input));
+    const selected = selectCleanupCandidates(ledger, new Date());
+    cleanupManifest = validateCleanupManifest({
+      schemaVersion: 1,
+      jobs: selected.map((entry) => ({
+        id: entry.jobId,
+        conversationId: entry.conversationId,
+        marker: entry.marker,
+        title: entry.historyTitle,
+        artifacts: entry.artifacts,
+      })),
+    });
+    addCleanupPathEntries(entries, cleanupManifest);
+  }
+  const pathAudit = await auditPathSet(entries);
+  if ((options.command === "plan" || options.command === "batch" || options.command === "resume") &&
+      manifest?.lifecycleLedgerPath) {
+    lifecycleLedger = await readLifecycleLedgerOrEmpty(manifest.lifecycleLedgerPath);
+  }
+  if (manifest?.schemaVersion === 2 && ["plan", "batch"].includes(options.command)) {
+    await Promise.all(manifest.jobs.map((job) => verifyJobReferences(job)));
+  }
+  return Object.freeze({
+    options,
+    statePath,
+    manifest,
+    ledger,
+    lifecycleLedger,
+    cleanupManifest,
+    pathAudit,
+  });
+}
+
 async function attachJobReferences(session, prepared, job) {
   validatePreparedSubmission(prepared);
   if (!job.references?.length) return;
@@ -3061,8 +3193,7 @@ async function readHandoffObservation(discovery, expectedSurface, expectedConver
   }
 }
 
-async function runWatch(options, discovery) {
-  const manifest = validateHandoffWatchManifest(await readStrictJson(options.input));
+async function runWatch(options, discovery, manifest) {
   const runId = randomUUID();
   const startedAt = new Date().toISOString();
   const deadline = Date.now() + options.timeoutMs;
@@ -3231,8 +3362,7 @@ export function takeHandoffApprovalSession(opened) {
   return session;
 }
 
-async function runApprove(options, discovery) {
-  const manifest = validateHandoffApprovalManifest(await readStrictJson(options.input));
+async function runApprove(options, discovery, manifest) {
   const runId = randomUUID();
   const startedAt = new Date().toISOString();
   const approvalText = `CODEX_APPROVE ${manifest.taskId}`;
@@ -3346,20 +3476,22 @@ async function runApprove(options, discovery) {
   return report;
 }
 
-async function recordGenerationLifecycle(batch, report, reportPath) {
+async function recordGenerationLifecycle(batch, report, reportPath, lifecycleLedgerState = null) {
   if (batch.schemaVersion !== 2) return null;
   const entries = buildLifecycleEntries(report, {
     jobType: batch.jobType,
     retentionDays: batch.retentionDays,
     reportPath,
   });
-  const existing = await readLifecycleLedgerOrEmpty(batch.lifecycleLedgerPath);
+  const existing = lifecycleLedgerState ? lifecycleLedgerState.value :
+    await readLifecycleLedgerOrEmpty(batch.lifecycleLedgerPath);
   const merged = mergeLifecycleEntries(existing, entries);
   await writeJsonAtomically(batch.lifecycleLedgerPath, merged);
+  if (lifecycleLedgerState) lifecycleLedgerState.value = merged;
   return { path: batch.lifecycleLedgerPath, recordedEntries: entries.length };
 }
 
-async function recordGenerationCheckpoint(batch, runId, jobs, reportPath) {
+async function recordGenerationCheckpoint(batch, runId, jobs, reportPath, lifecycleLedgerState = null) {
   if (batch.schemaVersion !== 2) return null;
   const retainedJobs = jobs.filter((job) => job?.conversationId && job?.surface && job?.submittedAt);
   if (!retainedJobs.length) return null;
@@ -3367,7 +3499,7 @@ async function recordGenerationCheckpoint(batch, runId, jobs, reportPath) {
     runId,
     surface: summarizeBatchSurface(retainedJobs),
     jobs: retainedJobs,
-  }, reportPath);
+  }, reportPath, lifecycleLedgerState);
 }
 
 async function inspectDispatchPlan(options, discovery, batch) {
@@ -3391,11 +3523,7 @@ async function inspectDispatchPlan(options, discovery, batch) {
   });
 }
 
-async function runPlan(options, discovery) {
-  const batch = validateBridgeBatch(await readStrictJson(options.input));
-  if (batch.schemaVersion === 2) {
-    await Promise.all(batch.jobs.map((job) => verifyJobReferences(job)));
-  }
+async function runPlan(options, discovery, batch) {
   const dispatchPlan = await inspectDispatchPlan(options, discovery, batch);
   const report = {
     schemaVersion: 1,
@@ -3414,11 +3542,7 @@ async function runPlan(options, discovery) {
   return report;
 }
 
-async function runBatch(options, discovery) {
-  const batch = validateBridgeBatch(await readStrictJson(options.input));
-  if (batch.schemaVersion === 2) {
-    await Promise.all(batch.jobs.map((job) => verifyJobReferences(job)));
-  }
+async function runBatch(options, discovery, batch, preloadedLifecycleLedger = null) {
   const dispatchPlan = await inspectDispatchPlan(options, discovery, batch);
   if (dispatchPlan.selectedMode === "unavailable") {
     throw new Error(dispatchPlan.userNotice);
@@ -3427,6 +3551,7 @@ async function runBatch(options, discovery) {
   const startedAt = new Date().toISOString();
   const jobs = [];
   let runError = null;
+  const lifecycleLedgerState = preloadedLifecycleLedger ? { value: preloadedLifecycleLedger } : null;
   const progressPath = batchProgressPath(options.output);
   await assertNoRunningBatchProgress(progressPath);
   let progressJobs = batch.jobs.map((job) => ({
@@ -3521,7 +3646,7 @@ async function runBatch(options, discovery) {
           updateProgressJob(submission);
           await persistBatchProgress();
           try {
-            await recordGenerationCheckpoint(batch, runId, [submission], options.output);
+            await recordGenerationCheckpoint(batch, runId, [submission], options.output, lifecycleLedgerState);
           } catch (error) {
             runError = `${runError ? `${runError}; ` : ""}Lifecycle checkpoint failed at ${job.id}: ${error.message}`;
             updateProgressJob({
@@ -3549,7 +3674,7 @@ async function runBatch(options, discovery) {
             updateProgressJob(collected);
             await persistBatchProgress();
             try {
-              await recordGenerationCheckpoint(batch, runId, [collected], options.output);
+              await recordGenerationCheckpoint(batch, runId, [collected], options.output, lifecycleLedgerState);
             } catch (error) {
               runError = `${runError ? `${runError}; ` : ""}Lifecycle checkpoint failed at ${job.id}: ${error.message}`;
               updateProgressJob({ id: job.id, error: `lifecycle checkpoint: ${error.message}` });
@@ -3599,7 +3724,7 @@ async function runBatch(options, discovery) {
       await persistBatchProgress();
       for (const collectedJob of collected) {
         try {
-          await recordGenerationCheckpoint(batch, runId, [collectedJob], options.output);
+          await recordGenerationCheckpoint(batch, runId, [collectedJob], options.output, lifecycleLedgerState);
         } catch (error) {
           runError = `${runError ? `${runError}; ` : ""}Lifecycle checkpoint failed at ${collectedJob.id}: ${error.message}`;
           updateProgressJob({ id: collectedJob.id, error: `lifecycle checkpoint: ${error.message}` });
@@ -3654,7 +3779,7 @@ async function runBatch(options, discovery) {
     } : null,
   };
   await writeJsonAtomically(options.output, report);
-  const lifecycle = await recordGenerationLifecycle(batch, report, options.output);
+  const lifecycle = await recordGenerationLifecycle(batch, report, options.output, lifecycleLedgerState);
   if (lifecycle) {
     report.lifecycle = lifecycle;
     await writeJsonAtomically(options.output, report);
@@ -3664,8 +3789,7 @@ async function runBatch(options, discovery) {
   return report;
 }
 
-async function runResume(options, discovery) {
-  const manifest = validateResumeManifest(await readStrictJson(options.input));
+async function runResume(options, discovery, manifest, preloadedLifecycleLedger = null) {
   const runId = randomUUID();
   const startedAt = new Date().toISOString();
   const jobs = [];
@@ -3842,12 +3966,13 @@ async function runResume(options, discovery) {
   };
   await writeJsonAtomically(options.output, report);
   if (manifest.jobType) {
+    const lifecycleLedgerState = preloadedLifecycleLedger ? { value: preloadedLifecycleLedger } : null;
     const lifecycle = await recordGenerationLifecycle({
       schemaVersion: 2,
       jobType: manifest.jobType,
       retentionDays: manifest.retentionDays,
       lifecycleLedgerPath: manifest.lifecycleLedgerPath,
-    }, report, options.output);
+    }, report, options.output, lifecycleLedgerState);
     report.lifecycle = lifecycle;
     await writeJsonAtomically(options.output, report);
   }
@@ -3867,19 +3992,9 @@ async function deleteHistoryConversation(session, job) {
   10000, `history removal for ${job.id}`);
 }
 
-async function runCleanup(options, discovery) {
-  const ledger = validateConversationLifecycleLedger(await readStrictJson(options.input));
-  const selected = selectCleanupCandidates(ledger, new Date());
-  const manifest = validateCleanupManifest({
-    schemaVersion: 1,
-    jobs: selected.map((entry) => ({
-      id: entry.jobId,
-      conversationId: entry.conversationId,
-      marker: entry.marker,
-      title: entry.historyTitle,
-      artifacts: entry.artifacts,
-    })),
-  });
+async function runCleanup(options, discovery, ledger, manifest) {
+  const selected = ledger.entries.filter((entry) =>
+    manifest.jobs.some((job) => job.conversationId === entry.conversationId));
   const results = [];
   for (let index = 0; index < manifest.jobs.length; index += 1) {
     const job = manifest.jobs[index];
@@ -3999,54 +4114,53 @@ async function runWithBridgeController(options, discovery, operation) {
   }
 }
 
-async function main() {
-  const options = parseBridgeArgs(process.argv.slice(2));
-  const discovery = await discoverBridge(options);
+export async function runBridgeMain(argv, { discover = discoverBridge } = {}) {
+  const options = parseBridgeArgs(argv);
+  const prepared = await prepareBridgeCommand(options);
+  const discovery = await discover(options);
   if (options.command === "discover") {
-    console.log(JSON.stringify(publicDiscovery(discovery), null, 2));
-    return;
+    return publicDiscovery(discovery);
   }
   if (options.command === "probe") {
-    console.log(JSON.stringify(await probeBridge(discovery), null, 2));
-    return;
+    return await probeBridge(discovery);
   }
   if (options.command === "plan") {
-    console.log(JSON.stringify(await runPlan(options, discovery), null, 2));
-    return;
+    return await runPlan(options, discovery, prepared.manifest);
   }
   if (options.command === "resume") {
-    console.log(JSON.stringify(await runWithBridgeController(
+    return await runWithBridgeController(
       options,
       discovery,
-      () => runResume(options, discovery),
-    ), null, 2));
-    return;
+      () => runResume(options, discovery, prepared.manifest, prepared.lifecycleLedger),
+    );
   }
   if (options.command === "watch") {
-    console.log(JSON.stringify(await runWatch(options, discovery), null, 2));
-    return;
+    return await runWatch(options, discovery, prepared.manifest);
   }
   if (options.command === "approve") {
-    console.log(JSON.stringify(await runWithBridgeController(
+    return await runWithBridgeController(
       options,
       discovery,
-      () => runApprove(options, discovery),
-    ), null, 2));
-    return;
+      () => runApprove(options, discovery, prepared.manifest),
+    );
   }
   if (options.command === "cleanup") {
-    console.log(JSON.stringify(await runWithBridgeController(
+    return await runWithBridgeController(
       options,
       discovery,
-      () => runCleanup(options, discovery),
-    ), null, 2));
-    return;
+      () => runCleanup(options, discovery, prepared.ledger, prepared.cleanupManifest),
+    );
   }
-  console.log(JSON.stringify(await runWithBridgeController(
+  return await runWithBridgeController(
     options,
     discovery,
-    () => runBatch(options, discovery),
-  ), null, 2));
+    () => runBatch(options, discovery, prepared.manifest, prepared.lifecycleLedger),
+  );
+}
+
+async function main() {
+  const result = await runBridgeMain(process.argv.slice(2));
+  console.log(JSON.stringify(result, null, 2));
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
