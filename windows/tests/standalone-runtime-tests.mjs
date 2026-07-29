@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -101,6 +102,33 @@ function runPowerShellAsync(script, args = [], env = {}) {
 
 function assertPowerShellSuccess(result) {
   assert.equal(result.status, 0, result.stderr || result.stdout);
+}
+
+function runPortSelectionSelfTest(payload) {
+  return runPowerShell(startScript, [
+    "-PortSelectionSelfTest",
+    "-PortSelectionInput",
+    JSON.stringify(payload),
+  ], {
+    CODEX_BRIDGE_P10_TEST_MODE: "1",
+    CODEX_BRIDGE_P10_TEST_ENVIRONMENT: "isolated",
+  });
+}
+
+function openLoopbackListener() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve(server));
+  });
+}
+
+function listenerPort(server) {
+  return server.address().port;
+}
+
+async function closeLoopbackListener(server) {
+  await new Promise((resolve) => server.close(() => resolve()));
 }
 
 function stopProcess(pid) {
@@ -943,6 +971,137 @@ test("standalone bootstrap owns Codex CDP state without theme or Dream Skin depe
     assert.equal(JSON.parse(coreResult.stdout).hostEdition, "Desktop");
   }
 });
+
+test("P1.0 Slice A selects an exact explicit or verified Codex port", async () => {
+  const explicitListener = await openLoopbackListener();
+  const detectedListener = await openLoopbackListener();
+  try {
+    const explicit = runPortSelectionSelfTest({
+      explicit: true,
+      explicitPort: listenerPort(explicitListener),
+      detectedPorts: [listenerPort(detectedListener)],
+      preferredPort: listenerPort(detectedListener),
+      candidatePorts: [listenerPort(detectedListener)],
+    });
+    assertPowerShellSuccess(explicit);
+    assert.deepEqual(JSON.parse(explicit.stdout).portSelection, {
+      reason: "explicit",
+      selectedPort: listenerPort(explicitListener),
+    });
+
+    const existing = runPortSelectionSelfTest({
+      explicit: false,
+      explicitPort: 9335,
+      detectedPorts: [listenerPort(explicitListener)],
+      preferredPort: listenerPort(detectedListener),
+      candidatePorts: [listenerPort(detectedListener)],
+    });
+    assertPowerShellSuccess(existing);
+    assert.deepEqual(JSON.parse(existing.stdout).portSelection, {
+      reason: "existing-verified",
+      selectedPort: listenerPort(explicitListener),
+    });
+  } finally {
+    await closeLoopbackListener(explicitListener);
+    await closeLoopbackListener(detectedListener);
+  }
+});
+
+test("P1.0 Slice A prefers a free loopback port and scans after a real listener", async () => {
+  const preferredListener = await openLoopbackListener();
+  const scannedListener = await openLoopbackListener();
+  const preferredPort = listenerPort(preferredListener);
+  const scannedPort = listenerPort(scannedListener);
+  await closeLoopbackListener(preferredListener);
+  await closeLoopbackListener(scannedListener);
+  const preferred = runPortSelectionSelfTest({
+    explicit: false,
+    explicitPort: 9335,
+    detectedPorts: [],
+    preferredPort,
+    candidatePorts: [preferredPort, scannedPort],
+  });
+  assertPowerShellSuccess(preferred);
+  assert.deepEqual(JSON.parse(preferred.stdout).portSelection, {
+    reason: "preferred",
+    selectedPort: preferredPort,
+  });
+
+  const occupied = await netListenOnPort(preferredPort);
+  try {
+    const scanned = runPortSelectionSelfTest({
+      explicit: false,
+      explicitPort: 9335,
+      detectedPorts: [],
+      preferredPort,
+      candidatePorts: [preferredPort, scannedPort],
+    });
+    assertPowerShellSuccess(scanned);
+    assert.deepEqual(JSON.parse(scanned.stdout).portSelection, {
+      reason: "scanned",
+      selectedPort: scannedPort,
+    });
+  } finally {
+    await closeLoopbackListener(occupied);
+  }
+});
+
+test("P1.0 Slice A fails closed for occupied candidates, multiple ports, and invalid port ranges", async () => {
+  const first = await openLoopbackListener();
+  const second = await openLoopbackListener();
+  const firstPort = listenerPort(first);
+  const secondPort = listenerPort(second);
+  try {
+    const occupied = runPortSelectionSelfTest({
+      explicit: false,
+      explicitPort: 9335,
+      detectedPorts: [],
+      preferredPort: firstPort,
+      candidatePorts: [firstPort, secondPort],
+    });
+    assert.notEqual(occupied.status, 0);
+
+    const multiple = runPortSelectionSelfTest({
+      explicit: false,
+      explicitPort: 9335,
+      detectedPorts: [firstPort, secondPort],
+      preferredPort: firstPort,
+      candidatePorts: [firstPort, secondPort],
+    });
+    assert.notEqual(multiple.status, 0);
+    assert.match(multiple.stderr + multiple.stdout, /multiple.*debugging.*ports|explicit.*port/i);
+  } finally {
+    await closeLoopbackListener(first);
+    await closeLoopbackListener(second);
+  }
+
+  for (const invalid of [1023, 65536]) {
+    const result = runPortSelectionSelfTest({
+      explicit: true,
+      explicitPort: invalid,
+      detectedPorts: [],
+      preferredPort: 9335,
+      candidatePorts: [9335],
+    });
+    assert.notEqual(result.status, 0, `invalid explicit port ${invalid} must fail`);
+  }
+  const invalidCandidate = runPortSelectionSelfTest({
+    explicit: false,
+    explicitPort: 9335,
+    detectedPorts: [],
+    preferredPort: 70000,
+    candidatePorts: [70000, 9335],
+  });
+  assert.notEqual(invalidCandidate.status, 0);
+});
+
+function netListenOnPort(port) {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => resolve(server));
+  });
+}
 
 function makeDetachedReportRuntime(root, delayMs = 250) {
   const fakeScript = path.join(root, "windows", "scripts", "chatgpt-bridge.mjs");

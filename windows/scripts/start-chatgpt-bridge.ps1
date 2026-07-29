@@ -18,7 +18,11 @@ param(
   [string]$ProtocolTestRoot,
   [Parameter(DontShow = $true)]
   [ValidateSet('success', 'no-ack', 'expired', 'malformed', 'rebound')]
-  [string]$ProtocolTestScenario = 'success'
+  [string]$ProtocolTestScenario = 'success',
+  [Parameter(DontShow = $true)]
+  [switch]$PortSelectionSelfTest,
+  [Parameter(DontShow = $true)]
+  [string]$PortSelectionInput
 )
 
 $ErrorActionPreference = 'Stop'
@@ -97,6 +101,13 @@ if ($PSVersionTable.PSEdition -ne 'Desktop') {
       [IO.Path]::GetFullPath($ProtocolTestRoot),
       '-ProtocolTestScenario',
       $ProtocolTestScenario
+    )
+  }
+  if ($PortSelectionSelfTest) {
+    $relayArguments += @(
+      '-PortSelectionSelfTest',
+      '-PortSelectionInput',
+      $PortSelectionInput
     )
   }
   & $windowsPowerShell @relayArguments
@@ -199,6 +210,75 @@ function Get-BridgeProcessPorts {
 function Get-BridgePortListeners {
   param([Parameter(Mandatory = $true)][int]$CandidatePort)
   return @(Get-NetTCPConnection -State Listen -LocalPort $CandidatePort -ErrorAction SilentlyContinue)
+}
+
+function Assert-BridgePortValue {
+  param(
+    [Parameter(Mandatory = $true)][int]$CandidatePort,
+    [string]$Label = 'Port'
+  )
+  if ($CandidatePort -lt 1024 -or $CandidatePort -gt 65535) {
+    throw "$Label must be between 1024 and 65535."
+  }
+  return $CandidatePort
+}
+
+function Test-BridgePortBindable {
+  param([Parameter(Mandatory = $true)][int]$CandidatePort)
+  Assert-BridgePortValue -CandidatePort $CandidatePort | Out-Null
+  $listener = $null
+  try {
+    $listener = New-Object -TypeName System.Net.Sockets.TcpListener -ArgumentList @(
+      [System.Net.IPAddress]::Loopback,
+      $CandidatePort
+    )
+    $listener.Start()
+    return $true
+  } catch {
+    return $false
+  } finally {
+    if ($null -ne $listener) { $listener.Stop() }
+  }
+}
+
+function Get-BridgePortSelection {
+  param(
+    [Parameter(Mandatory = $true)][bool]$Explicit,
+    [Parameter(Mandatory = $true)][int]$ExplicitPort,
+    [int[]]$DetectedPorts = @(),
+    [int[]]$CandidatePorts = @(9335..9399),
+    [int]$PreferredPort = 9335
+  )
+  if ($Explicit) {
+    Assert-BridgePortValue -CandidatePort $ExplicitPort -Label 'Explicit Port' | Out-Null
+    return [pscustomobject][ordered]@{ reason = 'explicit'; selectedPort = $ExplicitPort }
+  }
+
+  $verified = @($DetectedPorts | Where-Object { $null -ne $_ } | ForEach-Object {
+    Assert-BridgePortValue -CandidatePort ([int]$_) -Label 'Detected debugging port' | Out-Null
+    [int]$_
+  } | Sort-Object -Unique)
+  if ($verified.Count -gt 1) {
+    throw "Multiple verified Codex debugging ports are active: $($verified -join ', '). Specify -Port."
+  }
+  if ($verified.Count -eq 1) {
+    return [pscustomobject][ordered]@{ reason = 'existing-verified'; selectedPort = [int]$verified[0] }
+  }
+
+  Assert-BridgePortValue -CandidatePort $PreferredPort -Label 'Preferred Port' | Out-Null
+  $candidates = @($CandidatePorts | Where-Object { $null -ne $_ } | ForEach-Object {
+    Assert-BridgePortValue -CandidatePort ([int]$_) -Label 'Candidate Port' | Out-Null
+    [int]$_
+  } | Select-Object -Unique)
+  if ($candidates.Count -eq 0) { throw 'No controlled loopback port candidates were provided.' }
+  $orderedCandidates = @($PreferredPort) + @($candidates | Where-Object { [int]$_ -ne $PreferredPort })
+  foreach ($candidate in $orderedCandidates) {
+    if (Test-BridgePortBindable -CandidatePort ([int]$candidate)) {
+      $reason = if ([int]$candidate -eq $PreferredPort) { 'preferred' } else { 'scanned' }
+      return [pscustomobject][ordered]@{ reason = $reason; selectedPort = [int]$candidate }
+    }
+  }
+  throw "No controlled loopback port is available in the configured candidate range."
 }
 
 function Test-BridgeBrowserWebSocketUrl {
@@ -1076,6 +1156,29 @@ try {
   exit 0
 }
 
+if ($PortSelectionSelfTest) {
+  if ("$env:CODEX_BRIDGE_P10_TEST_MODE" -ne '1' -or
+      "$env:CODEX_BRIDGE_P10_TEST_ENVIRONMENT" -ne 'isolated' -or
+      [string]::IsNullOrWhiteSpace($PortSelectionInput)) {
+    throw 'Port selection self-test is test-only and requires the isolated P1.0 test gate and input.'
+  }
+  try { $selectionInput = $PortSelectionInput | ConvertFrom-Json -ErrorAction Stop }
+  catch { throw 'Port selection self-test input is invalid JSON.' }
+  if ($selectionInput.explicit -isnot [bool] -or
+      $selectionInput.explicitPort -isnot [int] -and $selectionInput.explicitPort -isnot [long] -or
+      $selectionInput.preferredPort -isnot [int] -and $selectionInput.preferredPort -isnot [long]) {
+    throw 'Port selection self-test input types are invalid.'
+  }
+  $selection = Get-BridgePortSelection `
+    -Explicit ([bool]$selectionInput.explicit) `
+    -ExplicitPort ([int]$selectionInput.explicitPort) `
+    -DetectedPorts @($selectionInput.detectedPorts | ForEach-Object { [int]$_ }) `
+    -CandidatePorts @($selectionInput.candidatePorts | ForEach-Object { [int]$_ }) `
+    -PreferredPort ([int]$selectionInput.preferredPort)
+  [ordered]@{ pass = $true; portSelection = $selection } | ConvertTo-Json -Compress
+  exit 0
+}
+
 if ($SelfTest) {
   $safe = Test-BridgeBrowserWebSocketUrl `
     -Value 'ws://127.0.0.1:9335/devtools/browser/browser-123' -CandidatePort 9335
@@ -1097,14 +1200,12 @@ if ($SelfTest) {
 
 $codex = Get-BridgeCodexInstall
 $processes = @(Get-BridgeCodexProcesses -Codex $codex)
-if (-not $portWasExplicit) {
-  $detectedPorts = @(Get-BridgeProcessPorts -Processes $processes)
-  if ($detectedPorts.Count -eq 1) {
-    $Port = $detectedPorts[0]
-  } elseif ($detectedPorts.Count -gt 1) {
-    throw "Multiple verified Codex debugging ports are active: $($detectedPorts -join ', '). Specify -Port."
-  }
-}
+$detectedPorts = if ($portWasExplicit) { @() } else { @(Get-BridgeProcessPorts -Processes $processes) }
+$portSelection = Get-BridgePortSelection `
+  -Explicit $portWasExplicit `
+  -ExplicitPort $Port `
+  -DetectedPorts $detectedPorts
+$Port = [int]$portSelection.selectedPort
 
 $identity = Get-BridgeCdpIdentity -CandidatePort $Port -Codex $codex
 if ($null -eq $identity) {
@@ -1124,6 +1225,7 @@ if ($null -eq $identity) {
       reportPath = "$($restart.ReportPath)"
       statePath = [IO.Path]::GetFullPath($StatePath)
       port = $Port
+      portSelection = $portSelection
       userNotice = 'Codex will close and reopen. Do not start it manually; inspect restart-report.json after it returns.'
     } | ConvertTo-Json -Depth 5
     exit 0
@@ -1144,6 +1246,7 @@ $state = [ordered]@{
   schemaVersion = 1
   platform = 'windows'
   port = $Port
+  portSelection = $portSelection
   browserId = "$($identity.BrowserId)"
   codexExe = "$($codex.Executable)"
   codexPackageRoot = "$($codex.PackageRoot)"
