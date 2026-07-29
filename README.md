@@ -147,3 +147,18 @@ resume”。这不是永久 daemon、自动回帖、密码学批准证明，也�
 `worker-created` 后未 ready、无 ack、过期或路径异常都属于失败关闭，不能自动重试。
 运行中的 Electron 是否能后来热开启 CDP 不作承诺；协议自测只启动无破坏测试 worker，
 不代表真实重启已执行。
+
+## 跨电脑端口与 Codex 版本
+
+端口是每台电脑的本地状态，不是产品常量。显式 `-Port` 永远优先；自动模式复用唯一
+已验证的 Codex 调试端口，或在 loopback `9335..9399` 中优先选择 `9335`、再扫描可
+绑定候选。启动结果会返回 `portSelection`，而 schema-v1 `state.json` 的 `port` 是
+后续调用唯一应读取的权威值。多端口、未验证监听或候选全部占用时会安全失败，不会
+偷偷连到别的进程或替换显式端口。
+
+发现会先核对当前注册 Store `OpenAI.Codex`，因此升级后的旧 state 会明确报告
+`stale-after-update`，带有 saved/current version 和 `start-chatgpt-bridge.ps1` 修复
+命令。版本相同但安装根、包族、签名或监听进程不一致仍拒绝。`discover`、`probe`、
+`plan` 会报告 `versionCompatibility`；未知 Codex 版本只允许已探测的主 ChatGPT 路由，
+实验 Quick Chat 标记 `unsupported-codex-version` 并回退串行主路由，不猜测或调用未知
+版本 RPC。

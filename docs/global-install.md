@@ -190,3 +190,22 @@ discover/probe 应明确 fail closed，而不是偷偷读取当前用户的
 `%LOCALAPPDATA%\CodexChatGPTBridge\state.json`。`-Root` 只选择 Runtime，不提供状态
 隔离。该 smoke 只证明 Skill/Runtime 清单、路径绑定和只读诊断可用；它不发送、恢复、
 批准或删除任何 GPT 对话，也不验证永久后台自动化。
+
+## P1.0 跨电脑端口与版本适配
+
+启动器不会把 `9335` 当成所有电脑都固定不变的接口。显式 `-Port` 会原样使用；
+未指定时，先复用唯一且已证明属于当前 Store Codex 的调试端口，否则只在
+loopback 的 `9335..9399` 受控范围内选择，优先 `9335`。启动输出的
+`portSelection.reason`/`selectedPort` 是本次选择摘要，写入 `state.json` 的仍是
+schema-v1 兼容的 `port` 字段。其他调用方应读取 state，不应硬编码端口。端口被
+未验证监听占用或候选全部不可绑定时会 fail closed；选择检查和 Codex 真正监听之间
+存在不可消除的短暂竞争窗口，竞争发生时不会自动换端口。
+
+发现阶段先查询当前注册的 Store `OpenAI.Codex`，再访问保存的 CDP 端口。升级后版本
+变化会返回 `stale-after-update`，给出有界的 saved/current version 和唯一修复命令
+`start-chatgpt-bridge.ps1`；不要手改 state。版本相同但 package family、安装根、签名
+或监听进程变化仍严格失败。`discover`、`probe`、`plan` 的结果含
+`versionCompatibility`：主路由为 `runtime-probed`；Quick Chat 仅对当前已验证映射
+`26.707.9564.0`、`26.715.10079.0` 标为 `verified`。未知版本标为
+`unsupported-codex-version`，实验 Quick Chat 回退主 ChatGPT 串行路径且不调用未知 RPC；
+能力缓存继续按 browserId+codexVersion 隔离。

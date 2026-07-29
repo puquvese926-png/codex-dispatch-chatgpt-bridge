@@ -476,3 +476,31 @@ bridge/protocol version, target binding and managed-file hashes. `plan`,
 calls when this gate fails. `discover` and `probe` are the only allowed
 manifest-diagnostic paths; an explicit `-Root` does not bypass the gate for
 mutating or operational actions.
+
+## Port and Codex-version contract
+
+`start-chatgpt-bridge.ps1` returns a machine-readable `portSelection` object but
+does not add that object to schema-v1 `state.json`. The state `port` remains the
+single authoritative selected endpoint. `-Port` is exact and range-checked
+(`1024..65535`); automatic selection first reuses one verified Codex debugging
+port, rejects multiple verified ports, otherwise prefers loopback `9335` and
+scans only `9335..9399` by an actual loopback bind check. Unverified listeners,
+non-loopback endpoints and an exhausted candidate set fail closed. The output
+reason is one of `explicit`, `existing-verified`, `preferred` or `scanned`.
+The check-to-use interval before Codex opens a newly selected port is bounded but
+not physically lockable; if the exact endpoint is later occupied or unverified,
+startup fails rather than attaching to it or replacing an explicit port.
+
+Discovery first reads the current registered Store `OpenAI.Codex` identity and
+version, then contacts the saved CDP endpoint. A changed version is a structured
+`stale-after-update` diagnostic containing bounded saved/current versions and the
+literal repair command `start-chatgpt-bridge.ps1`; it never edits `state.json`.
+Same-version package full name/family/root/signature or listener process drift is
+`codex-identity-mismatch`/`codex-process-identity-mismatch` and remains a hard
+failure. Successful discover, probe and plan results include a bounded
+`versionCompatibility` summary. The main surface is `runtime-probed`; Quick Chat
+is `verified` only for the pinned mappings `26.707.9564.0` and
+`26.715.10079.0`, otherwise it is `unsupported` with
+`unsupported-codex-version`. Experimental Quick Chat then selects the serial
+main surface and makes no version-unknown RPC call. The capability cache remains
+keyed by the exact browser ID and Codex version.

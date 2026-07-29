@@ -62,6 +62,21 @@ Git 仓库
     只会留下 `failed`/恢复提示，不会关闭 Codex。CIM 创建成功但未能归属时不宣布
     成功，也不授权自动重试；PowerShell 入口使用绝对 Windows PowerShell 5.1 路径。
 
+## P1.0 跨电脑适配补充
+
+启动器现在将端口选择分为四种可审计原因：`explicit`、`existing-verified`、
+`preferred` 和 `scanned`。没有显式端口时只检查当前已验证 Codex 的唯一调试端口，
+或在 loopback `9335..9399` 中做真实可绑定性扫描；多端口、未验证监听和全部占用
+都会停止。`portSelection` 只在启动结果中返回，持久 schema-v1 state 只保存
+权威 `port`，因此旧 runtime 的 state 校验仍兼容。
+
+发现先读取当前 Store 包身份和版本。升级导致的版本变化会分类为
+`stale-after-update`，带有有界 saved/current version 和
+`start-chatgpt-bridge.ps1` 修复命令；同版本的 package family、安装根、签名和
+监听进程变化不会被放宽。成功的 discover/probe/plan 会带
+`versionCompatibility`；未知版本不调用未知 Quick Chat RPC，而是保持主 ChatGPT
+串行路径。端口和版本都是机器/安装实例属性，不应写死在调用方。
+
 ## 验证
 
 - 独立运行时、安装、根目录解析和启动回归：PASS；

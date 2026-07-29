@@ -59,6 +59,7 @@ const QUICK_CHAT_SERVICE_EXPORT_BY_VERSION = new Map([
   ["26.707.9564.0", "n"],
   ["26.715.10079.0", "appServices"],
 ]);
+const SUPPORTED_QUICK_CHAT_VERSIONS = Object.freeze([...QUICK_CHAT_RPC_BY_VERSION.keys()].sort());
 const STATE_FIELDS = new Set([
   "browserId",
   "codexExe",
@@ -163,6 +164,22 @@ function launchLogPathsFromArgv(argv) {
 function safeLaunchLogError(error) {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/[\r\n]+/gu, " ").slice(0, 2000) || "bridge operation failed";
+}
+
+function safeBridgeDiagnosticFields(error) {
+  if (!error || typeof error.code !== "string") return {};
+  if (error.code === "stale-after-update") {
+    return {
+      diagnostic: "stale-after-update",
+      savedCodexVersion: String(error.details?.savedVersion || "").slice(0, 64),
+      currentCodexVersion: String(error.details?.currentVersion || "").slice(0, 64),
+      repairCommand: "start-chatgpt-bridge.ps1",
+    };
+  }
+  if (["codex-identity-mismatch", "codex-process-identity-mismatch", "codex-identity-report-invalid"].includes(error.code)) {
+    return { diagnostic: error.code };
+  }
+  return {};
 }
 
 export function appendBridgeLaunchLog(logPath, value) {
@@ -526,6 +543,85 @@ export function validateBridgeState(value) {
     throw new Error("Codex package executable identity is inconsistent");
   }
   return Object.freeze({ ...value });
+}
+
+function bridgeDiagnosticError(code, message, details = {}) {
+  const error = new Error(message);
+  error.code = code;
+  error.details = Object.freeze({ ...details });
+  return error;
+}
+
+export function validateRegisteredCodexIdentity(state, registered) {
+  if (!isPlainObject(state) || !isPlainObject(registered)) {
+    throw bridgeDiagnosticError("codex-identity-report-invalid", "Registered Codex identity report is invalid");
+  }
+  const required = ["version", "packageFullName", "packageFamilyName", "installLocation", "signatureKind"];
+  for (const field of required) {
+    if (typeof registered[field] !== "string" || !registered[field] || registered[field].includes("\0")) {
+      throw bridgeDiagnosticError("codex-identity-report-invalid", `Registered Codex identity field is invalid: ${field}`);
+    }
+  }
+  if (registered.version !== state.codexVersion) {
+    throw bridgeDiagnosticError(
+      "stale-after-update",
+      "Registered Codex version changed; refresh the bridge state with start-chatgpt-bridge.ps1.",
+      {
+        savedVersion: String(state.codexVersion).slice(0, 64),
+        currentVersion: registered.version.slice(0, 64),
+        repairCommand: "start-chatgpt-bridge.ps1",
+      },
+    );
+  }
+  const savedRoot = path.win32.normalize(String(state.codexPackageRoot || ""));
+  const currentRoot = path.win32.normalize(registered.installLocation);
+  if (registered.packageFullName !== state.codexPackageFullName ||
+      registered.packageFamilyName !== state.codexPackageFamilyName ||
+      currentRoot.toLowerCase() !== savedRoot.toLowerCase() ||
+      registered.signatureKind !== "Store") {
+    throw bridgeDiagnosticError(
+      "codex-identity-mismatch",
+      "Registered Codex package identity no longer matches the saved Store identity.",
+    );
+  }
+  return Object.freeze({
+    version: registered.version,
+    packageFullName: registered.packageFullName,
+    packageFamilyName: registered.packageFamilyName,
+    installLocation: registered.installLocation,
+    signatureKind: registered.signatureKind,
+  });
+}
+
+export function classifyWindowsIdentityReport(state, report) {
+  if (!isPlainObject(report)) {
+    throw bridgeDiagnosticError("codex-identity-report-invalid", "Registered Codex identity report is invalid");
+  }
+  // Package validation intentionally precedes listener validation: after an
+  // update, the saved port may be gone, but the caller still needs the precise
+  // stale-after-update diagnosis instead of a generic no-listener error.
+  validateRegisteredCodexIdentity(state, report.package);
+  const listeners = Array.isArray(report.listeners) ? report.listeners : [report.listeners].filter(Boolean);
+  if (!listeners.length) throw new Error("Saved CDP port has no listener");
+  return Object.freeze(listeners);
+}
+
+export function buildVersionCompatibilitySummary(codexVersion) {
+  if (typeof codexVersion !== "string" || !codexVersion || codexVersion.length > 64) {
+    throw new Error("Codex version is invalid");
+  }
+  const quickChatSupported = QUICK_CHAT_RPC_BY_VERSION.has(codexVersion);
+  return Object.freeze({
+    schemaVersion: 1,
+    codexVersion,
+    main: { status: "runtime-probed" },
+    quickChat: {
+      status: quickChatSupported ? "verified" : "unsupported",
+      reason: quickChatSupported ? null : "unsupported-codex-version",
+      rpcAttempted: false,
+    },
+    supportedQuickChatVersions: SUPPORTED_QUICK_CHAT_VERSIONS,
+  });
 }
 
 export function validatedDebuggerUrl(target, port) {
@@ -2059,8 +2155,7 @@ async function verifyWindowsIdentity(state) {
   if (process.platform !== "win32") throw new Error("ChatGPT bridge is Windows-only");
   const script = `
 $port = [int]$env:CODEX_BRIDGE_PORT
-$packageFullName = $env:CODEX_BRIDGE_PACKAGE_FULL_NAME
-$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction Stop | ForEach-Object {
+$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | ForEach-Object {
   $process = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$_.OwningProcess)" -ErrorAction Stop
   [pscustomobject]@{
     localAddress = "$($_.LocalAddress)"
@@ -2070,9 +2165,10 @@ $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction 
   }
 })
 $package = Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction Stop |
-  Where-Object { "$($_.PackageFullName)" -ceq "$packageFullName" } |
+  Where-Object { "$($_.SignatureKind)" -ieq 'Store' -and -not [bool]$_.IsDevelopmentMode } |
+  Sort-Object Version -Descending |
   Select-Object -First 1
-if ($null -eq $package) { throw 'Registered OpenAI.Codex package was not found.' }
+if ($null -eq $package) { throw 'Registered Store OpenAI.Codex package was not found.' }
 [pscustomobject]@{
   listeners = $listeners
   package = [pscustomobject]@{
@@ -2080,6 +2176,7 @@ if ($null -eq $package) { throw 'Registered OpenAI.Codex package was not found.'
     packageFamilyName = "$($package.PackageFamilyName)"
     packageFullName = "$($package.PackageFullName)"
     signatureKind = "$($package.SignatureKind)"
+    version = "$($package.Version)"
   }
 } | ConvertTo-Json -Depth 6 -Compress
 `;
@@ -2099,7 +2196,7 @@ if ($null -eq $package) { throw 'Registered OpenAI.Codex package was not found.'
     },
   });
   const report = JSON.parse(stdout.trim());
-  const listeners = Array.isArray(report.listeners) ? report.listeners : [report.listeners].filter(Boolean);
+  const listeners = classifyWindowsIdentityReport(state, report);
   if (!listeners.length) throw new Error("Saved CDP port has no listener");
   for (const listener of listeners) {
     const address = String(listener.localAddress || "").toLowerCase();
@@ -2109,16 +2206,11 @@ if ($null -eq $package) { throw 'Registered OpenAI.Codex package was not found.'
         executable.toLowerCase() !== path.win32.normalize(state.codexExe).toLowerCase() ||
         !new RegExp(`(?:^|\\s)--remote-debugging-port(?:=|\\s+)${state.port}(?:$|\\s)`, "i").test(commandLine) ||
         !/(?:^|\s)--remote-debugging-address(?:=|\s+)127\.0\.0\.1(?:$|\s)/i.test(commandLine)) {
-      throw new Error("Saved CDP listener is not owned by the verified Codex process");
+      throw bridgeDiagnosticError(
+        "codex-process-identity-mismatch",
+        "Saved CDP listener is not owned by the verified Codex process",
+      );
     }
-  }
-  const registered = report.package;
-  if (!registered || registered.packageFullName !== state.codexPackageFullName ||
-      registered.packageFamilyName !== state.codexPackageFamilyName ||
-      path.win32.normalize(registered.installLocation).toLowerCase() !==
-        path.win32.normalize(state.codexPackageRoot).toLowerCase() ||
-      registered.signatureKind !== "Store") {
-    throw new Error("Saved Codex package identity no longer matches the registered Store package");
   }
   return Object.freeze({ listenerCount: listeners.length, processId: listeners[0].processId });
 }
@@ -3640,6 +3732,7 @@ async function runPlan(options, discovery, batch) {
     command: "plan",
     plannedAt: new Date().toISOString(),
     codexVersion: discovery.state.codexVersion,
+    versionCompatibility: buildVersionCompatibilitySummary(discovery.state.codexVersion),
     packageFullName: discovery.state.codexPackageFullName,
     port: discovery.state.port,
     browserId: discovery.state.browserId,
@@ -4164,8 +4257,11 @@ async function runCleanup(options, discovery, ledger, manifest) {
 async function discoverBridge(options) {
   const statePath = options.statePath || defaultStatePath;
   const state = validateBridgeState(await readStrictJson(statePath));
-  const [identity, version, targets] = await Promise.all([
-    verifyWindowsIdentity(state),
+  // Verify the current Store package before touching the saved CDP endpoint so
+  // an upgraded client is reported as stale-after-update instead of a generic
+  // fetch failure against the old port.
+  const identity = await verifyWindowsIdentity(state);
+  const [version, targets] = await Promise.all([
     fetchCdpJson(state.port, "/json/version"),
     fetchCdpJson(state.port, "/json/list"),
   ]);
@@ -4182,6 +4278,7 @@ function publicDiscovery(discovery) {
     pass: true,
     command: "discover",
     codexVersion: discovery.state.codexVersion,
+    versionCompatibility: buildVersionCompatibilitySummary(discovery.state.codexVersion),
     packageFullName: discovery.state.codexPackageFullName,
     port: discovery.state.port,
     browserId: discovery.state.browserId,
@@ -4299,7 +4396,13 @@ if (isMain) {
     } catch {
       // Invalid launch arguments cannot be trusted for diagnostic output.
     }
-    const safeError = { pass: false, command: argv[0] || null, launchId: launchLogs?.launchToken || null, error: safeLaunchLogError(error) };
+    const safeError = {
+      pass: false,
+      command: argv[0] || null,
+      launchId: launchLogs?.launchToken || null,
+      ...safeBridgeDiagnosticFields(error),
+      error: safeLaunchLogError(error),
+    };
     if (launchLogs) {
       try {
         appendBridgeLaunchLog(launchLogs.stderrLogPath, safeError);

@@ -176,5 +176,19 @@ If the route, title or marker is unavailable, the only honest outcome is
 start a replacement batch. A genuinely new generation requires a separate explicit
 user authorization and a new job/conversation; the ambiguous original remains sealed.
 This is a bounded recovery path, not a persistent daemon or automatic GPT reply service.
+
+## P1.0 cross-computer startup diagnostics
+
+| Symptom | Meaning | Safe response |
+|---|---|---|
+| `stale-after-update` with saved/current Codex versions | The registered Store `OpenAI.Codex` version changed after the saved bridge state was created. This is more precise than a CDP fetch failure. | Do not hand-edit `state.json`, do not resend or restart repeatedly. With explicit authorization, run the official `start-chatgpt-bridge.ps1` path once to refresh the state, then rerun read-only `discover`/`probe`. |
+| `codex-identity-mismatch` or `codex-process-identity-mismatch` on the same version | Package family/root/signature or the listener-owning process no longer matches the saved identity. | Fail closed. Do not accept a same-version package as equivalent, attach to an unverified listener, or replace an explicit port. Inspect the official installation and refresh only through the start path. |
+| Automatic port reports `preferred`/`scanned`, or all candidates are occupied | Port numbers are machine-local. The bridge preferred loopback `9335`, scanned only the controlled range, and refused non-loopback/unverified listeners. | Treat `state.json.port` and the start result's `portSelection.selectedPort` as authoritative. Never hard-code `9335`; if the range is exhausted, free/repair the local listener situation or provide an explicit valid `-Port`. |
+
+The port bind check cannot reserve a port across Codex activation. A competing
+process may win the narrow check-to-use interval; the bridge must then fail closed
+at the exact endpoint rather than connect to the new listener or silently switch.
+The version summary is diagnostic capability metadata, not permission to call an
+unknown Quick Chat RPC.
 The MVP supports explicit dispatch and read-only recovery; it does not make itself a
 background listener by editing `AGENTS.md`.

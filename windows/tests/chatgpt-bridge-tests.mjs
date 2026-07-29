@@ -62,6 +62,9 @@ import {
   summarizeBatchSurface,
   isNativeQuickChatFallbackError,
   DEFAULT_TIMEOUT_MS,
+  buildVersionCompatibilitySummary,
+  classifyWindowsIdentityReport,
+  validateRegisteredCodexIdentity,
   batchProgressPath,
   buildBatchProgress,
   summarizeBatchError,
@@ -635,6 +638,13 @@ test("final Node CLI succeeds exactly once without detached log arguments", () =
       pass: true,
       command: "discover",
       codexVersion: "26.715.10079.0",
+      versionCompatibility: {
+        schemaVersion: 1,
+        codexVersion: "26.715.10079.0",
+        main: { status: "runtime-probed" },
+        quickChat: { status: "verified", reason: null, rpcAttempted: false },
+        supportedQuickChatVersions: ["26.707.9564.0", "26.715.10079.0"],
+      },
       packageFullName: "OpenAI.Codex_26.715.10079.0_x64__test",
       port: 9345,
       browserId: "browser-p08",
@@ -2332,6 +2342,100 @@ test("accepts only the standalone bridge state identity", () => {
   ]) {
     assert.throws(() => validateBridgeState(value), /state|schema|platform|port|browser|package|executable|unknown/i);
   }
+});
+
+test("classifies a changed registered Codex version as stale-after-update with a repair command", () => {
+  const state = {
+    codexVersion: "26.715.10079.0",
+    codexPackageFullName: "OpenAI.Codex_26.715.10079.0_x64__test",
+    codexPackageFamilyName: "OpenAI.Codex_test",
+    codexPackageRoot: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.715.10079.0_x64__test",
+  };
+  assert.throws(() => validateRegisteredCodexIdentity(state, {
+    version: "26.800.12000.0",
+    packageFullName: "OpenAI.Codex_26.800.12000.0_x64__test",
+    packageFamilyName: "OpenAI.Codex_test",
+    installLocation: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.800.12000.0_x64__test",
+    signatureKind: "Store",
+  }), (error) => {
+    assert.equal(error.code, "stale-after-update");
+    assert.equal(error.details.savedVersion, state.codexVersion);
+    assert.equal(error.details.currentVersion, "26.800.12000.0");
+    assert.equal(error.details.repairCommand, "start-chatgpt-bridge.ps1");
+    return true;
+  });
+});
+
+test("classifies package version before old-port listener absence", () => {
+  const state = {
+    codexVersion: "26.715.10079.0",
+    codexPackageFullName: "OpenAI.Codex_26.715.10079.0_x64__test",
+    codexPackageFamilyName: "OpenAI.Codex_test",
+    codexPackageRoot: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.715.10079.0_x64__test",
+  };
+  const upgraded = {
+    package: {
+      version: "26.800.12000.0",
+      packageFullName: "OpenAI.Codex_26.800.12000.0_x64__test",
+      packageFamilyName: "OpenAI.Codex_test",
+      installLocation: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.800.12000.0_x64__test",
+      signatureKind: "Store",
+    },
+    listeners: [],
+  };
+  assert.throws(() => classifyWindowsIdentityReport(state, upgraded), (error) => {
+    assert.equal(error.code, "stale-after-update");
+    return true;
+  });
+  assert.throws(() => classifyWindowsIdentityReport(state, {
+    package: {
+      version: state.codexVersion,
+      packageFullName: state.codexPackageFullName,
+      packageFamilyName: state.codexPackageFamilyName,
+      installLocation: state.codexPackageRoot,
+      signatureKind: "Store",
+    },
+    listeners: [],
+  }), /saved CDP port has no listener/i);
+});
+
+test("keeps same-version package family, root, signature and process identity strict", () => {
+  const state = {
+    codexVersion: "26.715.10079.0",
+    codexPackageFullName: "OpenAI.Codex_26.715.10079.0_x64__test",
+    codexPackageFamilyName: "OpenAI.Codex_test",
+    codexPackageRoot: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.715.10079.0_x64__test",
+  };
+  const registered = {
+    version: state.codexVersion,
+    packageFullName: state.codexPackageFullName,
+    packageFamilyName: state.codexPackageFamilyName,
+    installLocation: state.codexPackageRoot,
+    signatureKind: "Store",
+  };
+  for (const mutation of [
+    { packageFamilyName: "Other.Codex_test" },
+    { installLocation: "C:\\Program Files\\WindowsApps\\Other.Codex" },
+    { signatureKind: "Test" },
+    { packageFullName: "OpenAI.Codex_26.715.10079.0_x64__other" },
+  ]) {
+    assert.throws(() => validateRegisteredCodexIdentity(state, { ...registered, ...mutation }),
+      (error) => error.code === "codex-identity-mismatch");
+  }
+  assert.doesNotThrow(() => validateRegisteredCodexIdentity(state, registered));
+});
+
+test("reports supported and unknown Codex versions without weakening the main route", () => {
+  const supported = buildVersionCompatibilitySummary("26.715.10079.0");
+  assert.equal(supported.main.status, "runtime-probed");
+  assert.equal(supported.quickChat.status, "verified");
+  assert.ok(supported.supportedQuickChatVersions.includes("26.715.10079.0"));
+
+  const unknown = buildVersionCompatibilitySummary("26.999.0.0");
+  assert.equal(unknown.main.status, "runtime-probed");
+  assert.equal(unknown.quickChat.status, "unsupported");
+  assert.equal(unknown.quickChat.reason, "unsupported-codex-version");
+  assert.equal(unknown.quickChat.rpcAttempted, false);
 });
 
 test("rejects CDP websocket targets outside the saved loopback endpoint", () => {

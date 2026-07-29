@@ -258,6 +258,39 @@ standalone state only through `start-chatgpt-bridge.ps1`.
 
 Keep production and bridge repair separate. A failed recovery must not monopolize the route controller. Never resend an ambiguous job automatically; only a new explicit user authorization may create a different fresh job while the ambiguous conversation remains sealed.
 
+## Cross-computer port and Codex-version compatibility
+
+The standalone bootstrap owns the selected loopback port for the current machine.
+An explicit `-Port` is always used exactly as supplied and is never silently
+replaced. Without it, the bootstrap reuses exactly one debugging port proven to
+belong to the running Store Codex; multiple verified ports require explicit
+`-Port`. If no verified port exists, it probes only loopback bindability in the
+controlled `9335..9399` range, preferring `9335` and then scanning the next
+candidate. An occupied or unverified listener is skipped; if every candidate is
+occupied, startup fails closed. The start result contains `portSelection` with
+the reason (`explicit`, `existing-verified`, `preferred` or `scanned`) and the
+selected port. The persisted schema-v1 `state.json` keeps only the authoritative
+`port`; callers must read it rather than hard-code `9335`.
+
+Port selection has the normal startup check-to-use race: a different process can
+claim a port after the bind check and before Codex opens it. The bootstrap
+rechecks the exact selected port and fails closed; it never connects to a new
+unverified listener or silently switches an explicit port. Different computers
+may therefore produce different state ports.
+
+Before CDP fetch, discovery reads the currently registered Store
+`OpenAI.Codex` package and compares version, full name, family, install root,
+signature and listener process ownership with the saved state. A version change
+is reported as `stale-after-update` with bounded saved/current versions and the
+repair command `start-chatgpt-bridge.ps1`; state is refreshed only through the
+official start path. Same-version identity drift remains a hard failure.
+Successful discover/probe/plan reports include `versionCompatibility`: the main
+surface is `runtime-probed`, while Quick Chat is `verified` only for the pinned
+versions `26.707.9564.0` and `26.715.10079.0`; an unknown version is
+`unsupported-codex-version` and experimental Quick Chat falls back to serial
+main ChatGPT without calling an unknown RPC asset. Capability cache entries stay
+scoped by browser ID and exact Codex version.
+
 ## Commands
 
 ```powershell

@@ -9,6 +9,8 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { buildVersionCompatibilitySummary } from "../scripts/chatgpt-bridge.mjs";
+
 import {
   acquireBridgeControllerLock,
   bridgeCapabilityCachePath,
@@ -70,6 +72,26 @@ test("experimental Quick Chat obeys the session health cache and keeps a serial 
   assert.equal(eligible.quickChat.attempt, true);
   assert.equal(eligible.fallbackMode, "serial-main-chat");
   assert.equal(eligible.worstCaseCollectionMs, 2400000);
+});
+
+test("unknown Codex versions keep the main route and explicitly disable Quick Chat RPCs", () => {
+  const compatibility = buildVersionCompatibilitySummary("26.999.0.0");
+  const plan = buildDispatchPlan({
+    requestedJobs: 2,
+    timeoutMs: 600000,
+    mainChatAvailable: true,
+    experimentalQuickChat: true,
+    quickChatLimit: 0,
+    occupiedQuickChatWindows: 0,
+    quickChatHealth: null,
+  });
+  assert.equal(compatibility.quickChat.status, "unsupported");
+  assert.equal(compatibility.quickChat.reason, "unsupported-codex-version");
+  assert.equal(compatibility.quickChat.rpcAttempted, false);
+  assert.equal(plan.selectedMode, "serial-main-chat");
+  assert.equal(plan.selectedSurface, "chatgpt-main-chat");
+  assert.equal(plan.quickChat.reason, "unsupported-codex-version");
+  assert.equal(plan.quickChat.attempt, false);
 });
 
 test("Quick Chat health is scoped to one Codex version and browser session", async () => {
