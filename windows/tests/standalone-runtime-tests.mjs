@@ -1007,6 +1007,25 @@ test("P1.0 Slice A selects an exact explicit or verified Codex port", async () =
   }
 });
 
+test("P1.0 port selection output keeps the persisted schema-v1 state compatible", async () => {
+  const listener = await openLoopbackListener();
+  const selectedPort = listenerPort(listener);
+  await closeLoopbackListener(listener);
+  const result = runPortSelectionSelfTest({
+    explicit: true,
+    explicitPort: selectedPort,
+    detectedPorts: [],
+    preferredPort: selectedPort,
+    candidatePorts: [selectedPort],
+  });
+  assertPowerShellSuccess(result);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.state.port, selectedPort);
+  assert.equal(Object.hasOwn(payload.state, "portSelection"), false);
+  const { validateBridgeState } = await import(pathToFileURL(runtimeScript).href);
+  assert.doesNotThrow(() => validateBridgeState(payload.state));
+});
+
 test("P1.0 Slice A prefers a free loopback port and scans after a real listener", async () => {
   const preferredListener = await openLoopbackListener();
   const scannedListener = await openLoopbackListener();

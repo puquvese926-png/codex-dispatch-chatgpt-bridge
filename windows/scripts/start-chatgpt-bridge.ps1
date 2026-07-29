@@ -281,6 +281,26 @@ function Get-BridgePortSelection {
   throw "No controlled loopback port is available in the configured candidate range."
 }
 
+function New-BridgeState {
+  param(
+    [Parameter(Mandatory = $true)][int]$SelectedPort,
+    [Parameter(Mandatory = $true)][object]$Identity,
+    [Parameter(Mandatory = $true)][object]$Codex
+  )
+  return [ordered]@{
+    schemaVersion = 1
+    platform = 'windows'
+    port = $SelectedPort
+    browserId = "$($Identity.BrowserId)"
+    codexExe = "$($Codex.Executable)"
+    codexPackageRoot = "$($Codex.PackageRoot)"
+    codexPackageFullName = "$($Codex.PackageFullName)"
+    codexPackageFamilyName = "$($Codex.PackageFamilyName)"
+    codexVersion = "$($Codex.Version)"
+    createdAt = [DateTime]::UtcNow.ToString('o')
+  }
+}
+
 function Test-BridgeBrowserWebSocketUrl {
   param(
     [Parameter(Mandatory = $true)][string]$Value,
@@ -1175,7 +1195,17 @@ if ($PortSelectionSelfTest) {
     -DetectedPorts @($selectionInput.detectedPorts | ForEach-Object { [int]$_ }) `
     -CandidatePorts @($selectionInput.candidatePorts | ForEach-Object { [int]$_ }) `
     -PreferredPort ([int]$selectionInput.preferredPort)
-  [ordered]@{ pass = $true; portSelection = $selection } | ConvertTo-Json -Compress
+  $fakeRoot = 'C:\Program Files\WindowsApps\OpenAI.Codex_26.999.0.0_x64__p10'
+  $fakeCodex = [pscustomobject]@{
+    Executable = Join-Path $fakeRoot 'app\ChatGPT.exe'
+    PackageRoot = $fakeRoot
+    PackageFullName = 'OpenAI.Codex_26.999.0.0_x64__p10'
+    PackageFamilyName = 'OpenAI.Codex_p10'
+    Version = '26.999.0.0'
+  }
+  $fakeIdentity = [pscustomobject]@{ BrowserId = 'browser-p10' }
+  $state = New-BridgeState -SelectedPort ([int]$selection.selectedPort) -Identity $fakeIdentity -Codex $fakeCodex
+  [ordered]@{ pass = $true; portSelection = $selection; state = $state } | ConvertTo-Json -Compress
   exit 0
 }
 
@@ -1242,19 +1272,7 @@ if ($null -eq $identity) {
   }
 }
 
-$state = [ordered]@{
-  schemaVersion = 1
-  platform = 'windows'
-  port = $Port
-  portSelection = $portSelection
-  browserId = "$($identity.BrowserId)"
-  codexExe = "$($codex.Executable)"
-  codexPackageRoot = "$($codex.PackageRoot)"
-  codexPackageFullName = "$($codex.PackageFullName)"
-  codexPackageFamilyName = "$($codex.PackageFamilyName)"
-  codexVersion = "$($codex.Version)"
-  createdAt = [DateTime]::UtcNow.ToString('o')
-}
+$state = New-BridgeState -SelectedPort $Port -Identity $identity -Codex $codex
 Write-BridgeState -Path ([IO.Path]::GetFullPath($StatePath)) -State $state
 
 [ordered]@{
@@ -1262,6 +1280,7 @@ Write-BridgeState -Path ([IO.Path]::GetFullPath($StatePath)) -State $state
   action = 'start'
   reusedExisting = [bool]($processes.Count -gt 0)
   port = $Port
+  portSelection = $portSelection
   browserId = "$($identity.BrowserId)"
   statePath = [IO.Path]::GetFullPath($StatePath)
   codexVersion = "$($codex.Version)"
