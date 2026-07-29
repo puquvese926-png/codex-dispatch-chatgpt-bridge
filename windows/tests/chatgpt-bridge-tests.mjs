@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
+import vm from "node:vm";
+import { fileURLToPath } from "node:url";
 
+import * as bridgeRuntime from "../scripts/chatgpt-bridge.mjs";
 import {
   browserIdFromVersion,
   buildChatProbeExpression,
@@ -9,11 +16,14 @@ import {
   buildBlobImageDataExpression,
   buildBlobImageChunkExpression,
   buildConversationSnapshotExpression,
+  buildMainChatSubmissionLeaseExpression,
   buildHistoryDeleteStartExpression,
   buildHistoryTitleListExpression,
   buildHistoryTitleExpression,
   buildHandoffApprovalFocusExpression,
   buildHandoffApprovalSubmitExpression,
+  attemptHandoffApprovalClick,
+  takeHandoffApprovalSession,
   buildHandoffUnitsExpression,
   buildMarkerPresenceExpression,
   buildAttachmentAcknowledgementExpression,
@@ -51,6 +61,13 @@ import {
   buildJobRouting,
   summarizeBatchSurface,
   isNativeQuickChatFallbackError,
+  DEFAULT_TIMEOUT_MS,
+  buildVersionCompatibilitySummary,
+  classifyWindowsIdentityReport,
+  validateRegisteredCodexIdentity,
+  batchProgressPath,
+  buildBatchProgress,
+  summarizeBatchError,
   summarizeCollectedImages,
   validateBridgeBatch,
   validateResumeManifest,
@@ -66,6 +83,221 @@ import {
   validateHandoffApprovalManifest,
   validateHandoffWatchManifest,
 } from "../scripts/chatgpt-handoff-protocol.mjs";
+
+const EXACT_CHATGPT_ID = "local-chatgpt:11111111-1111-4111-8111-111111111111";
+const EXACT_LOCAL_ID = "local:22222222-2222-4222-8222-222222222222";
+const EXACT_MARKER = "CODEX-BRIDGE-exact-root-marker";
+const VALID_PNG_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+const BRIDGE_RUNTIME_PATH = fileURLToPath(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url));
+
+function createDomElement(tagName, {
+  attributes = {},
+  children = [],
+  text = "",
+  value,
+  files = [],
+  visible = true,
+  disabled = false,
+} = {}) {
+  const element = {
+    tagName: tagName.toUpperCase(),
+    attributes: { ...attributes },
+    children: [],
+    parentElement: null,
+    ownerDocument: null,
+    textContent: text,
+    innerText: text,
+    disabled,
+    files,
+    visible,
+    clickCount: 0,
+    getAttribute(name) {
+      return Object.hasOwn(this.attributes, name) ? this.attributes[name] : null;
+    },
+    getBoundingClientRect() {
+      return this.visible ? { width: 200, height: 40 } : { width: 0, height: 0 };
+    },
+    getClientRects() {
+      return this.visible ? [{}] : [];
+    },
+    matches(selector) {
+      const alternatives = selector.split(",").map((part) => part.trim()).filter(Boolean);
+      return alternatives.some((part) => {
+        const tag = /^[a-z0-9-]+/iu.exec(part)?.[0];
+        if (tag && this.tagName !== tag.toUpperCase()) return false;
+        const attributesInSelector = [...part.matchAll(/\[([^\]=*]+)(?:(\*=|=)"([^"]*)")?\]/gu)];
+        return attributesInSelector.every((match) => {
+          const [, name, operator, expected] = match;
+          const actual = this.getAttribute(name);
+          if (!operator) return actual !== null;
+          if (actual === null) return false;
+          return operator === "=" ? actual === expected : actual.includes(expected);
+        });
+      });
+    },
+    querySelectorAll(selector) {
+      const matches = [];
+      const visit = (node) => {
+        for (const child of node.children) {
+          if (child.matches(selector)) matches.push(child);
+          visit(child);
+        }
+      };
+      visit(this);
+      return matches;
+    },
+    querySelector(selector) {
+      return this.querySelectorAll(selector)[0] || null;
+    },
+    closest(selector) {
+      let current = this;
+      while (current) {
+        if (current.matches(selector)) return current;
+        current = current.parentElement;
+      }
+      return null;
+    },
+    contains(node) {
+      let current = node;
+      while (current) {
+        if (current === this) return true;
+        current = current.parentElement;
+      }
+      return false;
+    },
+    focus() {
+      this.ownerDocument.activeElement = this;
+    },
+    click() {
+      this.clickCount += 1;
+    },
+  };
+  if (value !== undefined) element.value = value;
+  for (const child of children) {
+    child.parentElement = element;
+    element.children.push(child);
+  }
+  return element;
+}
+
+function createDomHarness(children, {
+  href = "app://-/index.html",
+} = {}) {
+  const document = createDomElement("document", { children });
+  document.activeElement = null;
+  const assignDocument = (node) => {
+    node.ownerDocument = document;
+    for (const child of node.children) assignDocument(child);
+  };
+  assignDocument(document);
+  return {
+    document,
+    evaluate(expression) {
+      return vm.runInNewContext(expression, {
+        document,
+        location: { href },
+        getComputedStyle(node) {
+          return {
+            display: node.visible ? "block" : "none",
+            visibility: node.visible ? "visible" : "hidden",
+          };
+        },
+        Set,
+        URL,
+      });
+    },
+  };
+}
+
+function createComposer(text = "", attributes = {}) {
+  return createDomElement("div", {
+    attributes: {
+      contenteditable: "true",
+      role: "textbox",
+      ...attributes,
+    },
+    text,
+  });
+}
+
+function createSendButton(attributes = {}) {
+  return createDomElement("button", {
+    attributes: {
+      "data-testid": "send-button",
+      "aria-label": "Send",
+      ...attributes,
+    },
+  });
+}
+
+function createExactDialog(conversationId, composer, send, extraChildren = []) {
+  const rawIdentity = conversationId.startsWith("local-chatgpt:") ?
+    `chatgpt:${conversationId}` :
+    conversationId.slice("local:".length);
+  const identityRoot = createDomElement("div", {
+    attributes: { "data-above-composer-conversation-id": rawIdentity },
+    children: [...extraChildren, composer, send],
+  });
+  return createDomElement("div", {
+    attributes: { role: "dialog", "data-pip-obstacle": "quick-chat" },
+    children: [identityRoot],
+  });
+}
+
+function quickChatAppUrl(conversationId) {
+  const route = `/chatgpt/quick-chat/${conversationId}`;
+  return `app://-/index.html?initialRoute=${encodeURIComponent(route)}`;
+}
+
+function createConversationUnit(role, text, key = `${role}-unit`) {
+  return createDomElement("div", {
+    attributes: { "data-content-search-unit-key": `${key}:${role}` },
+    text,
+  });
+}
+
+function createP08CliFixture(root) {
+  const statePath = path.join(root, "state.json");
+  const ledgerPath = path.join(root, "ledger.json");
+  const reportPath = path.join(root, "cleanup-report.json");
+  const discoveryCountPath = path.join(root, "discovery-count.txt");
+  writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, platform: "windows" }) + "\n", "utf8");
+  writeFileSync(ledgerPath, JSON.stringify({ schemaVersion: 1, entries: [] }) + "\n", "utf8");
+  writeFileSync(discoveryCountPath, "0\n", "utf8");
+  writeFileSync(path.join(root, "discovery.json"), JSON.stringify({
+    statePath,
+    discoveryCountPath,
+    state: {
+      schemaVersion: 1,
+      platform: "windows",
+      port: 9345,
+      browserId: "browser-p08",
+      codexVersion: "26.715.10079.0",
+      codexExe: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_test\\app\\ChatGPT.exe",
+      codexPackageRoot: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_test",
+      codexPackageFullName: "OpenAI.Codex_26.715.10079.0_x64__test",
+      codexPackageFamilyName: "OpenAI.Codex_test",
+      createdAt: "2026-07-28T00:00:00.000Z",
+    },
+    identity: { processId: 1234 },
+    version: { Browser: "Codex/26.715.10079.0" },
+    target: { id: "page-p08", title: "Codex", url: "app://-/index.html" },
+  }) + "\n", "utf8");
+  return { statePath, ledgerPath, reportPath, discoveryCountPath, discoveryPath: path.join(root, "discovery.json") };
+}
+
+function runP08Cli(fixture, args) {
+  return spawnSync(process.execPath, [BRIDGE_RUNTIME_PATH, ...args], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      CODEX_BRIDGE_P08_TEST_MODE: "1",
+      CODEX_BRIDGE_P08_TEST_ENVIRONMENT: "black-box",
+      CODEX_BRIDGE_P08_DISCOVERY_PATH: fixture.discoveryPath,
+      LOCALAPPDATA: path.dirname(fixture.statePath),
+    },
+  });
+}
 
 test("annotates bridge evaluation failures with the exact recovery stage", () => {
   const error = annotateBridgeStageError("history-title-list", new Error("CDP command timed out: Runtime.evaluate"));
@@ -190,7 +422,11 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: null,
     output: null,
     statePath: null,
-    timeoutMs: 180000,
+    launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
+    experimentalQuickChat: false,
+    timeoutMs: 600000,
   });
 
   assert.deepEqual(parseBridgeArgs([
@@ -206,6 +442,10 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\jobs\\batch.json",
     output: "C:\\jobs\\report.json",
     statePath: null,
+    launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
+    experimentalQuickChat: false,
     timeoutMs: 240000,
   });
 
@@ -224,7 +464,11 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\jobs\\resume.json",
     output: "C:\\jobs\\recovered.json",
     statePath: null,
-    timeoutMs: 180000,
+    launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
+    experimentalQuickChat: false,
+    timeoutMs: 600000,
   });
   assert.throws(() => parseBridgeArgs([
     "resume", "--input", "C:\\in.json", "--output", "C:\\out.json", "--allow-send",
@@ -241,7 +485,11 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\state\\conversations.json",
     output: "C:\\reports\\cleanup.json",
     statePath: null,
-    timeoutMs: 180000,
+    launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
+    experimentalQuickChat: false,
+    timeoutMs: 600000,
   });
   assert.throws(() => parseBridgeArgs([
     "cleanup", "--input", "C:\\in.json", "--output", "C:\\out.json",
@@ -259,6 +507,10 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\handoff\\watch.json",
     output: "C:\\handoff\\report.json",
     statePath: null,
+    launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
+    experimentalQuickChat: false,
     timeoutMs: 5000,
     pollMs: 1000,
   });
@@ -277,11 +529,200 @@ test("parses read-only and explicitly authorized bridge commands", () => {
     input: "C:\\handoff\\approve.json",
     output: "C:\\handoff\\approve-report.json",
     statePath: null,
-    timeoutMs: 180000,
+    launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
+    experimentalQuickChat: false,
+    timeoutMs: 600000,
   });
   assert.throws(() => parseBridgeArgs([
     "approve", "--input", "C:\\in.json", "--output", "C:\\out.json",
   ]), /allow-send|authorization/i);
+  assert.deepEqual(parseBridgeArgs([
+    "plan",
+    "--input", "C:\\jobs\\batch.json",
+    "--output", "C:\\jobs\\plan.json",
+  ]), {
+    command: "plan",
+    allowSend: false,
+    allowDelete: false,
+    input: "C:\\jobs\\batch.json",
+    output: "C:\\jobs\\plan.json",
+    statePath: null,
+    launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
+    experimentalQuickChat: false,
+    timeoutMs: 600000,
+  });
+  assert.equal(parseBridgeArgs([
+    "plan",
+    "--input", "C:\\jobs\\batch.json",
+    "--output", "C:\\jobs\\plan.json",
+    "--experimental-quick-chat",
+  ]).experimentalQuickChat, true);
+  assert.equal(parseBridgeArgs([
+    "batch",
+    "--input", "C:\\jobs\\batch.json",
+    "--output", "C:\\jobs\\report.json",
+    "--experimental-quick-chat",
+    "--allow-send",
+  ]).experimentalQuickChat, true);
+  const launchToken = "11111111-1111-4111-8111-111111111111";
+  assert.throws(() => parseBridgeArgs([
+    "batch",
+    "--input", "C:\\jobs\\batch.json",
+    "--output", "C:\\jobs\\report.json",
+    "--allow-send",
+    "--bridge-launch-token", launchToken,
+  ]), /launch token|log paths/i);
+  const launchLogRoot = "C:\\Users\\HP\\AppData\\Local\\CodexChatGPTBridge\\launches\\11111111-1111-4111-8111-111111111111";
+  const parsedLaunchLogs = parseBridgeArgs([
+    "batch",
+    "--input", "C:\\jobs\\batch.json",
+    "--output", "C:\\jobs\\report.json",
+    "--allow-send",
+    "--bridge-launch-token", launchToken,
+    "--bridge-stdout-log", `${launchLogRoot}\\stdout.log`,
+    "--bridge-stderr-log", `${launchLogRoot}\\stderr.log`,
+  ]);
+  assert.equal(parsedLaunchLogs.stdoutLogPath, `${launchLogRoot}\\stdout.log`);
+  assert.equal(parsedLaunchLogs.stderrLogPath, `${launchLogRoot}\\stderr.log`);
+  assert.throws(() => parseBridgeArgs([
+    "batch", "--input", "C:\\jobs\\batch.json", "--output", "C:\\jobs\\report.json",
+    "--allow-send", "--bridge-launch-token", launchToken,
+    "--bridge-stdout-log", `${launchLogRoot}\\stdout.log`,
+  ]), /both|pair|stderr/i);
+  assert.throws(() => parseBridgeArgs([
+    "batch", "--input", "C:\\jobs\\batch.json", "--output", "C:\\jobs\\report.json",
+    "--allow-send", "--bridge-launch-token", launchToken,
+    "--bridge-stdout-log", `${launchLogRoot}\\business.json`,
+    "--bridge-stderr-log", `${launchLogRoot}\\stderr.log`,
+  ]), /log|stdout|launch/i);
+  assert.throws(() => parseBridgeArgs([
+    "batch", "--input", "C:\\jobs\\batch.json", "--output", "C:\\jobs\\report.json",
+    "--allow-send", "--bridge-launch-token", "not-a-uuid",
+  ]), /launch token.*UUID/i);
+  assert.throws(() => parseBridgeArgs([
+    "resume",
+    "--input", "C:\\jobs\\resume.json",
+    "--output", "C:\\jobs\\report.json",
+    "--experimental-quick-chat",
+  ]), /experimental.*Quick Chat|quick chat/i);
+});
+
+test("oversized launcher log events degrade to one bounded safe record", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-log-bound-"));
+  try {
+    const logPath = path.join(temporaryRoot, "stdout.log");
+    bridgeRuntime.appendBridgeLaunchLog(logPath, { pass: true, detail: "x".repeat(200000) });
+    const lines = readFileSync(logPath, "utf8").trim().split(/\r?\n/).filter(Boolean);
+    assert.equal(lines.length, 1);
+    assert.ok(Buffer.byteLength(lines[0], "utf8") <= 65536);
+    assert.deepEqual(JSON.parse(lines[0]), {
+      pass: false,
+      error: "bridge launch log payload exceeded the bounded limit",
+    });
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("final Node CLI succeeds exactly once without detached log arguments", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-p08-cli-"));
+  try {
+    const fixture = createP08CliFixture(temporaryRoot);
+    const discovered = runP08Cli(fixture, ["discover", "--state", fixture.statePath]);
+    assert.equal(discovered.status, 0, discovered.stderr || discovered.stdout);
+    assert.deepEqual(JSON.parse(discovered.stdout), {
+      pass: true,
+      command: "discover",
+      codexVersion: "26.715.10079.0",
+      versionCompatibility: {
+        schemaVersion: 1,
+        codexVersion: "26.715.10079.0",
+        main: { status: "runtime-probed" },
+        quickChat: { status: "verified", reason: null, rpcAttempted: false },
+        supportedQuickChatVersions: ["26.707.9564.0", "26.715.10079.0"],
+      },
+      packageFullName: "OpenAI.Codex_26.715.10079.0_x64__test",
+      port: 9345,
+      browserId: "browser-p08",
+      browser: "Codex/26.715.10079.0",
+      renderer: { id: "page-p08", title: "Codex", url: "app://-/index.html" },
+      processId: 1234,
+    });
+
+    const cleanup = runP08Cli(fixture, [
+      "cleanup",
+      "--state", fixture.statePath,
+      "--input", fixture.ledgerPath,
+      "--output", fixture.reportPath,
+      "--allow-delete",
+    ]);
+    assert.equal(cleanup.status, 0, cleanup.stderr || cleanup.stdout);
+    const cleanupReport = JSON.parse(cleanup.stdout);
+    assert.equal(cleanupReport.pass, true);
+    assert.equal(cleanupReport.command, "cleanup");
+    assert.deepEqual(JSON.parse(readFileSync(fixture.ledgerPath, "utf8")), { schemaVersion: 1, entries: [] });
+    assert.equal(JSON.parse(readFileSync(fixture.discoveryCountPath, "utf8")), 2);
+    assert.equal(existsSync(path.join(temporaryRoot, "stdout.log")), false);
+    assert.equal(existsSync(path.join(temporaryRoot, "stderr.log")), false);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("final Node CLI rejects partial or invalid detached log arguments before any operation", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-p08-log-args-"));
+  try {
+    const fixture = createP08CliFixture(temporaryRoot);
+    const launchToken = "11111111-1111-4111-8111-111111111111";
+    const stdoutPath = path.join(temporaryRoot, launchToken, "stdout.log");
+    const stderrPath = path.join(temporaryRoot, launchToken, "stderr.log");
+    const cases = [
+      ["--bridge-stdout-log", stdoutPath],
+      ["--bridge-stdout-log", "relative-stdout.log", "--bridge-stderr-log", "relative-stderr.log", "--bridge-launch-token", launchToken],
+      ["--bridge-stdout-log", stdoutPath, "--bridge-stderr-log", stderrPath, "--bridge-launch-token", "not-a-uuid"],
+    ];
+    for (const logArguments of cases) {
+      const result = runP08Cli(fixture, ["cleanup", "--state", fixture.statePath,
+        "--input", fixture.ledgerPath, "--output", fixture.reportPath, "--allow-delete", ...logArguments]);
+      assert.notEqual(result.status, 0);
+    }
+    assert.equal(readFileSync(fixture.discoveryCountPath, "utf8").trim(), "0");
+    assert.equal(readFileSync(fixture.ledgerPath, "utf8").trim(), '{"schemaVersion":1,"entries":[]}');
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("detached log finalization failure cannot change a completed command result", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "codex-bridge-p08-log-failure-"));
+  try {
+    const fixture = createP08CliFixture(temporaryRoot);
+    const launchToken = "22222222-2222-4222-8222-222222222222";
+    const launchRoot = path.join(temporaryRoot, launchToken);
+    mkdirSync(launchRoot, { recursive: true });
+    mkdirSync(path.join(launchRoot, "stdout.log"));
+    writeFileSync(path.join(launchRoot, "stderr.log"), "", "utf8");
+    const result = runP08Cli(fixture, [
+      "cleanup",
+      "--state", fixture.statePath,
+      "--input", fixture.ledgerPath,
+      "--output", fixture.reportPath,
+      "--allow-delete",
+      "--bridge-launch-token", launchToken,
+      "--bridge-stdout-log", path.join(launchRoot, "stdout.log"),
+      "--bridge-stderr-log", path.join(launchRoot, "stderr.log"),
+    ]);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout).pass, true);
+    assert.equal(JSON.parse(readFileSync(fixture.discoveryCountPath, "utf8")), 1);
+    assert.equal(JSON.parse(readFileSync(fixture.reportPath, "utf8")).pass, true);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
 });
 
 test("validates strict unique batch jobs without rewriting prompts", () => {
@@ -401,14 +842,18 @@ test("zero-reference generation skips attachment upload and preserves an empty r
 });
 
 test("attachment discovery uses visible upload controls without private APIs", () => {
-  const expression = buildAttachmentButtonExpression();
+  const expression = buildAttachmentButtonExpression("chatgpt-main-chat", EXACT_CHATGPT_ID);
   assert.match(expression, /Attach|添加|上传|文件/i);
   assert.match(expression, /click/);
   assert.doesNotMatch(expression, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
 });
 
 test("attachment acknowledgement recognizes rendered attachment cards", () => {
-  const expression = buildAttachmentAcknowledgementExpression(["reference-a.jpg", "reference-b.png"]);
+  const expression = buildAttachmentAcknowledgementExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    ["reference-a.jpg", "reference-b.png"],
+  );
   assert.match(expression, /aria-label/);
   assert.match(expression, /title/);
   assert.match(expression, /alt/);
@@ -417,11 +862,735 @@ test("attachment acknowledgement recognizes rendered attachment cards", () => {
   assert.doesNotMatch(expression, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
 });
 
+test("attachment button ignores an earlier Codex attach control", () => {
+  const codexAttach = createDomElement("button", {
+    attributes: { "aria-label": "Add files" },
+  });
+  const codexComposer = createComposer();
+  const codexRoot = createDomElement("main", {
+    children: [codexAttach, codexComposer],
+  });
+  const chatAttach = createDomElement("button", {
+    attributes: { "aria-label": "添加文件" },
+  });
+  const chatComposer = createComposer();
+  const chatSend = createSendButton();
+  const chatRoot = createExactDialog(EXACT_CHATGPT_ID, chatComposer, chatSend, [chatAttach]);
+  const harness = createDomHarness([codexRoot, chatRoot]);
+
+  const result = harness.evaluate(buildAttachmentButtonExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  ));
+
+  assert.equal(result.clicked, true);
+  assert.equal(codexAttach.clickCount, 0);
+  assert.equal(chatAttach.clickCount, 1);
+});
+
+test("file input resolves only inside the exact leased ChatGPT root", () => {
+  const codexInput = createDomElement("input", {
+    attributes: { type: "file" },
+  });
+  const codexComposer = createComposer();
+  const codexRoot = createDomElement("main", {
+    children: [codexInput, codexComposer],
+  });
+  const chatInput = createDomElement("input", {
+    attributes: { type: "file" },
+  });
+  const chatRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [chatInput],
+  );
+  const harness = createDomHarness([codexRoot, chatRoot]);
+
+  const selected = harness.evaluate(bridgeRuntime.buildAttachmentInputExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  ));
+
+  assert.equal(selected, chatInput);
+  assert.notEqual(selected, codexInput);
+});
+
+test("zero or multiple exact-root file inputs fail before DOM.setFileInputFiles", () => {
+  const zeroInputRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+  );
+  const zeroHarness = createDomHarness([zeroInputRoot]);
+  assert.equal(zeroHarness.evaluate(bridgeRuntime.buildAttachmentInputExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  )), null);
+
+  const inputA = createDomElement("input", { attributes: { type: "file" } });
+  const inputB = createDomElement("input", { attributes: { type: "file" } });
+  const multipleRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [inputA, inputB],
+  );
+  const multipleHarness = createDomHarness([multipleRoot]);
+  assert.equal(multipleHarness.evaluate(bridgeRuntime.buildAttachmentInputExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  )), null);
+});
+
+test("attachment input state reports multiple exact-root inputs without clicking", () => {
+  const attach = createDomElement("button", {
+    attributes: { "aria-label": "添加文件" },
+  });
+  const inputA = createDomElement("input", { attributes: { type: "file" } });
+  const inputB = createDomElement("input", { attributes: { type: "file" } });
+  const exactRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [attach, inputA, inputB],
+  );
+  const harness = createDomHarness([exactRoot]);
+
+  const state = harness.evaluate(bridgeRuntime.buildAttachmentInputStateExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  ));
+
+  assert.equal(state.ok, false);
+  assert.equal(state.inputCount, 2);
+  assert.equal(state.inputPresent, false);
+  assert.equal(state.reason, "file-input-count");
+  assert.equal(attach.clickCount, 0);
+});
+
+test("attachment acknowledgement ignores identical filenames outside the exact root", () => {
+  const exactInput = createDomElement("input", {
+    attributes: { type: "file" },
+    files: [],
+  });
+  const exactRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [exactInput, createDomElement("div", { attributes: { title: "other.png" } })],
+  );
+  const outsideCard = createDomElement("div", {
+    attributes: { title: "same.png" },
+  });
+  const harness = createDomHarness([exactRoot, outsideCard]);
+
+  const result = harness.evaluate(bridgeRuntime.buildAttachmentAcknowledgementExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    ["same.png"],
+  ));
+
+  assert.equal(result, false);
+});
+
+test("attachment acknowledgement ignores identical filenames in ordinary exact-root text", () => {
+  const exactInput = createDomElement("input", {
+    attributes: { type: "file" },
+    files: [],
+  });
+  const exactRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [exactInput],
+  );
+  exactRoot.innerText = "历史消息中提到了 same.png，但这不是附件";
+  exactRoot.textContent = exactRoot.innerText;
+  const harness = createDomHarness([exactRoot]);
+
+  const result = harness.evaluate(bridgeRuntime.buildAttachmentAcknowledgementExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    ["same.png"],
+  ));
+
+  assert.equal(result, false);
+});
+
+test("attachment acknowledgement accepts exact files and semantic attachment labels", () => {
+  const exactInput = createDomElement("input", {
+    attributes: { type: "file" },
+    files: [{ name: "reference-a.jpg" }],
+  });
+  const attachmentLabel = createDomElement("div", {
+    attributes: { "aria-label": "Attached file reference-b.png" },
+  });
+  const exactRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [exactInput, attachmentLabel],
+  );
+  const harness = createDomHarness([exactRoot]);
+
+  const result = harness.evaluate(bridgeRuntime.buildAttachmentAcknowledgementExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    ["reference-a.jpg", "reference-b.png"],
+  ));
+
+  assert.equal(result, true);
+});
+
+test("delayed exact-root input polling clicks attachment once and then stays read-only", async () => {
+  const fixturePath = fileURLToPath(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url));
+  const fixtureSha256 = createHash("sha256").update(readFileSync(fixturePath)).digest("hex");
+  const prepared = {
+    surface: "chatgpt-main-chat",
+    conversationId: EXACT_CHATGPT_ID,
+  };
+  const job = {
+    id: "delayed-attachment-input",
+    references: [{ path: fixturePath, sha256: fixtureSha256 }],
+  };
+  const attachmentClickExpressions = [];
+  const inputStateExpressions = [];
+  let inputStatePolls = 0;
+  const sendCalls = [];
+  const session = {
+    async evaluate(expression) {
+      if (expression.includes("attach.click")) {
+        attachmentClickExpressions.push(expression);
+        return { inputPresent: false, clicked: true };
+      }
+      if (expression.includes("inputCount")) {
+        inputStateExpressions.push(expression);
+        inputStatePolls += 1;
+        const inputCount = inputStatePolls >= 2 ? 1 : 0;
+        return { ok: inputCount === 1, inputCount, inputPresent: inputCount === 1 };
+      }
+      return true;
+    },
+    async evaluateRemoteObject() {
+      return { objectId: "attachment-input-remote" };
+    },
+    async send(method, params) {
+      sendCalls.push([method, params]);
+      if (method === "DOM.requestNode") return { nodeId: 42 };
+      return {};
+    },
+  };
+
+  await bridgeRuntime.attachJobReferences(session, prepared, job);
+
+  assert.equal(attachmentClickExpressions.length, 1);
+  assert.equal(inputStateExpressions.length, 2);
+  assert.deepEqual(sendCalls.map(([method]) => method), [
+    "DOM.requestNode",
+    "Runtime.releaseObject",
+    "DOM.setFileInputFiles",
+  ]);
+});
+
+test("attachment acknowledgement fails after conversation identity or Quick Chat route changes", () => {
+  const mainInput = createDomElement("input", {
+    attributes: { type: "file" },
+    files: [{ name: "same.png" }],
+  });
+  const mainRoot = createExactDialog(
+    "local-chatgpt:77777777-7777-4777-8777-777777777777",
+    createComposer(),
+    createSendButton(),
+    [mainInput],
+  );
+  const mainHarness = createDomHarness([mainRoot]);
+  assert.equal(mainHarness.evaluate(bridgeRuntime.buildAttachmentAcknowledgementExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    ["same.png"],
+  )), false);
+
+  const quickInput = createDomElement("input", {
+    attributes: { type: "file" },
+    files: [{ name: "same.png" }],
+  });
+  const quickHarness = createDomHarness([quickInput], {
+    href: quickChatAppUrl("local-chatgpt:88888888-8888-4888-8888-888888888888"),
+  });
+  assert.equal(quickHarness.evaluate(bridgeRuntime.buildAttachmentAcknowledgementExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+    ["same.png"],
+  )), false);
+});
+
+test("remote attachment input object is released after DOM.requestNode success and failure", async () => {
+  const prepared = {
+    surface: "chatgpt-main-chat",
+    conversationId: EXACT_CHATGPT_ID,
+  };
+  const successCalls = [];
+  const successSession = {
+    async evaluateRemoteObject() {
+      successCalls.push("evaluateRemoteObject");
+      return { objectId: "remote-success" };
+    },
+    async send(method, params) {
+      successCalls.push([method, params]);
+      if (method === "DOM.requestNode") return { nodeId: 123 };
+      return {};
+    },
+  };
+  assert.equal(
+    await bridgeRuntime.requestExactAttachmentInputNode(successSession, prepared),
+    123,
+  );
+  assert.deepEqual(successCalls.map((entry) => Array.isArray(entry) ? entry[0] : entry), [
+    "evaluateRemoteObject",
+    "DOM.requestNode",
+    "Runtime.releaseObject",
+  ]);
+
+  const failureCalls = [];
+  const failureSession = {
+    async evaluateRemoteObject() {
+      failureCalls.push("evaluateRemoteObject");
+      return { objectId: "remote-failure" };
+    },
+    async send(method) {
+      failureCalls.push(method);
+      if (method === "DOM.requestNode") throw new Error("requestNode failed");
+      return {};
+    },
+  };
+  await assert.rejects(
+    bridgeRuntime.requestExactAttachmentInputNode(failureSession, prepared),
+    /requestNode failed/,
+  );
+  assert.deepEqual(failureCalls, ["evaluateRemoteObject", "DOM.requestNode", "Runtime.releaseObject"]);
+});
+
+test("zero-reference generation performs no attachment UI or CDP calls", async () => {
+  let calls = 0;
+  const session = {
+    async evaluate() { calls += 1; },
+    async evaluateRemoteObject() { calls += 1; },
+    async send() { calls += 1; },
+  };
+  await bridgeRuntime.attachJobReferences(
+    session,
+    { surface: "chatgpt-main-chat", conversationId: EXACT_CHATGPT_ID },
+    { references: [] },
+  );
+  assert.equal(calls, 0);
+});
+
+test("composer focus selects only the exact leased ChatGPT root", () => {
+  const codexComposer = createComposer();
+  const codexSend = createSendButton();
+  const codexRoot = createDomElement("main", { children: [codexComposer, codexSend] });
+  const chatComposer = createComposer();
+  const chatSend = createSendButton();
+  const chatRoot = createExactDialog(EXACT_CHATGPT_ID, chatComposer, chatSend);
+  const harness = createDomHarness([codexRoot, chatRoot]);
+
+  const result = harness.evaluate(buildComposerFocusExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  ));
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.document.activeElement, chatComposer);
+  assert.notEqual(harness.document.activeElement, codexComposer);
+});
+
+test("send click ignores an earlier Codex send button", () => {
+  const codexComposer = createComposer(EXACT_MARKER);
+  const codexSend = createSendButton();
+  const codexRoot = createDomElement("main", { children: [codexComposer, codexSend] });
+  const chatComposer = createComposer(EXACT_MARKER);
+  const chatSend = createSendButton();
+  const chatRoot = createExactDialog(EXACT_CHATGPT_ID, chatComposer, chatSend);
+  const harness = createDomHarness([codexRoot, chatRoot]);
+
+  const result = harness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(result.clicked, true);
+  assert.equal(codexSend.clickCount, 0);
+  assert.equal(chatSend.clickCount, 1);
+});
+
+test("send click rejects zero or multiple exact roots before submission", () => {
+  const missingComposer = createComposer(EXACT_MARKER);
+  const missingSend = createSendButton();
+  const missingHarness = createDomHarness([
+    createExactDialog(
+      "local-chatgpt:33333333-3333-4333-8333-333333333333",
+      missingComposer,
+      missingSend,
+    ),
+  ]);
+  const missingResult = missingHarness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+  assert.equal(missingResult.clicked, false);
+  assert.equal(missingSend.clickCount, 0);
+
+  const composerA = createComposer(EXACT_MARKER);
+  const sendA = createSendButton();
+  const composerB = createComposer(EXACT_MARKER);
+  const sendB = createSendButton();
+  const multipleHarness = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, composerA, sendA),
+    createExactDialog(EXACT_CHATGPT_ID, composerB, sendB),
+  ]);
+  const multipleResult = multipleHarness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+  assert.equal(multipleResult.clicked, false);
+  assert.equal(sendA.clickCount + sendB.clickCount, 0);
+});
+
+test("send click revalidates exact conversation identity and marker atomically", () => {
+  const wrongMarkerComposer = createComposer("different marker");
+  const wrongMarkerSend = createSendButton();
+  const markerHarness = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, wrongMarkerComposer, wrongMarkerSend),
+  ]);
+  const markerResult = markerHarness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+  assert.equal(markerResult.clicked, false);
+  assert.equal(wrongMarkerSend.clickCount, 0);
+
+  const wrongIdentityComposer = createComposer(EXACT_MARKER);
+  const wrongIdentitySend = createSendButton();
+  const identityHarness = createDomHarness([
+    createExactDialog(
+      "local-chatgpt:44444444-4444-4444-8444-444444444444",
+      wrongIdentityComposer,
+      wrongIdentitySend,
+    ),
+  ]);
+  const identityResult = identityHarness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+  assert.equal(identityResult.clicked, false);
+  assert.equal(wrongIdentitySend.clickCount, 0);
+});
+
+test("quick-chat send refuses a stale renderer route after preparation", () => {
+  const composer = createComposer(EXACT_MARKER);
+  const send = createSendButton();
+  const staleId = "local-chatgpt:55555555-5555-4555-8555-555555555555";
+  const harness = createDomHarness([composer, send], {
+    href: quickChatAppUrl(staleId),
+  });
+
+  const result = harness.evaluate(buildSendClickExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(result.clicked, false);
+  assert.equal(send.clickCount, 0);
+});
+
+test("quick-chat send succeeds only on the current expected app route", () => {
+  const composer = createComposer(EXACT_MARKER);
+  const send = createSendButton();
+  const harness = createDomHarness([composer, send], {
+    href: quickChatAppUrl(EXACT_CHATGPT_ID),
+  });
+
+  const result = harness.evaluate(buildSendClickExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(result.clicked, true);
+  assert.equal(send.clickCount, 1);
+});
+
+test("malformed prewarm and non-app quick-chat routes fail before click", () => {
+  const invalidRoutes = [
+    "app://-/index.html",
+    "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat-prewarm",
+    "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat%2Fbad%2Fextra",
+    `https://example.com/?initialRoute=${encodeURIComponent(`/chatgpt/quick-chat/${EXACT_CHATGPT_ID}`)}`,
+    `app://user:password@-/index.html?initialRoute=${encodeURIComponent(`/chatgpt/quick-chat/${EXACT_CHATGPT_ID}`)}`,
+  ];
+
+  for (const href of invalidRoutes) {
+    const composer = createComposer(EXACT_MARKER);
+    const send = createSendButton();
+    const harness = createDomHarness([composer, send], { href });
+    const result = harness.evaluate(buildSendClickExpression(
+      "chatgpt-quick-chat",
+      EXACT_CHATGPT_ID,
+      EXACT_MARKER,
+    ));
+    assert.equal(result.clicked, false, href);
+    assert.equal(send.clickCount, 0, href);
+  }
+});
+
+test("quick-chat focus and readiness fail when the current route is not expected", () => {
+  const composer = createComposer(EXACT_MARKER);
+  const send = createSendButton();
+  const staleId = "local-chatgpt:66666666-6666-4666-8666-666666666666";
+  const harness = createDomHarness([composer, send], {
+    href: quickChatAppUrl(staleId),
+  });
+
+  const focus = harness.evaluate(buildComposerFocusExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+  ));
+  const readiness = harness.evaluate(buildComposerReadinessExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(focus.ok, false);
+  assert.equal(readiness.ok, false);
+  assert.equal(harness.document.activeElement, null);
+});
+
+test("main local thread identity cannot authorize a Codex composer", () => {
+  const codexComposer = createComposer(EXACT_MARKER);
+  const codexSend = createSendButton();
+  const modeControl = createDomElement("button", {
+    attributes: { "aria-label": "当前模式：ChatGPT" },
+  });
+  const codexRoot = createDomElement("main", {
+    children: [modeControl, codexComposer, codexSend],
+  });
+  const activeThread = createDomElement("button", {
+    attributes: {
+      "data-app-action-sidebar-thread-id": EXACT_LOCAL_ID,
+      "aria-current": "page",
+    },
+  });
+  const harness = createDomHarness([activeThread, codexRoot]);
+
+  const result = harness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(result.clicked, false);
+  assert.equal(codexSend.clickCount, 0);
+});
+
+test("main active sidebar identity authorizes only an explicit ChatGPT mode root", () => {
+  const activeThread = createDomElement("button", {
+    attributes: {
+      "data-app-action-sidebar-thread-id": EXACT_LOCAL_ID,
+      "aria-current": "page",
+    },
+  });
+  const modeControl = createDomElement("button", {
+    attributes: { "aria-label": "当前模式：ChatGPT" },
+  });
+  const chatComposer = createComposer(EXACT_MARKER, {
+    "aria-label": "给 ChatGPT 发消息",
+  });
+  const chatSend = createSendButton();
+  const chatRoot = createDomElement("main", {
+    children: [modeControl, chatComposer, chatSend],
+  });
+  const harness = createDomHarness([activeThread, chatRoot]);
+
+  const focus = harness.evaluate(buildComposerFocusExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+  ));
+  const readiness = harness.evaluate(buildComposerReadinessExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+    EXACT_MARKER,
+  ));
+  const clicked = harness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(focus.ok, true);
+  assert.equal(readiness.ok, true);
+  assert.equal(clicked.clicked, true);
+  assert.equal(harness.document.activeElement, chatComposer);
+  assert.equal(chatSend.clickCount, 1);
+});
+
+test("main active sidebar identity accepts a non-button ChatGPT mode control", () => {
+  const activeThread = createDomElement("button", {
+    attributes: {
+      "data-app-action-sidebar-thread-id": EXACT_LOCAL_ID,
+      "aria-current": "page",
+    },
+  });
+  const modeControl = createDomElement("div", {
+    attributes: {
+      role: "button",
+      "aria-label": "当前模式：ChatGPT",
+    },
+  });
+  const chatComposer = createComposer(EXACT_MARKER, {
+    "aria-label": "给 ChatGPT 发消息",
+  });
+  const chatSend = createSendButton();
+  const chatRoot = createDomElement("main", {
+    children: [modeControl, chatComposer, chatSend],
+  });
+  const harness = createDomHarness([activeThread, chatRoot]);
+
+  const focus = harness.evaluate(buildComposerFocusExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+  ));
+  const readiness = harness.evaluate(buildComposerReadinessExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+    EXACT_MARKER,
+  ));
+  const clicked = harness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(focus.ok, true);
+  assert.equal(readiness.ok, true);
+  assert.equal(clicked.clicked, true);
+  assert.equal(harness.document.activeElement, chatComposer);
+  assert.equal(chatSend.clickCount, 1);
+});
+
+test("main local thread identity submits only through its bound ChatGPT root", () => {
+  const chatComposer = createComposer(EXACT_MARKER);
+  const chatSend = createSendButton();
+  const chatRoot = createExactDialog(EXACT_LOCAL_ID, chatComposer, chatSend);
+  const harness = createDomHarness([chatRoot]);
+
+  const result = harness.evaluate(buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_LOCAL_ID,
+    EXACT_MARKER,
+  ));
+
+  assert.equal(result.clicked, true);
+  assert.equal(chatSend.clickCount, 1);
+});
+
+test("CDP loss during the click attempt seals unknown-after-submit", async () => {
+  assert.equal(typeof bridgeRuntime.attemptExactSendClick, "function");
+  const session = {
+    async evaluate() {
+      throw new Error("CDP websocket closed");
+    },
+  };
+  const result = await bridgeRuntime.attemptExactSendClick(
+    session,
+    {
+      surface: "chatgpt-main-chat",
+      conversationId: EXACT_CHATGPT_ID,
+    },
+    EXACT_MARKER,
+    () => "2026-07-28T12:00:00.000Z",
+  );
+
+  assert.equal(result.status, "unknown-after-submit");
+  assert.equal(result.attemptedAt, "2026-07-28T12:00:00.000Z");
+  assert.equal(result.submittedAt, "2026-07-28T12:00:00.000Z");
+  assert.equal(result.expectedConversationId, EXACT_CHATGPT_ID);
+  assert.equal(result.marker, EXACT_MARKER);
+});
+
+test("explicit clicked false remains not-submitted", async () => {
+  assert.equal(typeof bridgeRuntime.attemptExactSendClick, "function");
+  const session = {
+    async evaluate() {
+      return { clicked: false, reason: "exact-root-count" };
+    },
+  };
+  const result = await bridgeRuntime.attemptExactSendClick(
+    session,
+    {
+      surface: "chatgpt-main-chat",
+      conversationId: EXACT_CHATGPT_ID,
+    },
+    EXACT_MARKER,
+    () => "2026-07-28T12:01:00.000Z",
+  );
+
+  assert.equal(result.status, "not-submitted");
+  assert.equal(result.submittedAt, null);
+  assert.equal(result.expectedConversationId, EXACT_CHATGPT_ID);
+  assert.equal(result.marker, EXACT_MARKER);
+});
+
+test("quick-chat send attempt requires an externally verified exact route", async () => {
+  await assert.rejects(
+    bridgeRuntime.attemptExactSendClick(
+      { async evaluate() { return { clicked: true }; } },
+      {
+        surface: "chatgpt-quick-chat",
+        conversationId: EXACT_CHATGPT_ID,
+        exactRouteVerified: false,
+      },
+      EXACT_MARKER,
+    ),
+    /route was not exactly verified/i,
+  );
+});
+
+test("submission expressions reject invalid identity inputs at build time", () => {
+  assert.throws(
+    () => buildComposerFocusExpression("chatgpt-main-chat", "not-a-conversation"),
+    /conversation identity is invalid/i,
+  );
+  assert.throws(
+    () => buildComposerReadinessExpression("chatgpt-quick-chat", EXACT_LOCAL_ID, EXACT_MARKER),
+    /conversation identity is invalid/i,
+  );
+  assert.throws(
+    () => buildSendClickExpression("unknown-surface", EXACT_CHATGPT_ID, EXACT_MARKER),
+    /surface is invalid/i,
+  );
+});
+
 test("composer discovery tolerates ChatGPT editor and send-control selector drift", () => {
-  const focus = buildComposerFocusExpression();
+  const focus = buildComposerFocusExpression("chatgpt-main-chat", EXACT_CHATGPT_ID);
   const blank = buildComposerAvailabilityExpression(true);
-  const ready = buildComposerReadinessExpression("CODEX-BRIDGE-test-marker");
-  const send = buildSendClickExpression();
+  const ready = buildComposerReadinessExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    "CODEX-BRIDGE-test-marker",
+  );
+  const send = buildSendClickExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    "CODEX-BRIDGE-test-marker",
+  );
 
   for (const expression of [focus, blank, ready]) {
     assert.match(expression, /data-lexical-editor/);
@@ -462,6 +1631,120 @@ test("main ChatGPT fallback uses only visible new-chat and blank-surface gates",
   assert.doesNotMatch(entry + newConversation + blank, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
 });
 
+test("main ChatGPT entry is idempotent when the owned chat dialog is already visible", () => {
+  let clicks = 0;
+  const visibleRect = { width: 800, height: 600 };
+  const button = {
+    disabled: false,
+    innerText: "Quick chat",
+    textContent: "Quick chat",
+    getAttribute(name) {
+      if (name === "aria-label") return "Quick chat";
+      return null;
+    },
+    getBoundingClientRect() {
+      return visibleRect;
+    },
+    getClientRects() {
+      return [visibleRect];
+    },
+    click() {
+      clicks += 1;
+    },
+  };
+  const dialog = {
+    disabled: false,
+    getAttribute() {
+      return null;
+    },
+    getBoundingClientRect() {
+      return visibleRect;
+    },
+    getClientRects() {
+      return [visibleRect];
+    },
+    querySelector(selector) {
+      if (selector === "[data-above-composer-conversation-id]") return {};
+      return null;
+    },
+  };
+  const originalDocument = globalThis.document;
+  const originalGetComputedStyle = globalThis.getComputedStyle;
+  globalThis.document = {
+    querySelectorAll(selector) {
+      if (selector === "button, [role=\"button\"]") return [button];
+      if (selector === "[data-pip-obstacle=\"quick-chat\"]") return [dialog];
+      if (selector === "[role=\"dialog\"]") return [dialog];
+      return [];
+    },
+  };
+  globalThis.getComputedStyle = () => ({ display: "block", visibility: "visible" });
+  try {
+    assert.equal(eval(buildMainChatEntryExpression()), true);
+    assert.equal(clicks, 0);
+  } finally {
+    globalThis.document = originalDocument;
+    globalThis.getComputedStyle = originalGetComputedStyle;
+  }
+});
+
+test("main new-chat gate accepts an aria-only localized control", () => {
+  let clicks = 0;
+  const visibleRect = { width: 80, height: 40 };
+  const button = {
+    disabled: false,
+    innerText: "",
+    textContent: "",
+    getAttribute(name) {
+      if (name === "aria-label") return "新聊天";
+      return null;
+    },
+    getBoundingClientRect() {
+      return visibleRect;
+    },
+    getClientRects() {
+      return [visibleRect];
+    },
+    click() {
+      clicks += 1;
+    },
+  };
+  const dialog = {
+    disabled: false,
+    getAttribute() {
+      return null;
+    },
+    getBoundingClientRect() {
+      return visibleRect;
+    },
+    getClientRects() {
+      return [visibleRect];
+    },
+    querySelectorAll(selector) {
+      if (selector === "button, [role=\"button\"]") return [button];
+      return [];
+    },
+  };
+  const originalDocument = globalThis.document;
+  const originalGetComputedStyle = globalThis.getComputedStyle;
+  globalThis.document = {
+    querySelectorAll(selector) {
+      if (selector === "button, [role=\"button\"]") return [button];
+      if (selector === "[data-pip-obstacle=\"quick-chat\"]") return [dialog];
+      if (selector === "[role=\"dialog\"]") return [dialog];
+      return [];
+    },
+  };
+  globalThis.getComputedStyle = () => ({ display: "block", visibility: "visible" });
+  try {
+    assert.equal(eval(buildMainChatNewConversationExpression()), true);
+    assert.equal(clicks, 1);
+  } finally {
+    globalThis.document = originalDocument;
+    globalThis.getComputedStyle = originalGetComputedStyle;
+  }
+});
+
 test("retained main-surface fallback is collected before the next job can replace its dialog", () => {
   const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
   const start = source.indexOf("async function runBatch");
@@ -472,17 +1755,136 @@ test("retained main-surface fallback is collected before the next job can replac
   const immediateCollection = runBatchSource.indexOf("await collectJob(session, submission, options.timeoutMs)");
   const deferredCollection = runBatchSource.indexOf("const collected = await Promise.all");
   assert.ok(immediateCollection >= 0 && immediateCollection < deferredCollection);
+  const collectStart = source.indexOf("async function collectJob");
+  const collectionEntry = source.indexOf("main-chat-collection-entry-open", collectStart);
+  const navigate = source.indexOf("await navigateToConversation", collectStart);
+  assert.ok(collectionEntry >= 0 && collectionEntry < navigate);
+});
+
+test("main collection verifies the submitted lease before touching the entry toggle", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const submitStart = source.indexOf("async function submitJob");
+  const collectStart = source.indexOf("async function collectJob", submitStart);
+  const closeStart = source.indexOf("async function closeOwnedQuickChat", collectStart);
+  const submitSource = source.slice(submitStart, collectStart);
+  const collectSource = source.slice(collectStart, closeStart);
+
+  assert.match(submitSource, /buildMainChatSubmissionLeaseExpression/);
+  assert.match(collectSource, /main-chat-current-submission-lease/);
+  const lease = collectSource.indexOf("buildMainChatSubmissionLeaseExpression");
+  const entry = collectSource.indexOf("buildMainChatEntryExpression");
+  assert.ok(lease >= 0 && entry > lease);
+  assert.doesNotMatch(
+    collectSource,
+    /currentConversationId\s*=\s*submission\.surface\s*===\s*"chatgpt-main-chat"\s*\?\s*submission\.conversationId/,
+  );
+  assert.match(collectSource, /main-chat-collection-lease-lost/);
+});
+
+test("product batch defaults to a long image-generation window and writes durable progress", () => {
+  assert.equal(DEFAULT_TIMEOUT_MS, 600000);
+  assert.equal(
+    batchProgressPath("C:\\reports\\batch.json"),
+    "C:\\reports\\batch.json.progress.json",
+  );
+  const progress = buildBatchProgress({
+    runId: "run-progress",
+    reportPath: "C:\\reports\\batch.json",
+    startedAt: "2026-07-27T00:00:00.000Z",
+    updatedAt: "2026-07-27T00:01:00.000Z",
+    state: "running",
+    requestedJobs: 2,
+    currentJobId: "shot-1",
+    jobs: [
+      {
+        id: "shot-1",
+        promptHash: "a".repeat(64),
+        marker: "CODEX-BRIDGE-run-progress-shot-1",
+        conversationId: "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de",
+        expectedConversationId: "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de",
+        surface: "chatgpt-main-chat",
+        attemptedAt: "2026-07-27T00:00:29.000Z",
+        submittedAt: "2026-07-27T00:00:30.000Z",
+        status: "submitted",
+      },
+      {
+        id: "shot-2",
+        promptHash: "b".repeat(64),
+        marker: "CODEX-BRIDGE-run-progress-shot-2",
+        status: "pending",
+      },
+    ],
+  });
+  assert.equal(progress.state, "running");
+  assert.equal(progress.currentJobId, "shot-1");
+  assert.equal(progress.submittedJobs, 1);
+  assert.equal(progress.completedJobs, 0);
+  assert.equal(progress.jobs[0].conversationId, "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de");
+  assert.equal(progress.jobs[0].expectedConversationId, "local-chatgpt:160a7a9e-a491-455c-bc68-d007dd7230de");
+  assert.equal(progress.jobs[0].attemptedAt, "2026-07-27T00:00:29.000Z");
+  assert.equal(progress.jobs[0].marker, "CODEX-BRIDGE-run-progress-shot-1");
+  assert.equal(progress.jobs[1].status, "pending");
+  assert.equal(
+    summarizeBatchError(null, [{ id: "shot-1", status: "timeout-after-submit" }]),
+    "shot-1: timeout-after-submit",
+  );
+});
+
+test("batch fallback trips a per-batch native Quick chat circuit breaker and persists checkpoints", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function runBatch");
+  const end = source.indexOf("async function runResume", start);
+  const runBatchSource = source.slice(start, end);
+  assert.match(runBatchSource, /nativeQuickChatDisabledReason/);
+  assert.match(runBatchSource, /batchProgressPath\(options\.output\)/);
+  assert.match(runBatchSource, /await persistBatchProgress\(/);
+  assert.match(runBatchSource, /buildBatchProgress\(/);
+  assert.match(runBatchSource, /recordGenerationCheckpoint\(/);
+  assert.match(runBatchSource, /assertNoRunningBatchProgress\(/);
+  const beforeSubmit = runBatchSource.indexOf("await persistBatchProgress");
+  const submit = runBatchSource.indexOf("await submitJob", beforeSubmit);
+  assert.ok(beforeSubmit >= 0 && submit > beforeSubmit);
+});
+
+test("production batch uses a precomputed route plan, persistent health, and the global controller", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  assert.match(source, /chatgpt-bridge-product-control\.mjs/);
+  assert.match(source, /buildDispatchPlan/);
+  assert.match(source, /readQuickChatHealth/);
+  assert.match(source, /recordQuickChatHealth/);
+  assert.match(source, /acquireBridgeControllerLock/);
+  assert.match(source, /releaseBridgeControllerLock/);
+  const runBatchStart = source.indexOf("async function runBatch");
+  const runBatchEnd = source.indexOf("async function runResume", runBatchStart);
+  const runBatchSource = source.slice(runBatchStart, runBatchEnd);
+  assert.match(runBatchSource, /dispatchPlan/);
+  assert.match(runBatchSource, /quickChat\.attempt/);
 });
 
 test("embedded Quick chat uses its visible DOM conversation identity and snapshot root", () => {
   const identity = buildMainChatConversationIdExpression();
-  const snapshot = buildConversationSnapshotExpression("CODEX-BRIDGE-test-job", "main-chat");
+  const snapshot = buildConversationSnapshotExpression(
+    "CODEX-BRIDGE-test-job",
+    EXACT_CHATGPT_ID,
+    "main-chat",
+  );
   assert.match(identity, /data-above-composer-conversation-id/);
   assert.match(identity, /local-chatgpt/);
   assert.match(identity, /data-app-action-sidebar-thread-id/);
   assert.match(identity, /local:/);
   assert.match(snapshot, /data-pip-obstacle="quick-chat"/);
   assert.match(snapshot, /当前模式|current mode/i);
+});
+
+test("main-surface recovery falls back to marker- and identity-guarded history scanning", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function openMainChatSubmittedConversation");
+  const end = source.indexOf("async function selectHistoryConversation", start);
+  const recovery = source.slice(start, end);
+  assert.match(recovery, /main ChatGPT submitted marker/);
+  assert.match(recovery, /discoverHistoryConversation\(session/);
+  assert.match(recovery, /main-chat/);
+  assert.match(recovery, /15000/);
 });
 
 test("validates explicit read-only resume manifests", () => {
@@ -617,8 +2019,8 @@ test("validates exact handoff approval and scopes visible UI submission to its c
     () => validateHandoffApprovalManifest({ ...manifest, taskId: "changed task" }),
     /taskId|approval/i,
   );
-  const focus = buildHandoffApprovalFocusExpression(manifest.conversationId);
-  const submit = buildHandoffApprovalSubmitExpression(manifest.conversationId, manifest.taskId);
+  const focus = buildHandoffApprovalFocusExpression(manifest.surface, manifest.conversationId);
+  const submit = buildHandoffApprovalSubmitExpression(manifest.surface, manifest.conversationId, manifest.taskId);
   assert.match(focus, /data-above-composer-conversation-id/);
   assert.match(focus, /composer-not-empty/);
   assert.match(focus, /aria-label="给 ChatGPT 发消息"/);
@@ -626,6 +2028,187 @@ test("validates exact handoff approval and scopes visible UI submission to its c
   assert.match(submit, /data-above-composer-conversation-id/);
   assert.match(submit, /aria-label\*="ChatGPT"/);
   assert.doesNotMatch(focus + submit, /cookie|localStorage|sessionStorage|indexedDB|fetch\(/i);
+});
+
+test("handoff approval focus and submit use only the exact leased ChatGPT owner", () => {
+  const codexComposer = createComposer("", { "aria-label": "Codex composer" });
+  const codexSend = createSendButton({ "aria-label": "Send" });
+  const codexRoot = createDomElement("div", {
+    attributes: { role: "dialog" },
+    children: [codexComposer, codexSend],
+  });
+  const composer = createComposer("", { "aria-label": "给 ChatGPT 发消息" });
+  const send = createSendButton();
+  const chatRoot = createExactDialog(EXACT_CHATGPT_ID, composer, send);
+  const harness = createDomHarness([codexRoot, chatRoot]);
+  const focus = harness.evaluate(buildHandoffApprovalFocusExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  ));
+  assert.equal(focus.ok, true);
+  composer.textContent = "CODEX_APPROVE exact-approval";
+  composer.innerText = composer.textContent;
+  const clicked = harness.evaluate(buildHandoffApprovalSubmitExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    "exact-approval",
+  ));
+  assert.equal(clicked.ok, true);
+  assert.equal(send.clickCount, 1);
+  assert.equal(codexSend.clickCount, 0);
+});
+
+test("handoff approval rejects duplicate roots, composers, sends and identity conflicts", () => {
+  const duplicateRoots = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, createComposer(""), createSendButton()),
+    createExactDialog(EXACT_CHATGPT_ID, createComposer(""), createSendButton()),
+  ]).evaluate(buildHandoffApprovalFocusExpression("chatgpt-main-chat", EXACT_CHATGPT_ID));
+  assert.equal(duplicateRoots.ok, false);
+  assert.equal(duplicateRoots.reason, "exact-root-count");
+
+  const duplicateComposers = createDomElement("div", {
+    children: [createComposer(""), createComposer("")],
+  });
+  const composerResult = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, createComposer(""), createSendButton(), [duplicateComposers]),
+  ]).evaluate(buildHandoffApprovalFocusExpression("chatgpt-main-chat", EXACT_CHATGPT_ID));
+  assert.equal(composerResult.ok, false);
+  assert.equal(composerResult.reason, "composer-count");
+
+  const sendA = createSendButton();
+  const sendB = createSendButton({ "aria-label": "发送" });
+  const sendRoot = createDomElement("div", { children: [sendA, sendB] });
+  const sendResult = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, createComposer(""), createSendButton(), [sendRoot]),
+  ]).evaluate(buildHandoffApprovalSubmitExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    "duplicate-send",
+  ));
+  assert.equal(sendResult.ok, false);
+  assert.equal(sendResult.reason, "send-count");
+
+  const otherIdentity = createDomElement("div", {
+    attributes: { "data-above-composer-conversation-id": "chatgpt:local-chatgpt:33333333-3333-4333-8333-333333333333" },
+  });
+  const conflictRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(""),
+    createSendButton(),
+    [otherIdentity],
+  );
+  const conflict = createDomHarness([conflictRoot]).evaluate(
+    buildHandoffApprovalFocusExpression("chatgpt-main-chat", EXACT_CHATGPT_ID),
+  );
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.reason, "exact-root-count");
+});
+
+test("handoff approval rejects stale, malformed and non-app Quick Chat routes", () => {
+  const composer = createComposer("");
+  const send = createSendButton();
+  const root = createExactDialog(EXACT_CHATGPT_ID, composer, send);
+  for (const href of [
+    quickChatAppUrl("local-chatgpt:44444444-4444-4444-8444-444444444444"),
+    "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat%2Fprewarm",
+    "https://chatgpt.local/quick-chat/local-chatgpt%3A11111111-1111-4111-8111-111111111111",
+  ]) {
+    const result = createDomHarness([root], { href }).evaluate(
+      buildHandoffApprovalSubmitExpression("chatgpt-quick-chat", EXACT_CHATGPT_ID, "quick-approval"),
+    );
+    assert.equal(result.ok, false);
+    assert.equal(send.clickCount, 0);
+  }
+
+  const validHarness = createDomHarness([root], { href: quickChatAppUrl(EXACT_CHATGPT_ID) });
+  const focused = validHarness.evaluate(buildHandoffApprovalFocusExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+  ));
+  assert.equal(focused.ok, true);
+  composer.textContent = "CODEX_APPROVE quick-approval";
+  composer.innerText = composer.textContent;
+  const clicked = validHarness.evaluate(buildHandoffApprovalSubmitExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+    "quick-approval",
+  ));
+  assert.equal(clicked.ok, true);
+  assert.equal(send.clickCount, 1);
+});
+
+test("handoff approval requires exact approval text before clicking", () => {
+  const composer = createComposer("CODEX_APPROVE exact-approval-extra");
+  const send = createSendButton();
+  const result = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, composer, send),
+  ]).evaluate(buildHandoffApprovalSubmitExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+    "exact-approval",
+  ));
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "approval-mismatch");
+  assert.equal(send.clickCount, 0);
+});
+
+test("handoff approval click boundary preserves not-submitted and unknown states", async () => {
+  const prepared = {
+    surface: "chatgpt-main-chat",
+    conversationId: EXACT_CHATGPT_ID,
+  };
+  const rejected = await attemptHandoffApprovalClick(
+    { async evaluate() { return { ok: false, reason: "approval-mismatch" }; } },
+    prepared,
+    "boundary-approval",
+    () => "2026-07-28T12:02:00.000Z",
+  );
+  assert.equal(rejected.status, "not-submitted");
+  assert.equal(rejected.clicked, false);
+  assert.equal(rejected.attemptedAt, "2026-07-28T12:02:00.000Z");
+  assert.equal(rejected.submittedAt, null);
+
+  const lost = await attemptHandoffApprovalClick(
+    { async evaluate() { throw new Error("CDP websocket closed"); } },
+    prepared,
+    "boundary-approval",
+    () => "2026-07-28T12:03:00.000Z",
+  );
+  assert.equal(lost.status, "unknown-after-submit");
+  assert.equal(lost.clicked, null);
+  assert.equal(lost.attemptedAt, "2026-07-28T12:03:00.000Z");
+  assert.equal(lost.submittedAt, "2026-07-28T12:03:00.000Z");
+  assert.equal(lost.expectedSurface, "chatgpt-main-chat");
+  assert.equal(lost.expectedConversationId, EXACT_CHATGPT_ID);
+});
+
+test("runApprove binds every approval action to the opened prepared identity and surface", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function runApprove");
+  const end = source.indexOf("async function recordGenerationLifecycle", start);
+  const approveSource = source.slice(start, end);
+  assert.match(approveSource, /opened\.prepared\.conversationId\s*!==\s*manifest\.conversationId/);
+  assert.match(approveSource, /buildHandoffApprovalFocusExpression\(\s*opened\.prepared\.surface,\s*manifest\.conversationId\s*\)/);
+  assert.match(approveSource, /attemptHandoffApprovalClick\(\s*session,\s*opened\.prepared,\s*manifest\.taskId/);
+  assert.doesNotMatch(approveSource, /buildHandoffApprovalFocusExpression\(manifest\.conversationId\)/);
+  assert.doesNotMatch(approveSource, /buildHandoffApprovalSubmitExpression\(manifest\.conversationId/);
+});
+
+test("runApprove takes ownership of its session before prepared validation", () => {
+  const close = () => {};
+  const session = { close, evaluate() {}, send() {} };
+  assert.equal(takeHandoffApprovalSession({ session }), session);
+  assert.throws(() => takeHandoffApprovalSession({ session: null }), /session/i);
+  assert.throws(() => takeHandoffApprovalSession({ session: { evaluate() {} } }), /session/i);
+
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function runApprove");
+  const end = source.indexOf("async function recordGenerationLifecycle", start);
+  const approveSource = source.slice(start, end);
+  const adoption = approveSource.indexOf("session = takeHandoffApprovalSession(opened);");
+  const preparedGuard = approveSource.indexOf("opened.prepared.conversationId !== manifest.conversationId");
+  const surfaceGuard = approveSource.indexOf("validateSubmissionExpressionInput(opened.prepared.surface, opened.prepared.conversationId)");
+  assert.ok(adoption >= 0 && preparedGuard > adoption && surfaceGuard > preparedGuard);
 });
 
 test("handoff checkpoint prevents duplicate delivery and task rebinding", () => {
@@ -658,9 +2241,22 @@ test("handoff checkpoint prevents duplicate delivery and task rebinding", () => 
   assert.throws(() => selectNextApprovedHandoff(rebound, delivered), /rebound|reused/i);
 });
 
+test("watch commits against the latest checkpoint through the cross-process transaction", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function runWatch");
+  const end = source.indexOf("async function openHandoffApprovalConversation", start);
+  const watchSource = source.slice(start, end);
+  assert.match(watchSource, /commitHandoffDelivery\(\{[\s\S]*checkpointPath: manifest\.checkpointPath/);
+  assert.match(watchSource, /conversationId: manifest\.conversationId/);
+  assert.doesNotMatch(watchSource, /selectNextApprovedHandoff\(observation\.units/);
+  assert.match(watchSource, /error\?\.code !== "ELOCKBUSY"/);
+});
+
 test("handoff DOM collection is read-only and scoped to rendered conversation units", () => {
-  const expression = buildHandoffUnitsExpression();
+  assert.throws(() => buildHandoffUnitsExpression(), /surface|identity/i);
+  const expression = buildHandoffUnitsExpression("chatgpt-main-chat", EXACT_CHATGPT_ID);
   const nativeExpression = buildHandoffUnitsExpression(
+    "chatgpt-quick-chat",
     "local-chatgpt:4c172155-0408-4417-b253-145d3e80a9d1",
   );
   assert.match(expression, /readable/);
@@ -677,7 +2273,7 @@ test("handoff watch passes its expected conversation identity into DOM collectio
   const start = source.indexOf("async function readHandoffObservation");
   const end = source.indexOf("async function runWatch", start);
   const observationSource = source.slice(start, end);
-  assert.match(observationSource, /buildHandoffUnitsExpression\(expectedConversationId\)/);
+  assert.match(observationSource, /buildHandoffUnitsExpression\(expectedSurface, expectedConversationId\)/);
   assert.doesNotMatch(observationSource, /manifest\\./);
 });
 
@@ -746,6 +2342,100 @@ test("accepts only the standalone bridge state identity", () => {
   ]) {
     assert.throws(() => validateBridgeState(value), /state|schema|platform|port|browser|package|executable|unknown/i);
   }
+});
+
+test("classifies a changed registered Codex version as stale-after-update with a repair command", () => {
+  const state = {
+    codexVersion: "26.715.10079.0",
+    codexPackageFullName: "OpenAI.Codex_26.715.10079.0_x64__test",
+    codexPackageFamilyName: "OpenAI.Codex_test",
+    codexPackageRoot: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.715.10079.0_x64__test",
+  };
+  assert.throws(() => validateRegisteredCodexIdentity(state, {
+    version: "26.800.12000.0",
+    packageFullName: "OpenAI.Codex_26.800.12000.0_x64__test",
+    packageFamilyName: "OpenAI.Codex_test",
+    installLocation: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.800.12000.0_x64__test",
+    signatureKind: "Store",
+  }), (error) => {
+    assert.equal(error.code, "stale-after-update");
+    assert.equal(error.details.savedVersion, state.codexVersion);
+    assert.equal(error.details.currentVersion, "26.800.12000.0");
+    assert.equal(error.details.repairCommand, "start-chatgpt-bridge.ps1");
+    return true;
+  });
+});
+
+test("classifies package version before old-port listener absence", () => {
+  const state = {
+    codexVersion: "26.715.10079.0",
+    codexPackageFullName: "OpenAI.Codex_26.715.10079.0_x64__test",
+    codexPackageFamilyName: "OpenAI.Codex_test",
+    codexPackageRoot: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.715.10079.0_x64__test",
+  };
+  const upgraded = {
+    package: {
+      version: "26.800.12000.0",
+      packageFullName: "OpenAI.Codex_26.800.12000.0_x64__test",
+      packageFamilyName: "OpenAI.Codex_test",
+      installLocation: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.800.12000.0_x64__test",
+      signatureKind: "Store",
+    },
+    listeners: [],
+  };
+  assert.throws(() => classifyWindowsIdentityReport(state, upgraded), (error) => {
+    assert.equal(error.code, "stale-after-update");
+    return true;
+  });
+  assert.throws(() => classifyWindowsIdentityReport(state, {
+    package: {
+      version: state.codexVersion,
+      packageFullName: state.codexPackageFullName,
+      packageFamilyName: state.codexPackageFamilyName,
+      installLocation: state.codexPackageRoot,
+      signatureKind: "Store",
+    },
+    listeners: [],
+  }), /saved CDP port has no listener/i);
+});
+
+test("keeps same-version package family, root, signature and process identity strict", () => {
+  const state = {
+    codexVersion: "26.715.10079.0",
+    codexPackageFullName: "OpenAI.Codex_26.715.10079.0_x64__test",
+    codexPackageFamilyName: "OpenAI.Codex_test",
+    codexPackageRoot: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.715.10079.0_x64__test",
+  };
+  const registered = {
+    version: state.codexVersion,
+    packageFullName: state.codexPackageFullName,
+    packageFamilyName: state.codexPackageFamilyName,
+    installLocation: state.codexPackageRoot,
+    signatureKind: "Store",
+  };
+  for (const mutation of [
+    { packageFamilyName: "Other.Codex_test" },
+    { installLocation: "C:\\Program Files\\WindowsApps\\Other.Codex" },
+    { signatureKind: "Test" },
+    { packageFullName: "OpenAI.Codex_26.715.10079.0_x64__other" },
+  ]) {
+    assert.throws(() => validateRegisteredCodexIdentity(state, { ...registered, ...mutation }),
+      (error) => error.code === "codex-identity-mismatch");
+  }
+  assert.doesNotThrow(() => validateRegisteredCodexIdentity(state, registered));
+});
+
+test("reports supported and unknown Codex versions without weakening the main route", () => {
+  const supported = buildVersionCompatibilitySummary("26.715.10079.0");
+  assert.equal(supported.main.status, "runtime-probed");
+  assert.equal(supported.quickChat.status, "verified");
+  assert.ok(supported.supportedQuickChatVersions.includes("26.715.10079.0"));
+
+  const unknown = buildVersionCompatibilitySummary("26.999.0.0");
+  assert.equal(unknown.main.status, "runtime-probed");
+  assert.equal(unknown.quickChat.status, "unsupported");
+  assert.equal(unknown.quickChat.reason, "unsupported-codex-version");
+  assert.equal(unknown.quickChat.rpcAttempted, false);
 });
 
 test("rejects CDP websocket targets outside the saved loopback endpoint", () => {
@@ -998,8 +2688,20 @@ test("probe expression is read-only and does not inspect credentials or chat his
 });
 
 test("snapshot expression scopes collection to rendered conversation units", () => {
-  const expression = buildConversationSnapshotExpression("BRIDGE-MARKER-A");
-  const mainExpression = buildConversationSnapshotExpression("BRIDGE-MARKER-A", "main-chat");
+  assert.throws(
+    () => buildConversationSnapshotExpression("BRIDGE-MARKER-A"),
+    /identity/i,
+  );
+  const expression = buildConversationSnapshotExpression(
+    "BRIDGE-MARKER-A",
+    EXACT_CHATGPT_ID,
+    "quick-chat",
+  );
+  const mainExpression = buildConversationSnapshotExpression(
+    "BRIDGE-MARKER-A",
+    EXACT_CHATGPT_ID,
+    "main-chat",
+  );
   assert.match(expression, /data-content-search-unit-key/);
   assert.match(expression, /BRIDGE-MARKER-A/);
   assert.match(expression, /assistant/);
@@ -1009,6 +2711,214 @@ test("snapshot expression scopes collection to rendered conversation units", () 
   assert.doesNotMatch(expression, /fetch\(|XMLHttpRequest|querySelectorAll\(['"]p/i);
   assert.match(mainExpression, /role="dialog"/);
   assert.match(mainExpression, /root\.querySelectorAll/);
+});
+
+test("snapshot reads only the exact ChatGPT owner and rejects zero or multiple roots", () => {
+  const marker = "CODEX-BRIDGE-exact-snapshot";
+  const codexRoot = createDomElement("div", {
+    attributes: { role: "dialog" },
+    children: [
+      createConversationUnit("user", marker, "codex"),
+      createConversationUnit("assistant", "wrong root", "codex"),
+      createComposer(),
+      createSendButton(),
+    ],
+  });
+  const chatRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [
+      createConversationUnit("user", marker, "chat"),
+      createConversationUnit("assistant", "exact answer", "chat"),
+    ],
+  );
+  const exactHarness = createDomHarness([codexRoot, chatRoot]);
+  const exact = exactHarness.evaluate(buildConversationSnapshotExpression(
+    marker,
+    EXACT_CHATGPT_ID,
+    "main-chat",
+  ));
+  assert.equal(exact.readable, true);
+  assert.equal(exact.markerPresent, true);
+  assert.equal(exact.assistantText, "exact answer");
+  assert.equal(exact.userMessageCount, 1);
+
+  const wrongOnly = createExactDialog(
+    "local-chatgpt:33333333-3333-4333-8333-333333333333",
+    createComposer(),
+    createSendButton(),
+    [createConversationUnit("user", marker, "wrong")],
+  );
+  const wrongResult = createDomHarness([wrongOnly]).evaluate(buildConversationSnapshotExpression(
+    marker,
+    EXACT_CHATGPT_ID,
+    "main-chat",
+  ));
+  assert.equal(wrongResult.readable, false);
+
+  const duplicateResult = createDomHarness([
+    createExactDialog(EXACT_CHATGPT_ID, createComposer(), createSendButton()),
+    createExactDialog(EXACT_CHATGPT_ID, createComposer(), createSendButton()),
+  ]).evaluate(buildConversationSnapshotExpression(
+    marker,
+    EXACT_CHATGPT_ID,
+    "main-chat",
+  ));
+  assert.equal(duplicateResult.readable, false);
+});
+
+test("quick-chat snapshot rejects a stale current app route before reading units", () => {
+  const root = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [createConversationUnit("user", "CODEX-BRIDGE-route", "quick")],
+  );
+  const result = createDomHarness([root], {
+    href: quickChatAppUrl("local-chatgpt:44444444-4444-4444-8444-444444444444"),
+  }).evaluate(buildConversationSnapshotExpression(
+    "CODEX-BRIDGE-route",
+    EXACT_CHATGPT_ID,
+    "quick-chat",
+  ));
+  assert.equal(result.readable, false);
+  assert.equal(result.markerPresent, false);
+});
+
+test("main submission lease uses one exact owner for identity and snapshot", () => {
+  const marker = "CODEX-BRIDGE-lease-marker";
+  const codexRoot = createDomElement("div", {
+    attributes: { role: "dialog" },
+    children: [createComposer(), createSendButton()],
+  });
+  const chatRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [createConversationUnit("user", marker, "lease")],
+  );
+  const result = createDomHarness([codexRoot, chatRoot]).evaluate(
+    buildMainChatSubmissionLeaseExpression(EXACT_CHATGPT_ID, marker),
+  );
+  assert.equal(result.conversationId, EXACT_CHATGPT_ID);
+  assert.equal(result.snapshot.readable, true);
+  assert.equal(result.snapshot.markerPresent, true);
+  const expression = buildMainChatSubmissionLeaseExpression(EXACT_CHATGPT_ID, marker);
+  assert.equal((expression.match(/const resolved = resolveExactOwner\(false\)/g) || []).length, 1);
+});
+
+test("handoff units require the exact owner and ignore another dialog", () => {
+  const codexRoot = createDomElement("div", {
+    attributes: { role: "dialog" },
+    children: [createConversationUnit("user", "CODEX_APPROVE wrong-task", "codex")],
+  });
+  const chatRoot = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [createConversationUnit("user", "CODEX_APPROVE exact-task", "chat")],
+  );
+  const result = createDomHarness([codexRoot, chatRoot]).evaluate(
+    buildHandoffUnitsExpression("chatgpt-main-chat", EXACT_CHATGPT_ID),
+  );
+  assert.equal(result.readable, true);
+  assert.equal(result.units.length, 1);
+  assert.match(result.units[0].text, /exact-task/);
+
+  const wrong = createDomHarness([codexRoot]).evaluate(
+    buildHandoffUnitsExpression("chatgpt-main-chat", EXACT_CHATGPT_ID),
+  );
+  assert.equal(wrong.readable, false);
+});
+
+test("handoff units require an explicit surface and Quick Chat route", () => {
+  assert.throws(() => buildHandoffUnitsExpression("chatgpt-handoff", EXACT_CHATGPT_ID), /surface/i);
+  const root = createDomElement("main", {
+    children: [
+      createConversationUnit("user", "CODEX_HANDOFF exact-task", "quick"),
+      createComposer("", { "aria-label": "ChatGPT composer" }),
+      createSendButton(),
+    ],
+  });
+  const validHarness = createDomHarness([root], { href: quickChatAppUrl(EXACT_CHATGPT_ID) });
+  const valid = validHarness.evaluate(buildHandoffUnitsExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+  ));
+  assert.equal(valid.readable, true);
+
+  const mainOnQuick = validHarness.evaluate(buildHandoffUnitsExpression(
+    "chatgpt-main-chat",
+    EXACT_CHATGPT_ID,
+  ));
+  assert.equal(mainOnQuick.readable, false);
+
+  const stale = createDomHarness([root], {
+    href: quickChatAppUrl("local-chatgpt:55555555-5555-4555-8555-555555555555"),
+  }).evaluate(buildHandoffUnitsExpression(
+    "chatgpt-quick-chat",
+    EXACT_CHATGPT_ID,
+  ));
+  assert.equal(stale.readable, false);
+});
+
+test("snapshot rejects expected-plus-other identity conflicts", () => {
+  const other = "local-chatgpt:66666666-6666-4666-8666-666666666666";
+  const conflictingIdentity = createDomElement("div", {
+    attributes: { "data-above-composer-conversation-id": `chatgpt:${other}` },
+  });
+  const root = createExactDialog(
+    EXACT_CHATGPT_ID,
+    createComposer(),
+    createSendButton(),
+    [conflictingIdentity, createConversationUnit("user", "CODEX-BRIDGE-conflict", "conflict")],
+  );
+  const result = createDomHarness([root]).evaluate(buildConversationSnapshotExpression(
+    "CODEX-BRIDGE-conflict",
+    EXACT_CHATGPT_ID,
+    "main-chat",
+  ));
+  assert.equal(result.readable, false);
+});
+
+test("snapshot rejects other explicit identity despite expected active sidebar fallback", () => {
+  const other = "local:77777777-7777-4777-8777-777777777777";
+  const activeSidebar = createDomElement("div", {
+    attributes: {
+      "data-app-action-sidebar-thread-id": EXACT_LOCAL_ID,
+      "data-app-action-sidebar-thread-active": "true",
+    },
+  });
+  const root = createDomElement("main", {
+    children: [
+      createDomElement("button", { text: "当前模式：ChatGPT" }),
+      createDomElement("div", {
+        attributes: { "data-above-composer-conversation-id": other },
+      }),
+      createComposer("", { "aria-label": "ChatGPT composer" }),
+      createSendButton(),
+      createConversationUnit("user", "CODEX-BRIDGE-sidebar-conflict", "conflict"),
+    ],
+  });
+  const result = createDomHarness([activeSidebar, root]).evaluate(buildConversationSnapshotExpression(
+    "CODEX-BRIDGE-sidebar-conflict",
+    EXACT_LOCAL_ID,
+    "main-chat",
+  ));
+  assert.equal(result.readable, false);
+});
+
+test("watch status reports unreadable before inactive when exact owner is unavailable", () => {
+  const source = readFileSync(new URL("../scripts/chatgpt-bridge.mjs", import.meta.url), "utf8");
+  const watchStart = source.indexOf("async function runWatch");
+  const loopEnd = source.indexOf("const remaining = deadline - Date.now();", watchStart);
+  const reportStart = source.indexOf("const report = {", loopEnd);
+  const reportEnd = source.indexOf("await writeJsonAtomically(options.output, report);", reportStart);
+  const reportSource = source.slice(reportStart, reportEnd);
+  assert.ok(reportStart > watchStart && reportEnd > reportStart);
+  assert.ok(reportSource.indexOf("!lastReadable") < reportSource.indexOf("lastIdentity !== manifest.conversationId"));
+  assert.match(reportSource, /conversation-not-readable/);
 });
 
 test("materializes only app-local rendered blob images", () => {
@@ -1058,7 +2968,7 @@ test("normalizes only the target result and strips unsafe or non-image URLs", ()
     assistantText: "完成。",
     images: [
       { src: "https://files.oaiusercontent.com/image.png", width: 1024, height: 1024, alt: "generated" },
-      { src: "data:image/png;base64,AAA=", width: 2, height: 2, alt: "inline" },
+      { src: VALID_PNG_DATA_URL, width: 1, height: 1, alt: "inline" },
       { src: "javascript:alert(1)", width: 1, height: 1, alt: "bad" },
     ],
   });
@@ -1068,7 +2978,7 @@ test("normalizes only the target result and strips unsafe or non-image URLs", ()
     assistantText: "完成。",
     images: [
       { src: "https://files.oaiusercontent.com/image.png", width: 1024, height: 1024, alt: "generated" },
-      { src: "data:image/png;base64,AAA=", width: 2, height: 2, alt: "inline" },
+      { src: VALID_PNG_DATA_URL, width: 1, height: 1, alt: "inline" },
     ],
   });
   assert.ok(Object.isFrozen(normalized));
@@ -1081,10 +2991,10 @@ test("normalizes only the target result and strips unsafe or non-image URLs", ()
 
 test("keeps image metadata in reports without embedding image bytes", () => {
   assert.deepEqual(summarizeCollectedImages([
-    { src: "data:image/png;base64,AAA=", width: 1672, height: 941, alt: "已生成图像 1" },
+    { src: VALID_PNG_DATA_URL, width: 1672, height: 941, alt: "已生成图像 1" },
     { src: "https://files.oaiusercontent.com/image.png", width: 1024, height: 1024, alt: "generated" },
   ]), [
-    { sourceType: "materialized-app-blob", width: 1672, height: 941, alt: "已生成图像 1" },
-    { sourceType: "remote-image", width: 1024, height: 1024, alt: "generated" },
+    { sourceType: "renderer-data-url", materializationStatus: "materialized", width: 1672, height: 941, alt: "已生成图像 1" },
+    { sourceType: "remote-image", materializationStatus: "metadata-only", width: 1024, height: 1024, alt: "generated" },
   ]);
 });

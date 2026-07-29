@@ -1,6 +1,6 @@
 ---
 name: dispatch-chatgpt-bridge
-description: "Coordinate three bridge families across native Codex tasks and integrated ChatGPT: Codex subagents, durable Codex-to-Codex conversation transfer, Codex-to-GPT dispatch including image generation, and GPT-to-Codex CODEX_HANDOFF. Use when users mention 子智能体、Codex 对话转交、原生 delegation、GPT 聊天调度、桥接调度、多聊天并行、生图分发、结果回收、GPT 规划 Codex 执行、持续监听、任务交接、CODEX_HANDOFF or handoff watch."
+description: "Coordinate three bridge families across native Codex tasks and integrated ChatGPT: Codex subagents, durable Codex-to-Codex conversation transfer, Codex-to-GPT dispatch including image generation, and GPT-to-Codex CODEX_HANDOFF. Use when users mention 子智能体、子代理、Codex 对话转交、桥接对话、跨对话、跨 Codex 对话、原生 delegation、ChatGPT桥接、GPT 聊天调度、桥接调度、多聊天并行、生图分发、结果回收、GPT 规划 Codex 执行、持续监听、任务交接、CODEX_HANDOFF or handoff watch."
 ---
 
 # Dispatch ChatGPT Bridge
@@ -41,8 +41,10 @@ Do not treat “子代理” as ambiguous: route it directly to `codex-conversat
 Use `codex-subagent` only when the user says 子智能体 or explicitly asks for a
 temporary/parallel worker. Never hand-write or scrape the UI's
 `<codex_delegation>` / `source_thread_id`; those are generated trace metadata.
-Native Codex tools are the stable transport for the first two routes; the
-loopback bridge runner is the stable transport for the last two.
+Native Codex tools are the stable transport for the first two routes. The
+loopback runner for the last two is a version-gated UI adapter: it must publish a
+route plan before sending, default to the verified serial main surface, and
+never present experimental Quick Chat as guaranteed capacity.
 
 Native Codex routes are not actions of `chatgpt-bridge.mjs`. When the matching
 Codex app tool is not surfaced, fail closed with a route-unavailable result;
@@ -67,12 +69,44 @@ The first standalone setup runs
 `windows/scripts/start-chatgpt-bridge.ps1`. It may reuse an already verified
 loopback Codex endpoint without restarting. If Codex is running without that
 endpoint, restarting it requires explicit user authorization through
-`-RestartExisting`.
+`-RestartExisting`. The launcher writes a durable restart request and uses an
+absolute Windows PowerShell 5.1 path for the Windows-process-service handoff.
+The detached process must first publish a strictly validated
+`worker-ready` record; the parent then writes an exact-operation `ack` before
+the worker may enter `stopping-existing`. No ack, expired deadline, malformed
+request, or path-identity mismatch can close Codex. Treat the durable
+`%LOCALAPPDATA%\CodexChatGPTBridge\restart-report.json` as authoritative because
+the calling command can disappear with the old Codex window. Its states include
+`dispatching`, `worker-created`, `worker-ready`, `restart-dispatched`,
+`stopping-existing`, `starting`, `complete` and `failed`. Do not ask the user to
+reopen Codex manually while the report is still in a running state.
+
+This restart path is a recovery action, not the normal hot-start path. A healthy
+verified loopback endpoint is reused without restarting. If the running Codex
+instance has no endpoint, the Electron process cannot be promised to expose one
+later through a hot switch; use the explicitly authorized ready/ack restart and
+inspect its report. The protocol self-test is test-only and never stops a real
+Codex process.
+
+Before any operational action, the installed Skill and selected Runtime must
+pass the deployment-manifest gate. The two canonical manifests must match in
+bridge/protocol version, target binding and managed-file SHA-256; Runtime paths
+are relative to its deployment root and therefore include `windows/scripts/...`.
+`plan`, `batch`, `resume`, `watch`, `approve` and `cleanup` fail closed before
+Node/CDP when the pair is missing, stale or inconsistent. `discover` and `probe`
+remain the only manifest-diagnostic exceptions. Install or upgrade with the
+repository `scripts/install-global.ps1`, verify with
+`scripts/verify-global-install.ps1`, and never bypass a failed gate with a
+project-private Runtime or manual manifest edit. A dirty source worktree is
+recorded as `dirty-worktree`; file hashes, not the HEAD label, identify the
+installed content.
 
 ## Dispatch workflow
 
 1. Classify the operation:
    - Use `discover` or `probe` for read-only health checks.
+   - Use `plan` with the intended batch manifest for a read-only route,
+     concurrency and worst-case wait decision. It never sends.
    - Use `watch` for bounded, read-only collection of one user-approved handoff from the exact active conversation. It writes only a local report and checkpoint.
    - Use `approve` only when the user explicitly authorizes relaying one exact approval to a pinned conversation and task ID.
    - Use `batch` only when the user has clearly authorized sending the prompts or generating the requested outputs.
@@ -80,9 +114,33 @@ endpoint, restarting it requires explicit user authorization through
 2. Make jobs independent. Put dependent stages in separate batches after their prerequisites complete.
 3. Create 1–6 jobs with unique lowercase kebab-case IDs. Preserve each approved prompt exactly; do not combine prompts merely to reduce job count.
 4. Write strict JSON input and choose a new absolute report path.
-5. Run `discover`, then `probe`, before the first mutating batch in a session.
-6. Invoke `batch` once with `-AllowSend`. The bridge schedules up to two ChatGPT windows per wave on the pinned client version and closes only windows it created.
-7. Read the report before taking another action. Never infer success from a visible window alone.
+5. Run `discover`, then `probe`, then `plan` before the first mutating batch in a
+   session. Report the plan's `userNotice`, selected mode, concurrency and
+   worst-case collection time to the caller before sending.
+6. Production defaults to `serial-main-chat`. Use
+   `-ExperimentalQuickChat` only when the user explicitly accepts the
+   version-specific experimental route. A healthy session cache may allow up to
+   two owned windows; an unhealthy cache routes directly to the serial main
+   surface without making the first real job rediscover the same failure.
+7. Invoke `batch` once with `-AllowSend`. Long-running generation should use
+   `-Detach`; it returns a durable `launchPath` immediately. `progressPath` is
+   populated only for batch, because resume/watch do not write a progress
+   sidecar. The detached logs are inside the launch directory. Synchronous CLI
+   calls omit both launch-log arguments and do not attempt diagnostic logging;
+   detached calls must receive the complete absolute UUID-bound `stdout.log` /
+   `stderr.log` pair. A diagnostic append failure never changes the durable
+   command result or authorizes a resend.
+8. Use runner-only `status -LaunchPath <launch.json>` or bounded `wait
+   -LaunchPath <launch.json>` to inspect that handle. These actions are
+   read-only and do not require a valid deployment manifest, start Node, touch
+   CDP, resend, resume or delete. A corrupt report/progress file is reported
+   explicitly; it is not treated as no report. Never infer success from a
+   visible window alone or from a parent-process timeout. If Windows created
+   the detached final Node process but its PID could not be uniquely
+   attributed, status reports `unknown-after-launch`; preserve that launch and
+   do not retry automatically. The compatibility `wrapperPid` field is a
+   legacy diagnostic alias and equals the final Node PID on the current direct
+   CIM path; it is not a second worker process.
 
 For image generation or editing, use schema v2. One job must equal one candidate and one newly created GPT chat. Every v2 job includes a `references` array. For original `image-generation`, use `references: []`; reference-guided generation may include 1–8 user-approved local PNG/JPEG/WebP files. `image-edit` requires 1–8 references. The bridge verifies every supplied path, type, size and SHA-256 before opening a chat, and skips the attachment UI only for an empty original-generation list. Set `conversationMode` to `fresh-per-job`, record a lifecycle ledger, and keep the default retention at seven days. Do not continue an edit or iteration inside the previous generation chat.
 
@@ -134,7 +192,14 @@ The embedded Quick chat dialog exposes its real local identity on a descendant's
 
 The full integrated ChatGPT main surface may expose a Codex local thread rather than a `local-chatgpt` route. In that mode resolve the active thread from `[data-above-composer-conversation-id]` or the active `[data-app-action-sidebar-thread-id]`/`[aria-current="page"]` item and normalize it as `local:<uuid>`. Use this identity only with `surface: "chatgpt-main-chat"`; require the exact active identity before send, marker acknowledgement and collection. Never reinterpret a `local:<uuid>` thread as a native Quick chat window.
 
-If official prewarm or the detached `quickChatWindow.open` lifecycle fails before submission, production may fall back only to the visible main ChatGPT surface: click `聊天`, click `新聊天`, then require a visible blank composer, zero visible conversation units, and no visible stop control. Record the exact native failure in that job's `routing.fallbackReason`; never hide a native-to-main downgrade behind the top-level report. This fallback must retain the main renderer, never close a user conversation, and never treat an unknown or stale quick-chat target as interchangeable.
+If official prewarm or the detached `quickChatWindow.open` lifecycle fails before submission, production may fall back only to the visible main ChatGPT surface: click `聊天`, click `新聊天`, then require a visible blank composer, zero visible conversation units, and no visible stop control. Record the exact native failure in that job's `routing.fallbackReason`; never hide a native-to-main downgrade behind the top-level report. After the first native fallback failure in one batch, trip a batch-local circuit breaker and route the remaining jobs directly to the main surface instead of waiting on the same known-bad Quick Chat path again. This fallback must retain the main renderer, never close a user conversation, and never treat an unknown or stale quick-chat target as interchangeable.
+
+Quick Chat is an explicit experimental optimization, not the production default.
+Persist its health under the standalone bridge state directory, scoped to the
+exact Codex version and CDP browser session. A cached failure expires after a
+bounded cooldown; it must never be reused across a Codex restart or version
+change. The ordinary batch path requests the main surface directly and therefore
+does not incur a native Quick Chat failure delay.
 
 The retained main ChatGPT surface is a singleton even when the native Quick chat capacity is two. If any job falls back to `chatgpt-main-chat`, collect and seal that job before another job may click `新聊天`; keep wave concurrency only for independently attributable native Quick chat windows.
 
@@ -144,7 +209,36 @@ Some clients keep the integrated ChatGPT surface active in the main renderer wit
 
 Main-surface post-submit acknowledgement and collection must use the same dialog-scoped rendered-unit/image snapshot. A global Codex `停止` button or Codex message unit is never evidence that the ChatGPT generation is still busy.
 
-Read-only recovery of a submitted main-surface job may reopen the visible `聊天` drawer when no dialog is present; it must never click a history row, create a new conversation, send, close, or delete.
+The main ChatGPT entry control is a toggle, not an idempotent open command. If the exact task-owned dialog is already visible, never click that control again merely because `aria-pressed` is absent. After send, preserve one atomic lease consisting of the exact conversation identity plus original marker: verify it before any entry-control action and on every collection poll. Reopen the entry only when that lease is not currently visible, then require the same lease again before collecting.
+
+Fresh main-surface preparation must recognize the `新聊天` / `New chat` control from visible semantic text, `aria-label`, or title. Current clients may render the control as an icon-only button with no `innerText`. An aria-only exact match is valid for clicking the new-chat control, but the bridge must still prove a blank surface and a new exact conversation identity before inserting any prompt.
+
+Image generation uses a ten-minute default collection window (`-TimeoutMs 600000`) because server-side image rendering can outlast a short text-task timeout. The caller may set another bounded value up to fifteen minutes. A timeout remains `timeout-after-submit`: content may already have been sent, the conversation is sealed, and the bridge never resends it.
+
+Every mutating batch writes a durable progress sidecar beside the requested report as `<report>.progress.json`. It is updated before submission, immediately after submission, after each collection result, and at finalization. It contains only task identity, status, timestamps, routing and artifact metadata; it never contains the prompt body or credentials. If an outer shell times out while the bridge child continues, read this sidecar and do not start another batch. Use `-Detach` when the caller cannot keep a synchronous parent process alive.
+
+Detached `batch`, `resume` and `watch` each return a durable launch handle. Only
+`batch` has a `progressPath`; `resume` and `watch` deliberately return
+`progressPath: null`. The runner-only `status` and `wait` actions read the
+launch record, report and (for batch) progress summary with bounded limits.
+These runner-only actions are supported from both `powershell.exe` (Windows
+PowerShell 5.1) and `pwsh` (PowerShell 7); their machine-readable output is
+UTF-8 and timestamp fields are normalized to invariant UTC strings at read
+time. The restart bootstrap still relays its Windows Appx/process work to the
+verified Windows PowerShell 5.1 executable.
+When a report/progress file is present but malformed or oversized, status
+returns an explicit corrupt reason. For an ambiguous batch result it exposes
+`recoveryRequired`, `conversationId`, `marker` and any captured `historyTitle`;
+it never constructs or executes a resend.
+
+The bridge holds one atomic controller lock under the standalone state directory
+for every `batch`, `resume`, `approve` or `cleanup`. It rejects a second
+controller even when that caller chooses a different report path. A dead owner
+may be reclaimed only after its process is proven absent. The same-report
+progress guard remains a second idempotency check, not the global concurrency
+mechanism.
+
+Read-only recovery of a submitted main-surface job may reopen the visible `聊天` drawer when no dialog is present. It may then scan visible titled history rows, but accepts a row only after the original marker and exact conversation identity both match. It must never create a new conversation, send, close, or delete.
 
 For main-surface recovery, the verified main target URL from discovery is sufficient; do not make a redundant `Runtime.evaluate(location.href)` route read a recovery prerequisite after the marker is already visible.
 
@@ -164,6 +258,39 @@ standalone state only through `start-chatgpt-bridge.ps1`.
 
 Keep production and bridge repair separate. A failed recovery must not monopolize the route controller. Never resend an ambiguous job automatically; only a new explicit user authorization may create a different fresh job while the ambiguous conversation remains sealed.
 
+## Cross-computer port and Codex-version compatibility
+
+The standalone bootstrap owns the selected loopback port for the current machine.
+An explicit `-Port` is always used exactly as supplied and is never silently
+replaced. Without it, the bootstrap reuses exactly one debugging port proven to
+belong to the running Store Codex; multiple verified ports require explicit
+`-Port`. If no verified port exists, it probes only loopback bindability in the
+controlled `9335..9399` range, preferring `9335` and then scanning the next
+candidate. An occupied or unverified listener is skipped; if every candidate is
+occupied, startup fails closed. The start result contains `portSelection` with
+the reason (`explicit`, `existing-verified`, `preferred` or `scanned`) and the
+selected port. The persisted schema-v1 `state.json` keeps only the authoritative
+`port`; callers must read it rather than hard-code `9335`.
+
+Port selection has the normal startup check-to-use race: a different process can
+claim a port after the bind check and before Codex opens it. The bootstrap
+rechecks the exact selected port and fails closed; it never connects to a new
+unverified listener or silently switches an explicit port. Different computers
+may therefore produce different state ports.
+
+Before CDP fetch, discovery reads the currently registered Store
+`OpenAI.Codex` package and compares version, full name, family, install root,
+signature and listener process ownership with the saved state. A version change
+is reported as `stale-after-update` with bounded saved/current versions and the
+repair command `start-chatgpt-bridge.ps1`; state is refreshed only through the
+official start path. Same-version identity drift remains a hard failure.
+Successful discover/probe/plan reports include `versionCompatibility`: the main
+surface is `runtime-probed`, while Quick Chat is `verified` only for the pinned
+versions `26.707.9564.0` and `26.715.10079.0`; an unknown version is
+`unsupported-codex-version` and experimental Quick Chat falls back to serial
+main ChatGPT without calling an unknown RPC asset. Capability cache entries stay
+scoped by browser ID and exact Codex version.
+
 ## Commands
 
 ```powershell
@@ -171,11 +298,16 @@ $runner = "$env:USERPROFILE\.codex\skills\dispatch-chatgpt-bridge\scripts\run-br
 
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action discover
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action probe
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action plan -InputPath <absolute-jobs.json> -OutputPath <absolute-plan.json>
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action batch -InputPath <absolute-jobs.json> -OutputPath <absolute-report.json> -AllowSend
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action batch -InputPath <absolute-jobs.json> -OutputPath <absolute-report.json> -TimeoutMs 600000 -Detach -AllowSend
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action plan -InputPath <absolute-jobs.json> -OutputPath <absolute-plan.json> -ExperimentalQuickChat
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action resume -InputPath <absolute-resume.json> -OutputPath <absolute-report.json>
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action approve -InputPath <absolute-approve.json> -OutputPath <absolute-report.json> -AllowSend
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action watch -InputPath <absolute-watch.json> -OutputPath <absolute-report.json> -TimeoutMs 180000 -PollMs 5000
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Action cleanup -InputPath <absolute-lifecycle-ledger.json> -OutputPath <absolute-cleanup-report.json> -AllowDelete
+pwsh -NoProfile -ExecutionPolicy Bypass -File $runner -Action status -LaunchPath <absolute-launch.json>
+pwsh -NoProfile -ExecutionPolicy Bypass -File $runner -Action wait -LaunchPath <absolute-launch.json> -TimeoutMs 600000 -PollMs 5000
 ```
 
 ## Interpret outcomes

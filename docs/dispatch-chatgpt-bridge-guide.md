@@ -55,6 +55,21 @@ flowchart LR
 `codex-conversation`；只有用户明确说“子智能体”或“临时并行 worker”时，才走
 `codex-subagent`。路由不能根据当前可见窗口猜测，必须固定目标身份。
 
+## 安装后如何触发，以及不会触发什么
+
+安装到当前用户的全局 Skill 目录并通过 `verify-global-install.ps1` 后，换一个
+Codex 对话即可用下面这句做最小验证：
+
+```text
+请使用 dispatch-chatgpt-bridge 做一次只读 discover/probe，不发送 GPT。
+```
+
+如果需要明确触发，就写：`使用 dispatch-chatgpt-bridge Skill`。frontmatter 已覆盖
+“桥接对话”“ChatGPT桥接”“子代理”“跨对话”等桥接语义，但不会把普通聊天泛化为
+桥接任务。安装器不修改用户的全局 `AGENTS.md`；改它也不能创建永久后台 daemon。
+当前 MVP 支持显式 batch、报告、`resume` 只读恢复和有界 `watch`，不支持无人值守
+持续监听或自动把结果回帖给 GPT。
+
 ## 路由一：子智能体（`codex-subagent`）
 
 ### 什么时候使用
@@ -217,7 +232,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
 }
 ```
 
-发送前必须明确授权：
+发送前先生成只读执行计划。默认计划会明确显示主 ChatGPT 串行模式、并发数
+和最坏等待时间：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
+  -Action plan `
+  -InputPath 'C:\absolute\jobs.json' `
+  -OutputPath 'C:\absolute\plan.json'
+```
+
+只有用户明确接受实验性 Quick Chat 时，才在 `plan` 和后续 `batch` 中同时
+添加 `-ExperimentalQuickChat`。该模式依赖当前 Codex 版本和会话健康缓存，
+不能承诺一定并行。
+
+发送时必须明确授权：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
@@ -226,9 +255,51 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
   -OutputPath 'C:\absolute\report.json' -AllowSend
 ```
 
-桥接会验证参考图哈希、使用独立会话、按客户端容量分轮，并在报告中返回
-状态、会话 ID、图像路径、尺寸和 SHA-256。提交状态不明时只允许只读
-`resume`，不能把未知状态改成新的 batch。
+生产批次建议使用更长的生图等待窗口；调用方不能保持同步进程时使用 `-Detach`：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
+  -Action batch `
+  -InputPath 'C:\absolute\jobs.json' `
+  -OutputPath 'C:\absolute\report.json' `
+  -TimeoutMs 600000 -Detach -AllowSend
+```
+
+桥接会在 batch 内重新计算计划，防止使用过期的预检结果。生产默认一张一张
+走主 ChatGPT；显式实验模式且当前能力允许时，才尝试最多两个 Quick Chat
+窗口。桥接会验证参考图哈希、使用独立会话，并在报告中返回
+状态、会话 ID、图像路径、尺寸和 SHA-256。批次运行期间会在报告旁写入
+`report.json.progress.json`，记录当前 job、提交时间、路由和完成数；外层
+PowerShell 等待超时不代表子进程停止，也不允许因此再开第二个 batch。
+提交状态不明时只允许只读 `resume`，不能把未知状态改成新的 batch。
+
+如果调用方不适合一直等待，可以使用持久 launch handle：
+
+```powershell
+$launch = powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
+  -Action batch -InputPath 'C:\absolute\jobs.json' `
+  -OutputPath 'C:\absolute\report.json' -Detach -AllowSend | ConvertFrom-Json
+
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
+  -Action status -LaunchPath $launch.launchPath
+
+powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
+  -Action wait -LaunchPath $launch.launchPath -TimeoutMs 600000 -PollMs 5000
+```
+
+`launchPath` 指向严格校验的 launch JSON；`stdoutPath`、`stderrPath` 位于
+同一个随机 launch 目录。batch 才有 `progressPath`，resume/watch 的值是
+`null`，不会伪造不存在的进度文件。`status`/`wait` 是 runner-only 的只读
+诊断，不启动 Node、不连接 CDP、不恢复、不重发。报告或进度文件若损坏，
+会返回 `report-corrupt`/`progress-corrupt`，不能被解释成“还没生成”。
+如果 Windows 已创建 detached 最终 Node 进程但暂时无法按唯一
+launch UUID 归属，返回 `unknown-after-launch`；保留原 launch，不要自动重试。
+
+这形成的是“计划 → 明确授权 → detach → status/wait → 报告或一次只读恢复”
+的半自动路径，不是永久后台 daemon、自动回帖服务或零 Codex 额度方案。
+
+所有 batch、resume、approve 和 cleanup 还会争用同一个全局控制锁。即使
+两个调用者选择不同报告路径，也不能同时操作唯一的主 ChatGPT 界面。
 
 ### 预期效果
 
@@ -340,6 +411,30 @@ GPT 负责设计方案，`gpt-to-codex` 把批准的计划交给主 Codex；主 
 是不可信输入；不读取凭据；不调用私有 ChatGPT API；不关闭或删除用户对话；
 不把失败状态解释成成功。
 
+### `BRIDGE_BATCH_UNKNOWN_AFTER_SUBMIT` 的用户恢复路径
+
+这个错误表示发送边界已经无法证明未执行；它不是“可以安全重发”的失败。按下面
+顺序做一次只读恢复：
+
+1. 找到原批次的 `report` 和同名 `.progress.json`，先确认 job 的
+   `submittedAt`、`conversationId`、`marker`、`promptHash`、`surface`；不要启动第二个
+   batch。若报告有唯一 `historyTitle`，也一并保留。
+2. 生成只读 resume 输入，只放原 job 的精确身份：`conversationId`、`marker`、
+   `promptHash`、`surface`，以及可用的唯一 `historyTitle`；不要改 job ID 来伪装原任务。
+3. 使用不带 `-AllowSend` 的 `resume`：
+
+   ```powershell
+   & $runner -Action resume -InputPath $resumeInput -OutputPath $resumeReport
+   ```
+
+4. 只接受 exact marker + exact conversation identity 验证通过的结果。找不到标题、
+   route 不可读、marker 缺失或恢复超时，都只能记录 `not-recovered`；桥接不会承诺
+   一定找回，也不会自动重发。此时原任务继续封存，若要重新生成必须由用户另行
+   明确授权一个全新的 job/会话，并接受可能重复生成的风险。
+
+`resume` 是一次有界只读操作，不是后台 watcher。恢复失败时不要关闭/删除原 GPT 对话，
+也不要把 `unknown-after-submit` 改写成 `not-submitted`。
+
 ## 文件和验证入口
 
 | 文件 | 作用 |
@@ -362,6 +457,10 @@ python -X utf8 "$env:USERPROFILE\.codex\skills\.system\skill-creator\scripts\qui
 
 .\windows\tests\run-tests.ps1
 ```
+
+全量入口会串行聚合多个 Node 测试文件，完整运行通常约需 8 分钟；控制台中间暂时
+没有新行不代表卡死。测试或隔离 smoke 使用临时 `-Root` 时，必须同时传入同一临时
+目录下的 `-StatePath`，因为 `-Root` 不会替换或隔离默认的 `%LOCALAPPDATA%` 状态。
 
 权威 Skill 位于本仓库的 `skills/dispatch-chatgpt-bridge/`。安装到 Codex
 运行环境后，还应将 Skill 和本仓库的独立 runtime 与全局副本逐文件校验。

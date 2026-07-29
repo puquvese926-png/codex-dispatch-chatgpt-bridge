@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -13,12 +14,31 @@ import {
 } from "./chatgpt-generation-lifecycle.mjs";
 import {
   createEmptyHandoffCheckpoint,
-  recordDeliveredHandoff,
   selectNextApprovedHandoff,
-  validateHandoffCheckpoint,
   validateHandoffApprovalManifest,
   validateHandoffWatchManifest,
 } from "./chatgpt-handoff-protocol.mjs";
+import {
+  commitHandoffDelivery,
+  checkpointLockPath,
+  writeJsonAtomically,
+} from "./chatgpt-handoff-checkpoint.mjs";
+import {
+  IMAGE_LIMITS,
+  isMetadataOnlyImageSource,
+  isStrictAppBlobSource,
+  parseStrictImageDataUrl,
+} from "./chatgpt-image-materialization.mjs";
+import {
+  acquireBridgeControllerLock,
+  buildDispatchPlan,
+  bridgeCapabilityCachePath,
+  bridgeControllerLockPath,
+  readQuickChatHealth,
+  recordQuickChatHealth,
+  releaseBridgeControllerLock,
+} from "./chatgpt-bridge-product-control.mjs";
+import { auditPathSet } from "./chatgpt-path-safety.mjs";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 const ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -39,6 +59,7 @@ const QUICK_CHAT_SERVICE_EXPORT_BY_VERSION = new Map([
   ["26.707.9564.0", "n"],
   ["26.715.10079.0", "appServices"],
 ]);
+const SUPPORTED_QUICK_CHAT_VERSIONS = Object.freeze([...QUICK_CHAT_RPC_BY_VERSION.keys()].sort());
 const STATE_FIELDS = new Set([
   "browserId",
   "codexExe",
@@ -57,6 +78,13 @@ const defaultStatePath = path.join(
   "CodexChatGPTBridge",
   "state.json",
 );
+export const DEFAULT_TIMEOUT_MS = 600000;
+const MAX_LAUNCH_LOG_BYTES = 64 * 1024;
+const MAX_LAUNCH_LOG_PATH_LENGTH = 32767;
+const PNG_DATA_PREFIX = "data:image/png;base64,";
+const MAX_RENDERED_DATA_URL_LENGTH = PNG_DATA_PREFIX.length + IMAGE_LIMITS.maxBase64Length;
+const MAX_BLOB_CHUNK_SIZE = 1024 * 1024;
+const MATERIALIZED_APP_BLOB = Symbol("materialized-app-blob");
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value) &&
@@ -86,6 +114,142 @@ function requireAbsolute(value, label) {
   return path.win32.normalize(value);
 }
 
+function validateLaunchLogOptions(options) {
+  const hasStdout = options.stdoutLogPath !== null;
+  const hasStderr = options.stderrLogPath !== null;
+  if (hasStdout !== hasStderr) {
+    throw new Error("bridge stdout/stderr log paths must be supplied as a pair");
+  }
+  if (!hasStdout) {
+    if (options.launchToken !== null) {
+      throw new Error("bridge launch token requires stdout/stderr log paths");
+    }
+    return options;
+  }
+  if (!options.launchToken) throw new Error("bridge launch logs require a launch token");
+  const stdout = requireAbsolute(options.stdoutLogPath, "bridge stdout log path");
+  const stderr = requireAbsolute(options.stderrLogPath, "bridge stderr log path");
+  if (stdout.length > MAX_LAUNCH_LOG_PATH_LENGTH || stderr.length > MAX_LAUNCH_LOG_PATH_LENGTH) {
+    throw new Error("bridge launch log path exceeds the Windows path limit");
+  }
+  const launchDirectory = path.win32.dirname(stdout);
+  if (path.win32.dirname(stderr).toLowerCase() !== launchDirectory.toLowerCase()) {
+    throw new Error("bridge stdout/stderr logs must share the launch directory");
+  }
+  if (path.win32.basename(stdout).toLowerCase() !== "stdout.log" ||
+      path.win32.basename(stderr).toLowerCase() !== "stderr.log") {
+    throw new Error("bridge launch log names must be stdout.log and stderr.log");
+  }
+  if (path.win32.basename(launchDirectory).toLowerCase() !== options.launchToken.toLowerCase()) {
+    throw new Error("bridge launch log directory must match the launch token");
+  }
+  options.stdoutLogPath = stdout;
+  options.stderrLogPath = stderr;
+  return options;
+}
+
+function launchLogPathsFromArgv(argv) {
+  let launchToken = null;
+  let stdoutLogPath = null;
+  let stderrLogPath = null;
+  for (let index = 1; index < argv.length; index += 1) {
+    if (argv[index] === "--bridge-launch-token") launchToken = argv[index + 1] ?? null;
+    if (argv[index] === "--bridge-stdout-log") stdoutLogPath = argv[index + 1] ?? null;
+    if (argv[index] === "--bridge-stderr-log") stderrLogPath = argv[index + 1] ?? null;
+  }
+  if (launchToken === null && stdoutLogPath === null && stderrLogPath === null) return null;
+  return validateLaunchLogOptions({ launchToken, stdoutLogPath, stderrLogPath });
+}
+
+function safeLaunchLogError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/[\r\n]+/gu, " ").slice(0, 2000) || "bridge operation failed";
+}
+
+function safeBridgeDiagnosticFields(error) {
+  if (!error || typeof error.code !== "string") return {};
+  if (error.code === "stale-after-update") {
+    return {
+      diagnostic: "stale-after-update",
+      savedCodexVersion: String(error.details?.savedVersion || "").slice(0, 64),
+      currentCodexVersion: String(error.details?.currentVersion || "").slice(0, 64),
+      repairCommand: "start-chatgpt-bridge.ps1",
+    };
+  }
+  if (["codex-identity-mismatch", "codex-process-identity-mismatch", "codex-identity-report-invalid"].includes(error.code)) {
+    return { diagnostic: error.code };
+  }
+  return {};
+}
+
+export function appendBridgeLaunchLog(logPath, value) {
+  if (typeof logPath !== "string" || !path.win32.isAbsolute(logPath)) {
+    throw new Error("bridge launch log path must be absolute");
+  }
+  const line = JSON.stringify(value);
+  const bounded = Buffer.byteLength(line, "utf8") <= MAX_LAUNCH_LOG_BYTES
+    ? line
+    : JSON.stringify({ pass: false, error: "bridge launch log payload exceeded the bounded limit" });
+  fsSync.appendFileSync(logPath, `${bounded}\n`, { encoding: "utf8", flag: "a" });
+}
+
+export function batchProgressPath(reportPath) {
+  return `${requireAbsolute(reportPath, "report path")}.progress.json`;
+}
+
+function progressJob(value) {
+  const job = isPlainObject(value) ? value : {};
+  return {
+    id: typeof job.id === "string" ? job.id : "unknown",
+    promptHash: typeof job.promptHash === "string" ? job.promptHash : null,
+    marker: typeof job.marker === "string" ? job.marker : null,
+    conversationId: typeof job.conversationId === "string" ? job.conversationId : null,
+    expectedConversationId: typeof job.expectedConversationId === "string" ?
+      job.expectedConversationId : null,
+    surface: typeof job.surface === "string" ? job.surface : null,
+    status: typeof job.status === "string" ? job.status : "pending",
+    attemptedAt: typeof job.attemptedAt === "string" ? job.attemptedAt : null,
+    submittedAt: typeof job.submittedAt === "string" ? job.submittedAt : null,
+    completedAt: typeof job.completedAt === "string" ? job.completedAt : null,
+    historyTitle: typeof job.historyTitle === "string" ? job.historyTitle : null,
+    routing: isPlainObject(job.routing) ? {
+      requestedSurface: job.routing.requestedSurface || null,
+      selectedSurface: job.routing.selectedSurface || null,
+      fallbackReason: job.routing.fallbackReason || null,
+    } : null,
+    artifactCount: Array.isArray(job.artifacts) ? job.artifacts.length : 0,
+    error: typeof job.error === "string" ? job.error : null,
+  };
+}
+
+export function buildBatchProgress(value) {
+  if (!isPlainObject(value)) throw new Error("batch progress must be an object");
+  const jobs = Array.isArray(value.jobs) ? value.jobs.map(progressJob) : [];
+  const state = value.state || "running";
+  if (!["running", "complete", "failed"].includes(state)) {
+    throw new Error("batch progress state is invalid");
+  }
+  const reportPath = requireAbsolute(value.reportPath, "report path");
+  return {
+    schemaVersion: 1,
+    command: "batch",
+    launchId: value.launchId || null,
+    state,
+    runId: value.runId,
+    reportPath,
+    progressPath: batchProgressPath(reportPath),
+    startedAt: value.startedAt,
+    updatedAt: value.updatedAt || new Date().toISOString(),
+    requestedJobs: Number.isInteger(value.requestedJobs) ? value.requestedJobs : jobs.length,
+    submittedJobs: jobs.filter((job) => Boolean(job.submittedAt)).length,
+    completedJobs: jobs.filter((job) => job.status === "complete").length,
+    currentJobId: value.currentJobId || null,
+    dispatchPlan: isPlainObject(value.dispatchPlan) ? value.dispatchPlan : null,
+    error: value.error || null,
+    jobs,
+  };
+}
+
 export function parseBridgeArgs(argv) {
   if (!Array.isArray(argv) || !argv.length) throw new Error("A bridge command is required");
   const options = {
@@ -95,21 +259,38 @@ export function parseBridgeArgs(argv) {
     input: null,
     output: null,
     statePath: null,
-    timeoutMs: 180000,
+    launchToken: null,
+    stdoutLogPath: null,
+    stderrLogPath: null,
+    experimentalQuickChat: false,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
   };
-  if (!["discover", "probe", "batch", "resume", "watch", "approve", "cleanup"].includes(options.command)) {
+  if (!["discover", "probe", "plan", "batch", "resume", "watch", "approve", "cleanup"].includes(options.command)) {
     throw new Error(`Unknown bridge command: ${options.command}`);
   }
   for (let index = 1; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--allow-send") options.allowSend = true;
     else if (argument === "--allow-delete") options.allowDelete = true;
+    else if (argument === "--experimental-quick-chat") options.experimentalQuickChat = true;
     else if (argument === "--input") options.input = argv[++index];
     else if (argument === "--output") options.output = argv[++index];
     else if (argument === "--state") options.statePath = argv[++index];
+    else if (argument === "--bridge-launch-token") {
+      const launchToken = argv[++index];
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(launchToken || "")) {
+        throw new Error("bridge launch token must be a UUID");
+      }
+      options.launchToken = launchToken;
+    }
+    else if (argument === "--bridge-stdout-log") options.stdoutLogPath = argv[++index];
+    else if (argument === "--bridge-stderr-log") options.stderrLogPath = argv[++index];
     else if (argument === "--timeout-ms") options.timeoutMs = Number(argv[++index]);
     else if (argument === "--poll-ms") options.pollMs = Number(argv[++index]);
     else throw new Error(`Unknown argument: ${argument}`);
+  }
+  if (options.experimentalQuickChat && !["plan", "batch"].includes(options.command)) {
+    throw new Error(`${options.command} does not accept experimental Quick Chat`);
   }
   if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 5000 || options.timeoutMs > 900000) {
     throw new Error("timeout-ms must be an integer between 5000 and 900000");
@@ -123,11 +304,14 @@ export function parseBridgeArgs(argv) {
     throw new Error(`${options.command} does not accept --poll-ms`);
   }
   if (options.statePath !== null) options.statePath = requireAbsolute(options.statePath, "state path");
-  if (["batch", "resume", "watch", "approve", "cleanup"].includes(options.command)) {
+  if (["plan", "batch", "resume", "watch", "approve", "cleanup"].includes(options.command)) {
     options.input = requireAbsolute(options.input, "input path");
     options.output = requireAbsolute(options.output, "output path");
     if (["batch", "approve"].includes(options.command) && !options.allowSend) {
       throw new Error(`${options.command} requires explicit --allow-send authorization`);
+    }
+    if (options.command === "plan" && options.allowSend) {
+      throw new Error("plan is read-only and does not accept --allow-send");
     }
     if (options.command === "resume" && options.allowSend) {
       throw new Error("resume is read-only and does not accept --allow-send");
@@ -144,9 +328,11 @@ export function parseBridgeArgs(argv) {
     if (options.command === "cleanup" && options.allowSend) {
       throw new Error("cleanup does not accept --allow-send");
     }
-  } else if (options.input !== null || options.output !== null || options.allowSend || options.allowDelete) {
+  } else if (options.input !== null || options.output !== null || options.allowSend ||
+      options.allowDelete || options.experimentalQuickChat) {
     throw new Error(`${options.command} does not accept batch mutation arguments`);
   }
+  validateLaunchLogOptions(options);
   return options;
 }
 
@@ -357,6 +543,85 @@ export function validateBridgeState(value) {
     throw new Error("Codex package executable identity is inconsistent");
   }
   return Object.freeze({ ...value });
+}
+
+function bridgeDiagnosticError(code, message, details = {}) {
+  const error = new Error(message);
+  error.code = code;
+  error.details = Object.freeze({ ...details });
+  return error;
+}
+
+export function validateRegisteredCodexIdentity(state, registered) {
+  if (!isPlainObject(state) || !isPlainObject(registered)) {
+    throw bridgeDiagnosticError("codex-identity-report-invalid", "Registered Codex identity report is invalid");
+  }
+  const required = ["version", "packageFullName", "packageFamilyName", "installLocation", "signatureKind"];
+  for (const field of required) {
+    if (typeof registered[field] !== "string" || !registered[field] || registered[field].includes("\0")) {
+      throw bridgeDiagnosticError("codex-identity-report-invalid", `Registered Codex identity field is invalid: ${field}`);
+    }
+  }
+  if (registered.version !== state.codexVersion) {
+    throw bridgeDiagnosticError(
+      "stale-after-update",
+      "Registered Codex version changed; refresh the bridge state with start-chatgpt-bridge.ps1.",
+      {
+        savedVersion: String(state.codexVersion).slice(0, 64),
+        currentVersion: registered.version.slice(0, 64),
+        repairCommand: "start-chatgpt-bridge.ps1",
+      },
+    );
+  }
+  const savedRoot = path.win32.normalize(String(state.codexPackageRoot || ""));
+  const currentRoot = path.win32.normalize(registered.installLocation);
+  if (registered.packageFullName !== state.codexPackageFullName ||
+      registered.packageFamilyName !== state.codexPackageFamilyName ||
+      currentRoot.toLowerCase() !== savedRoot.toLowerCase() ||
+      registered.signatureKind !== "Store") {
+    throw bridgeDiagnosticError(
+      "codex-identity-mismatch",
+      "Registered Codex package identity no longer matches the saved Store identity.",
+    );
+  }
+  return Object.freeze({
+    version: registered.version,
+    packageFullName: registered.packageFullName,
+    packageFamilyName: registered.packageFamilyName,
+    installLocation: registered.installLocation,
+    signatureKind: registered.signatureKind,
+  });
+}
+
+export function classifyWindowsIdentityReport(state, report) {
+  if (!isPlainObject(report)) {
+    throw bridgeDiagnosticError("codex-identity-report-invalid", "Registered Codex identity report is invalid");
+  }
+  // Package validation intentionally precedes listener validation: after an
+  // update, the saved port may be gone, but the caller still needs the precise
+  // stale-after-update diagnosis instead of a generic no-listener error.
+  validateRegisteredCodexIdentity(state, report.package);
+  const listeners = Array.isArray(report.listeners) ? report.listeners : [report.listeners].filter(Boolean);
+  if (!listeners.length) throw new Error("Saved CDP port has no listener");
+  return Object.freeze(listeners);
+}
+
+export function buildVersionCompatibilitySummary(codexVersion) {
+  if (typeof codexVersion !== "string" || !codexVersion || codexVersion.length > 64) {
+    throw new Error("Codex version is invalid");
+  }
+  const quickChatSupported = QUICK_CHAT_RPC_BY_VERSION.has(codexVersion);
+  return Object.freeze({
+    schemaVersion: 1,
+    codexVersion,
+    main: { status: "runtime-probed" },
+    quickChat: {
+      status: quickChatSupported ? "verified" : "unsupported",
+      reason: quickChatSupported ? null : "unsupported-codex-version",
+      rpcAttempted: false,
+    },
+    supportedQuickChatVersions: SUPPORTED_QUICK_CHAT_VERSIONS,
+  });
 }
 
 export function validatedDebuggerUrl(target, port) {
@@ -767,9 +1032,17 @@ export function buildMainChatEntryExpression() {
         .filter(Boolean).join(' ').trim();
       return visible(node) && /(?:当前模式|current mode)\\s*[:：]?\\s*ChatGPT/iu.test(label);
     });
-    if (!button) return Boolean(chatModeButton);
-    const dialogOpen = [...document.querySelectorAll('[role="dialog"]')].some(visible);
-    if (button.getAttribute('aria-pressed') !== 'true' || !dialogOpen) button.click();
+    const quickChatDialog = [...document.querySelectorAll('[data-pip-obstacle="quick-chat"]')].find(visible) || null;
+    const ownedDialog = quickChatDialog || [...document.querySelectorAll('[role="dialog"]')].find((dialog) => {
+      if (!visible(dialog)) return false;
+      return Boolean(
+        dialog.querySelector('[data-above-composer-conversation-id]') ||
+        dialog.querySelector('[contenteditable="true"][aria-label*="ChatGPT"], textarea[data-testid="prompt-textarea"]')
+      );
+    }) || null;
+    if (ownedDialog || chatModeButton) return true;
+    if (!button) return false;
+    button.click();
     return true;
   })()`;
 }
@@ -793,13 +1066,23 @@ export function buildMainChatNewConversationExpression() {
     if (!dialog && !chatModeButton) return false;
     const scope = dialog || document;
     const button = [...scope.querySelectorAll('button, [role="button"]')]
-      .find((node) => visible(node) && (node.innerText || node.textContent || '').trim() === '新聊天');
+      .find((node) => {
+        if (!visible(node)) return false;
+        const labels = [
+          node.getAttribute('aria-label'),
+          node.getAttribute('title'),
+          node.innerText,
+          node.textContent
+        ].filter(Boolean).map((value) => value.trim());
+        return labels.some((value) => /^(?:新聊天|New chat)$/iu.test(value));
+      });
     if (button) {
       button.click();
       return true;
     }
     return [...scope.querySelectorAll('header, h1, h2, h3')]
-      .some((node) => visible(node) && (node.innerText || node.textContent || '').trim() === '新聊天');
+      .some((node) => visible(node) &&
+        /^(?:新聊天|New chat)$/iu.test((node.innerText || node.textContent || '').trim()));
   })()`;
 }
 
@@ -867,16 +1150,34 @@ export function buildMainChatConversationIdExpression() {
   })()`;
 }
 
-export function buildComposerFocusExpression() {
-  return `(() => {
+function validateSubmissionExpressionInput(surface, conversationId, marker = null) {
+  if (!new Set(["chatgpt-quick-chat", "chatgpt-main-chat"]).has(surface)) {
+    throw new Error("submission surface is invalid");
+  }
+  const validConversationId = surface === "chatgpt-quick-chat" ?
+    LOCAL_CHATGPT_ID_PATTERN.test(conversationId) :
+    LOCAL_CHATGPT_ID_PATTERN.test(conversationId) || LOCAL_THREAD_ID_PATTERN.test(conversationId);
+  if (!validConversationId) throw new Error("submission conversation identity is invalid");
+  if (marker !== null &&
+      (typeof marker !== "string" || !marker || marker.length > 200 ||
+        /[\u0000-\u001f\u007f]/u.test(marker))) {
+    throw new Error("submission marker is invalid");
+  }
+}
+
+function buildExactSubmissionRootSource(surface, conversationId) {
+  validateSubmissionExpressionInput(surface, conversationId);
+  return `
+    const surface = ${JSON.stringify(surface)};
+    const expectedConversationId = ${JSON.stringify(conversationId)};
     const visible = (node) => {
-      if (!node || node.disabled || node.getAttribute('aria-hidden') === 'true') return false;
+      if (!node || node.getAttribute?.('aria-hidden') === 'true') return false;
       const style = getComputedStyle(node);
       if (style.display === 'none' || style.visibility === 'hidden') return false;
       const rect = node.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
     };
-    const selectors = [
+    const composerSelectors = [
       '[contenteditable="true"][data-lexical-editor="true"]',
       '[contenteditable="true"][role="textbox"]',
       '[contenteditable="true"][aria-label="给 ChatGPT 发消息"]',
@@ -884,10 +1185,192 @@ export function buildComposerFocusExpression() {
       'textarea[data-testid="prompt-textarea"]',
       'textarea'
     ];
-    const composer = selectors.map((selector) => document.querySelector(selector)).find(visible) || null;
-    if (!composer) return false;
-    composer.focus();
-    return document.activeElement === composer || composer.contains(document.activeElement);
+    const sendSelectors = [
+      'button[data-testid="send-button"]',
+      'button[aria-label="发送"]',
+      'button[aria-label="Send"]',
+      'button[type="submit"]'
+    ];
+    const uniqueVisible = (root, selectors) => {
+      const matches = [];
+      const seen = new Set();
+      for (const selector of selectors) {
+        for (const node of root.querySelectorAll(selector)) {
+          if (!seen.has(node) && visible(node)) {
+            seen.add(node);
+            matches.push(node);
+          }
+        }
+      }
+      return matches;
+    };
+    const composersIn = (root) => uniqueVisible(root, composerSelectors)
+      .filter((composer) => !composer.disabled);
+    const sendsIn = (root) => {
+      const sends = uniqueVisible(root, sendSelectors);
+      const seen = new Set(sends);
+      for (const button of root.querySelectorAll('button')) {
+        const label = [
+          button.getAttribute('aria-label'),
+          button.getAttribute('title'),
+          button.textContent
+        ].filter(Boolean).join(' ');
+        if (!seen.has(button) && visible(button) && /(?:send|发送|提交)/iu.test(label)) {
+          seen.add(button);
+          sends.push(button);
+        }
+      }
+      return sends;
+    };
+    const normalizeIdentity = (rawValue) => {
+      const raw = String(rawValue || '').trim();
+      const quick = /^chatgpt:(local-chatgpt:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/iu.exec(raw);
+      if (quick) return quick[1];
+      if (/^local:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(raw)) {
+        return raw;
+      }
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(raw)) {
+        return 'local:' + raw;
+      }
+      return null;
+    };
+    const currentQuickChatConversationId = () => {
+      try {
+        const url = new URL(location.href);
+        if (url.protocol !== 'app:' || url.username || url.password) return null;
+        const initialRoute = url.searchParams.get('initialRoute');
+        if (!initialRoute) return null;
+        let route = initialRoute;
+        try {
+          route = decodeURIComponent(route);
+        } catch {}
+        const match = /^\\/chatgpt\\/quick-chat\\/([^/]+)$/.exec(route);
+        if (!match) return null;
+        const conversationId = match[1];
+        if (!/^(?:local-chatgpt:)?[A-Za-z0-9._-]{1,200}$/.test(conversationId)) {
+          return null;
+        }
+        return conversationId;
+      } catch {
+        return null;
+      }
+    };
+    const hasChatGptMode = (root) => [...root.querySelectorAll('button,[role="button"]')].some((node) => {
+      if (!visible(node)) return false;
+      const label = [
+        node.getAttribute('aria-label'),
+        node.getAttribute('title'),
+        node.textContent
+      ].filter(Boolean).join(' ').trim();
+      return /(?:当前模式\\s*[:：]?\\s*ChatGPT|current mode\\s*[:：]?\\s*ChatGPT)/iu.test(label);
+    });
+    const isExplicitChatGptComposer = (composer) => {
+      const label = [
+        composer.getAttribute('aria-label'),
+        composer.getAttribute('title')
+      ].filter(Boolean).join(' ');
+      return /ChatGPT/iu.test(label);
+    };
+    const ownerForComposer = (composer) => {
+      const quickChat = composer.closest('[data-pip-obstacle="quick-chat"]');
+      if (quickChat) return quickChat;
+      const dialog = composer.closest('[role="dialog"]');
+      if (dialog) return dialog;
+      const identityOwner = composer.closest('[data-above-composer-conversation-id]');
+      if (identityOwner) return identityOwner;
+      if (surface !== 'chatgpt-main-chat') return null;
+      let current = composer.parentElement;
+      while (current && current !== document) {
+        if (current.matches?.('main, [role="main"], section') && hasChatGptMode(current)) {
+          return current;
+        }
+        current = current.parentElement;
+      }
+      return null;
+    };
+    const rootHasExpectedIdentity = (root) => {
+      const identityNodes = [];
+      if (root.matches?.('[data-above-composer-conversation-id]')) identityNodes.push(root);
+      identityNodes.push(...root.querySelectorAll('[data-above-composer-conversation-id]'));
+      const identities = [...new Set(identityNodes
+        .map((node) => normalizeIdentity(node.getAttribute('data-above-composer-conversation-id')))
+        .filter(Boolean))];
+      if (identities.length > 0) return identities.length === 1 && identities[0] === expectedConversationId;
+      if (surface !== 'chatgpt-main-chat' ||
+          !expectedConversationId.startsWith('local:') ||
+          !hasChatGptMode(root)) {
+        return false;
+      }
+      const rootComposers = composersIn(root);
+      if (rootComposers.length !== 1 || !isExplicitChatGptComposer(rootComposers[0])) return false;
+      const activeIds = [...new Set([...document.querySelectorAll(
+        '[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-active="true"], [data-app-action-sidebar-thread-id][aria-current="page"]'
+      )].filter(visible).map((node) =>
+        normalizeIdentity(node.getAttribute('data-app-action-sidebar-thread-id'))
+      ).filter(Boolean))];
+      return activeIds.length === 1 && activeIds[0] === expectedConversationId;
+    };
+    const resolveExactOwner = (requireSend) => {
+      if (surface === 'chatgpt-quick-chat') {
+        const currentConversationId = currentQuickChatConversationId();
+        if (currentConversationId !== expectedConversationId) {
+          return {
+            ok: false,
+            reason: 'quick-chat-route-mismatch',
+            currentConversationId,
+            expectedConversationId
+          };
+        }
+        const composers = composersIn(document);
+        if (composers.length !== 1) {
+          return { ok: false, reason: 'composer-count', rootCount: 1, composerCount: composers.length };
+        }
+        const sends = requireSend ? sendsIn(document) : [];
+        if (requireSend && sends.length !== 1) {
+          return { ok: false, reason: 'send-count', rootCount: 1, sendCount: sends.length };
+        }
+        return { ok: true, root: document, composer: composers[0], send: sends[0] || null };
+      }
+      const candidateRoots = [];
+      const seenRoots = new Set();
+      for (const composer of composersIn(document)) {
+        const root = ownerForComposer(composer);
+        if (root && !seenRoots.has(root)) {
+          seenRoots.add(root);
+          candidateRoots.push(root);
+        }
+      }
+      const exactRoots = candidateRoots.filter(rootHasExpectedIdentity);
+      if (exactRoots.length !== 1) {
+        return { ok: false, reason: 'exact-root-count', rootCount: exactRoots.length };
+      }
+      const root = exactRoots[0];
+      const composers = composersIn(root);
+      if (composers.length !== 1) {
+        return { ok: false, reason: 'composer-count', rootCount: 1, composerCount: composers.length };
+      }
+      const sends = requireSend ? sendsIn(root) : [];
+      if (requireSend && sends.length !== 1) {
+        return { ok: false, reason: 'send-count', rootCount: 1, sendCount: sends.length };
+      }
+      return { ok: true, root, composer: composers[0], send: sends[0] || null };
+    };`;
+}
+
+export function buildComposerFocusExpression(surface, conversationId) {
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
+  return `(() => {
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return resolved;
+    resolved.composer.focus();
+    const focused = document.activeElement === resolved.composer ||
+      resolved.composer.contains(document.activeElement);
+    return {
+      ok: focused,
+      reason: focused ? 'focused' : 'focus-rejected',
+      conversationId: expectedConversationId
+    };
   })()`;
 }
 
@@ -917,102 +1400,68 @@ export function buildComposerAvailabilityExpression(requireBlank = true) {
   })()`;
 }
 
-export function buildComposerReadinessExpression(marker) {
-  if (typeof marker !== "string" || !marker || marker.length > 200 || /[\u0000-\u001f\u007f]/u.test(marker)) {
-    throw new Error("composer marker is invalid");
-  }
+export function buildComposerReadinessExpression(surface, conversationId, marker) {
+  validateSubmissionExpressionInput(surface, conversationId, marker);
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
     const marker = ${JSON.stringify(marker)};
-    const visible = (node) => {
-      if (!node || node.disabled || node.getAttribute('aria-hidden') === 'true') return false;
-      const style = getComputedStyle(node);
-      if (style.display === 'none' || style.visibility === 'hidden') return false;
-      const rect = node.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
-    };
-    const composerSelectors = [
-      '[contenteditable="true"][data-lexical-editor="true"]',
-      '[contenteditable="true"][role="textbox"]',
-      '[contenteditable="true"][aria-label="给 ChatGPT 发消息"]',
-      '[contenteditable="true"][aria-label*="ChatGPT"]',
-      'textarea[data-testid="prompt-textarea"]',
-      'textarea'
-    ];
-    const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(visible) || null;
-    const directSend = [
-      'button[data-testid="send-button"]',
-      'button[aria-label="发送"]',
-      'button[aria-label="Send"]',
-      'button[type="submit"]'
-    ].map((selector) => document.querySelector(selector)).find(visible) || null;
-    const semanticSend = [...document.querySelectorAll('button')].find((button) => {
-      const label = [button.getAttribute('aria-label'), button.getAttribute('title'), button.textContent]
-        .filter(Boolean).join(' ');
-      return visible(button) && /(?:send|发送|提交)/i.test(label);
-    }) || null;
-    const send = directSend || semanticSend;
-    const composerText = composer
-      ? ('value' in composer ? composer.value : (composer.innerText || composer.textContent || ''))
-      : '';
-    return Boolean(composer && send && !send.disabled && composerText.includes(marker));
+    ${rootSource}
+    const resolved = resolveExactOwner(true);
+    if (!resolved.ok) return resolved;
+    const composerText = 'value' in resolved.composer ?
+      resolved.composer.value :
+      (resolved.composer.innerText || resolved.composer.textContent || '');
+    if (!composerText.includes(marker)) {
+      return { ok: false, reason: 'marker-mismatch', conversationId: expectedConversationId };
+    }
+    if (resolved.send.disabled) {
+      return { ok: false, reason: 'send-disabled', conversationId: expectedConversationId };
+    }
+    return { ok: true, reason: 'ready', conversationId: expectedConversationId };
   })()`;
 }
 
-export function buildSendClickExpression() {
+export function buildSendClickExpression(surface, conversationId, marker) {
+  validateSubmissionExpressionInput(surface, conversationId, marker);
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
-    const visible = (node) => {
-      if (!node || node.disabled || node.getAttribute('aria-hidden') === 'true') return false;
-      const style = getComputedStyle(node);
-      if (style.display === 'none' || style.visibility === 'hidden') return false;
-      const rect = node.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
-    };
-    const directSend = [
-      'button[data-testid="send-button"]',
-      'button[aria-label="发送"]',
-      'button[aria-label="Send"]',
-      'button[type="submit"]'
-    ].map((selector) => document.querySelector(selector)).find(visible) || null;
-    const semanticSend = [...document.querySelectorAll('button')].find((button) => {
-      const label = [button.getAttribute('aria-label'), button.getAttribute('title'), button.textContent]
-        .filter(Boolean).join(' ');
-      return visible(button) && /(?:send|发送|提交)/i.test(label);
-    }) || null;
-    const send = directSend || semanticSend;
-    if (!send || send.disabled) return false;
-    send.click();
-    return true;
-  })()`;
-}
-
-export function buildConversationSnapshotExpression(marker, surface = "quick-chat") {
-  if (typeof marker !== "string" || !marker || marker.length > 200 || /[\u0000-\u001f\u007f]/u.test(marker)) {
-    throw new Error("snapshot marker is invalid");
-  }
-  if (!new Set(["quick-chat", "main-chat"]).has(surface)) throw new Error("snapshot surface is invalid");
-  const markerJson = JSON.stringify(marker);
-  const rootExpression = surface === "main-chat" ? `(() => {
-      const visible = (node) => {
-        if (!node || node.getAttribute('aria-hidden') === 'true') return false;
-        const style = getComputedStyle(node);
-        const rect = node.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
+    const marker = ${JSON.stringify(marker)};
+    ${rootSource}
+    const resolved = resolveExactOwner(true);
+    if (!resolved.ok) return { clicked: false, ...resolved };
+    const composerText = 'value' in resolved.composer ?
+      resolved.composer.value :
+      (resolved.composer.innerText || resolved.composer.textContent || '');
+    if (!composerText.includes(marker)) {
+      return {
+        clicked: false,
+        reason: 'marker-mismatch',
+        conversationId: expectedConversationId
       };
-      const dialog = [...document.querySelectorAll('[data-pip-obstacle="quick-chat"]')].find(visible) ||
-        [...document.querySelectorAll('[role="dialog"]')].find(visible) || null;
-      if (dialog) return dialog;
-      const modeActive = [...document.querySelectorAll('button, [role="button"]')].some((node) => {
-        const label = [node.getAttribute('aria-label'), node.getAttribute('title'), node.innerText, node.textContent]
-          .filter(Boolean).join(' ').trim();
-        return visible(node) && /(?:当前模式|current mode)\s*[:：]?\s*ChatGPT/iu.test(label);
-      });
-      return modeActive ? document : null;
-    })()` : "document";
-  return `(() => {
-    const marker = ${markerJson};
-    const root = ${rootExpression};
-    if (!root) return { markerPresent: false, composerBusy: false, hasStopButton: false, sendPresent: false, assistantMessageCount: 0, userMessageCount: 0, assistantText: '', images: [] };
+    }
+    if (resolved.send.disabled ||
+        !resolved.root.contains(resolved.composer) ||
+        !resolved.root.contains(resolved.send)) {
+      return {
+        clicked: false,
+        reason: 'owner-mismatch',
+        conversationId: expectedConversationId
+      };
+    }
+    resolved.send.click();
+    return {
+      clicked: true,
+      reason: 'clicked',
+      conversationId: expectedConversationId
+    };
+  })()`;
+}
+
+function buildSnapshotBodySource(marker) {
+  return `
+    const marker = ${JSON.stringify(marker)};
     const units = [...root.querySelectorAll('[data-content-search-unit-key]')]
+      .filter(visible)
       .map((node) => {
         const key = node.getAttribute('data-content-search-unit-key') || '';
         const role = key.endsWith(':assistant') ? 'assistant' : key.endsWith(':user') ? 'user' : null;
@@ -1021,12 +1470,14 @@ export function buildConversationSnapshotExpression(marker, surface = "quick-cha
           key,
           role,
           text: (node.innerText || node.textContent || '').trim(),
-          images: role === 'assistant' ? [...node.querySelectorAll('img')].map((image) => ({
-            src: image.currentSrc || image.src || '',
-            width: image.naturalWidth || image.width || 0,
-            height: image.naturalHeight || image.height || 0,
-            alt: image.alt || '',
-          })) : [],
+          images: role === 'assistant' ? [...node.querySelectorAll('img')]
+            .filter(visible)
+            .map((image) => ({
+              src: image.currentSrc || image.src || '',
+              width: image.naturalWidth || image.width || 0,
+              height: image.naturalHeight || image.height || 0,
+              alt: image.alt || '',
+            })) : [],
         };
       })
       .filter(Boolean);
@@ -1034,6 +1485,7 @@ export function buildConversationSnapshotExpression(marker, surface = "quick-cha
     const users = units.filter((unit) => unit.role === 'user');
     const latest = assistants.at(-1) || null;
     const generatedImages = [...root.querySelectorAll('img')]
+      .filter(visible)
       .filter((image) => image.naturalWidth >= 512 && image.naturalHeight >= 512 &&
         /(?:generated image|生成图像)/i.test(image.alt || ''))
       .map((image) => ({
@@ -1045,6 +1497,8 @@ export function buildConversationSnapshotExpression(marker, surface = "quick-cha
     const images = [...(latest?.images || []), ...generatedImages]
       .filter((image, index, all) => image.src && all.findIndex((item) => item.src === image.src) === index);
     return {
+      readable: true,
+      conversationId: expectedConversationId,
       markerPresent: users.some((unit) => unit.text.includes(marker)),
       composerBusy: Boolean(root.querySelector('button[aria-label="停止"], button[aria-label="Stop"]')),
       hasStopButton: Boolean(root.querySelector('button[aria-label="停止"], button[aria-label="Stop"]')),
@@ -1054,45 +1508,74 @@ export function buildConversationSnapshotExpression(marker, surface = "quick-cha
       assistantText: latest?.text || '',
       images,
     };
+  `;
+}
+
+function emptySnapshotSource(reasonExpression) {
+  return `{
+      readable: false,
+      conversationId: null,
+      reason: ${reasonExpression},
+      markerPresent: false,
+      composerBusy: false,
+      hasStopButton: false,
+      sendPresent: false,
+      assistantMessageCount: 0,
+      userMessageCount: 0,
+      assistantText: '',
+      images: [],
+    }`;
+}
+
+export function buildConversationSnapshotExpression(marker, expectedConversationId, surface = "quick-chat") {
+  if (typeof marker !== "string" || !marker || marker.length > 200 || /[\u0000-\u001f\u007f]/u.test(marker)) {
+    throw new Error("snapshot marker is invalid");
+  }
+  if (!new Set(["quick-chat", "main-chat"]).has(surface)) throw new Error("snapshot surface is invalid");
+  const submissionSurface = surface === "quick-chat" ? "chatgpt-quick-chat" : "chatgpt-main-chat";
+  validateSubmissionExpressionInput(submissionSurface, expectedConversationId);
+  const rootSource = buildExactSubmissionRootSource(submissionSurface, expectedConversationId);
+  const bodySource = buildSnapshotBodySource(marker);
+  return `(() => {
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return ${emptySnapshotSource("resolved.reason")};
+    const root = resolved.root;
+    ${bodySource}
   })()`;
 }
 
-export function buildHandoffUnitsExpression(expectedConversationId = null) {
-  if (expectedConversationId !== null &&
-      !LOCAL_CHATGPT_ID_PATTERN.test(expectedConversationId) &&
-      !LOCAL_THREAD_ID_PATTERN.test(expectedConversationId)) {
-    throw new Error("handoff unit conversation identity is invalid");
+export function buildMainChatSubmissionLeaseExpression(conversationId, marker) {
+  if (!LOCAL_CHATGPT_ID_PATTERN.test(conversationId) && !LOCAL_THREAD_ID_PATTERN.test(conversationId)) {
+    throw new Error("main ChatGPT submission lease conversation identity is invalid");
   }
+  if (typeof marker !== "string" || !marker || marker.length > 200 || /[\u0000-\u001f\u007f]/u.test(marker)) {
+    throw new Error("main ChatGPT submission lease marker is invalid");
+  }
+  const rootSource = buildExactSubmissionRootSource("chatgpt-main-chat", conversationId);
+  const bodySource = buildSnapshotBodySource(marker);
   return `(() => {
-    const expected = ${JSON.stringify(expectedConversationId)};
-    const visible = (node) => {
-      if (!node || node.getAttribute('aria-hidden') === 'true') return false;
-      const style = getComputedStyle(node);
-      const rect = node.getBoundingClientRect();
-      return style.display !== 'none' && style.visibility !== 'hidden' &&
-        rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
-    };
-    const dialog = [...document.querySelectorAll('[data-pip-obstacle="quick-chat"]')].find(visible) ||
-      [...document.querySelectorAll('[role="dialog"]')].find(visible) || null;
-    const modeActive = [...document.querySelectorAll('button, [role="button"]')].some((node) => {
-      const label = [node.getAttribute('aria-label'), node.getAttribute('title'), node.innerText, node.textContent]
-        .filter(Boolean).join(' ').trim();
-      return visible(node) && /(?:当前模式|current mode)\\s*[:：]?\\s*ChatGPT/iu.test(label);
-    });
-    const identityNodes = [...document.querySelectorAll('[data-above-composer-conversation-id]')];
-    const exactDocument = Boolean(expected) && (
-      identityNodes.some((node) => {
-        const raw = node.getAttribute('data-above-composer-conversation-id')?.trim() || '';
-        const actual = raw.startsWith('chatgpt:') ? raw.slice('chatgpt:'.length) :
-          (/^[0-9a-f-]{36}$/iu.test(raw) ? 'local:' + raw : raw);
-        return actual === expected;
-      }) ||
-      (() => {
-        try { return decodeURIComponent(location.href).includes(expected); } catch { return false; }
-      })()
-    );
-    const root = dialog || ((modeActive || exactDocument) ? document : null);
-    if (!root) return { readable: false, units: [] };
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) {
+      return { conversationId: null, snapshot: ${emptySnapshotSource("resolved.reason")} };
+    }
+    const root = resolved.root;
+    const snapshot = (() => {
+      ${bodySource}
+    })();
+    return { conversationId: expectedConversationId, snapshot };
+  })()`;
+}
+
+export function buildHandoffUnitsExpression(surface, expectedConversationId) {
+  validateSubmissionExpressionInput(surface, expectedConversationId);
+  const rootSource = buildExactSubmissionRootSource(surface, expectedConversationId);
+  return `(() => {
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return { readable: false, conversationId: null, units: [] };
+    const root = resolved.root;
     const units = [...root.querySelectorAll('[data-content-search-unit-key]')]
       .filter(visible)
       .map((node) => {
@@ -1110,48 +1593,19 @@ export function buildHandoffUnitsExpression(expectedConversationId = null) {
       })
       .filter(Boolean)
       .slice(-500);
-    return { readable: true, units };
+    return { readable: true, conversationId: expectedConversationId, units };
   })()`;
 }
 
-export function buildHandoffApprovalFocusExpression(conversationId) {
-  if (!LOCAL_CHATGPT_ID_PATTERN.test(conversationId) && !LOCAL_THREAD_ID_PATTERN.test(conversationId)) {
-    throw new Error("handoff approval conversation identity is invalid");
-  }
+export function buildHandoffApprovalFocusExpression(surface, conversationId) {
+  validateSubmissionExpressionInput(surface, conversationId);
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
-    const expected = ${JSON.stringify(conversationId)};
-    const visible = (node) => {
-      if (!node || node.disabled || node.getAttribute('aria-hidden') === 'true') return false;
-      const style = getComputedStyle(node);
-      const rect = node.getBoundingClientRect();
-      return style.display !== 'none' && style.visibility !== 'hidden' &&
-        rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
-    };
-    const dialog = [...document.querySelectorAll('[data-pip-obstacle="quick-chat"]')]
-      .find(visible) || [...document.querySelectorAll('[role="dialog"]')].find(visible) || null;
-    const routeMatches = (() => {
-      try { return decodeURIComponent(location.href).includes(expected); } catch { return false; }
-    })();
-    const root = dialog || (routeMatches ? document : null);
-    if (!root) return { ok: false, reason: 'exact-root-missing' };
-    const raw = root.querySelector('[data-above-composer-conversation-id]')
-      ?.getAttribute('data-above-composer-conversation-id')?.trim() || '';
-    const activeThread = document.querySelector(
-      '[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-active="true"], [data-app-action-sidebar-thread-id][aria-current="page"]',
-    )?.getAttribute('data-app-action-sidebar-thread-id')?.trim() || '';
-    const actual = raw.startsWith('chatgpt:') ? raw.slice('chatgpt:'.length) :
-      (/^[0-9a-f-]{36}$/iu.test(raw) ? 'local:' + raw : (routeMatches ? expected : activeThread));
-    if (actual !== expected) return { ok: false, reason: 'conversation-identity-mismatch', actual };
-    const selectors = [
-      '[contenteditable="true"][data-lexical-editor="true"]',
-      '[contenteditable="true"][role="textbox"]',
-      '[contenteditable="true"][aria-label="给 ChatGPT 发消息"]',
-      '[contenteditable="true"][aria-label*="ChatGPT"]',
-      'textarea[data-testid="prompt-textarea"]',
-      'textarea'
-    ];
-    const composer = selectors.map((selector) => root.querySelector(selector)).find(visible) || null;
-    if (!composer) return { ok: false, reason: 'composer-missing' };
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return resolved;
+    const root = resolved.root;
+    const composer = resolved.composer;
     const composerText = 'value' in composer ? composer.value : (composer.innerText || composer.textContent || '');
     if (composerText.trim()) return { ok: false, reason: 'composer-not-empty' };
     const stop = [...root.querySelectorAll('button')].find((button) => {
@@ -1164,71 +1618,32 @@ export function buildHandoffApprovalFocusExpression(conversationId) {
     return {
       ok: document.activeElement === composer || composer.contains(document.activeElement),
       reason: 'focused',
+      conversationId: expectedConversationId,
     };
   })()`;
 }
 
-export function buildHandoffApprovalSubmitExpression(conversationId, taskId) {
-  if (!LOCAL_CHATGPT_ID_PATTERN.test(conversationId) && !LOCAL_THREAD_ID_PATTERN.test(conversationId)) {
-    throw new Error("handoff approval conversation identity is invalid");
-  }
+export function buildHandoffApprovalSubmitExpression(surface, conversationId, taskId) {
+  validateSubmissionExpressionInput(surface, conversationId);
   if (!ID_PATTERN.test(taskId)) throw new Error("handoff approval taskId is invalid");
   const approval = `CODEX_APPROVE ${taskId}`;
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
-    const expected = ${JSON.stringify(conversationId)};
     const approval = ${JSON.stringify(approval)};
-    const visible = (node) => {
-      if (!node || node.disabled || node.getAttribute('aria-hidden') === 'true') return false;
-      const style = getComputedStyle(node);
-      const rect = node.getBoundingClientRect();
-      return style.display !== 'none' && style.visibility !== 'hidden' &&
-        rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
-    };
-    const dialog = [...document.querySelectorAll('[data-pip-obstacle="quick-chat"]')]
-      .find(visible) || [...document.querySelectorAll('[role="dialog"]')].find(visible) || null;
-    const routeMatches = (() => {
-      try { return decodeURIComponent(location.href).includes(expected); } catch { return false; }
-    })();
-    const root = dialog || (routeMatches ? document : null);
-    if (!root) return { ok: false, reason: 'exact-root-missing' };
-    const raw = root.querySelector('[data-above-composer-conversation-id]')
-      ?.getAttribute('data-above-composer-conversation-id')?.trim() || '';
-    const activeThread = document.querySelector(
-      '[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-active="true"], [data-app-action-sidebar-thread-id][aria-current="page"]',
-    )?.getAttribute('data-app-action-sidebar-thread-id')?.trim() || '';
-    const actual = raw.startsWith('chatgpt:') ? raw.slice('chatgpt:'.length) :
-      (/^[0-9a-f-]{36}$/iu.test(raw) ? 'local:' + raw : (routeMatches ? expected : activeThread));
-    if (actual !== expected) return { ok: false, reason: 'conversation-identity-mismatch', actual };
-    const selectors = [
-      '[contenteditable="true"][data-lexical-editor="true"]',
-      '[contenteditable="true"][role="textbox"]',
-      '[contenteditable="true"][aria-label="给 ChatGPT 发消息"]',
-      '[contenteditable="true"][aria-label*="ChatGPT"]',
-      'textarea[data-testid="prompt-textarea"]',
-      'textarea'
-    ];
-    const composer = selectors.map((selector) => root.querySelector(selector)).find(visible) || null;
-    const composerText = composer
-      ? ('value' in composer ? composer.value : (composer.innerText || composer.textContent || ''))
-      : '';
+    ${rootSource}
+    const resolved = resolveExactOwner(true);
+    if (!resolved.ok) return { ok: false, clicked: false, ...resolved };
+    const root = resolved.root;
+    const composer = resolved.composer;
+    const composerText = 'value' in composer ? composer.value : (composer.innerText || composer.textContent || '');
     if (composerText.trim() !== approval) {
-      return { ok: false, reason: 'approval-mismatch', composerText: composerText.slice(0, 200) };
+      return { ok: false, clicked: false, reason: 'approval-mismatch', composerText: composerText.slice(0, 200) };
     }
-    const directSend = [
-      'button[data-testid="send-button"]',
-      'button[aria-label="发送"]',
-      'button[aria-label="Send"]',
-      'button[type="submit"]'
-    ].map((selector) => root.querySelector(selector)).find(visible) || null;
-    const semanticSend = [...root.querySelectorAll('button')].find((button) => {
-      const label = [button.getAttribute('aria-label'), button.getAttribute('title'), button.textContent]
-        .filter(Boolean).join(' ');
-      return visible(button) && /(?:send|发送|提交)/iu.test(label);
-    }) || null;
-    const send = directSend || semanticSend;
-    if (!send || send.disabled) return { ok: false, reason: 'send-missing' };
-    send.click();
-    return { ok: true, reason: 'clicked' };
+    if (!root.contains(composer) || !root.contains(resolved.send) || resolved.send.disabled) {
+      return { ok: false, clicked: false, reason: 'owner-mismatch' };
+    }
+    resolved.send.click();
+    return { ok: true, clicked: true, reason: 'clicked', conversationId: expectedConversationId };
   })()`;
 }
 
@@ -1276,35 +1691,96 @@ export function buildMarkerPresenceExpression(marker) {
   })()`;
 }
 
-export function buildAttachmentButtonExpression() {
+export function buildAttachmentButtonExpression(surface, conversationId) {
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
-    if (document.querySelector('input[type="file"]')) return { inputPresent: true, clicked: false };
-    const controls = [...document.querySelectorAll('button, [role="button"]')];
-    const attach = controls.find((node) => /Attach|Add files|Upload|添加|附加|上传|文件/i.test(
-      node.getAttribute('aria-label') || node.getAttribute('title') || node.innerText || node.textContent || ''));
-    if (!attach) return { inputPresent: false, clicked: false };
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return { inputPresent: false, clicked: false, ...resolved };
+    const inputs = [...resolved.root.querySelectorAll('input[type="file"]')];
+    if (inputs.length > 1) {
+      return { inputPresent: false, clicked: false, reason: 'file-input-count', inputCount: inputs.length };
+    }
+    if (inputs.length === 1) return { inputPresent: true, clicked: false };
+    const controls = [...resolved.root.querySelectorAll('button, [role="button"]')]
+      .filter(visible)
+      .filter((node) => /Attach|Add files|Upload|添加|附加|上传|文件/iu.test(
+        node.getAttribute('aria-label') || node.getAttribute('title') ||
+        node.innerText || node.textContent || ''));
+    if (controls.length !== 1) {
+      return { inputPresent: false, clicked: false, reason: 'attach-control-count', controlCount: controls.length };
+    }
+    const attach = controls[0];
     attach.click();
     return { inputPresent: false, clicked: true };
   })()`;
 }
 
-export function buildAttachmentAcknowledgementExpression(expectedNames) {
+export function buildAttachmentInputStateExpression(surface, conversationId) {
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
+  return `(() => {
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return { ok: false, inputCount: null, ...resolved };
+    const inputCount = [...resolved.root.querySelectorAll('input[type="file"]')].length;
+    return {
+      ok: inputCount === 1,
+      inputCount,
+      inputPresent: inputCount === 1,
+      reason: inputCount === 0 ? 'file-input-missing' : inputCount > 1 ? 'file-input-count' : 'ready',
+    };
+  })()`;
+}
+
+export function buildAttachmentInputExpression(surface, conversationId) {
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
+  return `(() => {
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return null;
+    const inputs = [...resolved.root.querySelectorAll('input[type="file"]')];
+    return inputs.length === 1 ? inputs[0] : null;
+  })()`;
+}
+
+export function buildAttachmentAcknowledgementExpression(surface, conversationId, expectedNames) {
+  validateSubmissionExpressionInput(surface, conversationId);
   if (!Array.isArray(expectedNames) || !expectedNames.length || expectedNames.some((name) =>
     typeof name !== "string" || !name.trim() || name.length > 255 || /[\u0000-\u001f\u007f]/u.test(name))) {
     throw new Error("attachment acknowledgement names are invalid");
   }
+  const rootSource = buildExactSubmissionRootSource(surface, conversationId);
   return `(() => {
     const expected = ${JSON.stringify(expectedNames)};
-    const input = document.querySelector('input[type="file"]');
+    ${rootSource}
+    const resolved = resolveExactOwner(false);
+    if (!resolved.ok) return false;
+    const inputs = [...resolved.root.querySelectorAll('input[type="file"]')];
+    if (inputs.length !== 1) return false;
+    const input = inputs[0];
     const selected = input ? [...input.files].map((file) => file.name) : [];
-    const body = document.body.innerText || '';
-    const renderedLabels = [...document.querySelectorAll('[aria-label], [title], img[alt]')]
+    const attachmentSemantic = /attachment|attached|file|upload|image|picture|图片|附件|文件|上传|图像/iu;
+    const renderedLabels = [...resolved.root.querySelectorAll('[aria-label], [title], img[alt], [data-testid]')]
+      .filter(visible)
+      .filter((node) => {
+        const tagName = (node.tagName || '').toLowerCase();
+        const dataTestId = node.getAttribute('data-testid') || '';
+        const label = [
+          node.getAttribute('aria-label') || '',
+          node.getAttribute('title') || '',
+          tagName === 'img' ? node.getAttribute('alt') || '' : '',
+        ].join(' ');
+        return tagName === 'img' && Boolean(node.getAttribute('alt')) ||
+          attachmentSemantic.test(label) ||
+          /attachment|attached|file|upload/iu.test(dataTestId);
+      })
       .flatMap((node) => [
         node.getAttribute('aria-label') || '',
         node.getAttribute('title') || '',
         node.getAttribute('alt') || '',
+        node.getAttribute('data-testid') || '',
       ]);
-    return expected.every((name) => selected.includes(name) || body.includes(name) ||
+    return expected.every((name) => selected.includes(name) ||
       renderedLabels.some((label) => label.includes(name)));
   })()`;
 }
@@ -1356,7 +1832,7 @@ function buildHistoryDeleteConfirmExpression() {
 }
 
 export function buildBlobImageDataExpression(source) {
-  if (typeof source !== "string" || !/^blob:app:\/\/-\/[A-Za-z0-9._-]{1,200}$/.test(source)) {
+  if (!isStrictAppBlobSource(source)) {
     throw new Error("Rendered blob image URL is invalid");
   }
   return `(() => {
@@ -1364,7 +1840,8 @@ export function buildBlobImageDataExpression(source) {
     const image = [...document.images]
       .find((node) => (node.currentSrc || node.src || '') === source);
     if (!image || !image.complete || image.naturalWidth < 1 || image.naturalHeight < 1 ||
-        image.naturalWidth * image.naturalHeight > 40000000) {
+        image.naturalWidth > ${IMAGE_LIMITS.maxDimension} || image.naturalHeight > ${IMAGE_LIMITS.maxDimension} ||
+        image.naturalWidth * image.naturalHeight > ${IMAGE_LIMITS.maxPixels}) {
       throw new Error('Rendered blob image is unavailable or invalid');
     }
     const canvas = document.createElement('canvas');
@@ -1374,18 +1851,18 @@ export function buildBlobImageDataExpression(source) {
     if (!context) throw new Error('Rendered blob image canvas is unavailable');
     context.drawImage(image, 0, 0);
     const dataUrl = canvas.toDataURL('image/png');
-    if (!dataUrl.startsWith('data:image/png;base64,') || dataUrl.length > 41943040) {
+    if (!dataUrl.startsWith(${JSON.stringify(PNG_DATA_PREFIX)}) || dataUrl.length > ${MAX_RENDERED_DATA_URL_LENGTH}) {
       throw new Error('Rendered blob image export is invalid');
     }
     return dataUrl;
   })()`;
 }
 
-export function buildBlobImageChunkExpression(source, offset, chunkSize = 1024 * 1024) {
-  if (typeof source !== "string" || !/^blob:app:\/\/-\/[A-Za-z0-9._-]{1,200}$/.test(source)) {
+export function buildBlobImageChunkExpression(source, offset, chunkSize = MAX_BLOB_CHUNK_SIZE) {
+  if (!isStrictAppBlobSource(source)) {
     throw new Error("Rendered blob image URL is invalid");
   }
-  if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > 4 * 1024 * 1024) {
+  if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > MAX_BLOB_CHUNK_SIZE) {
     throw new Error("Rendered blob image chunk offset or size is invalid");
   }
   return `(() => {
@@ -1395,7 +1872,8 @@ export function buildBlobImageChunkExpression(source, offset, chunkSize = 1024 *
     const image = [...document.images]
       .find((node) => (node.currentSrc || node.src || '') === source);
     if (!image || !image.complete || image.naturalWidth < 1 || image.naturalHeight < 1 ||
-        image.naturalWidth * image.naturalHeight > 40000000) {
+        image.naturalWidth > ${IMAGE_LIMITS.maxDimension} || image.naturalHeight > ${IMAGE_LIMITS.maxDimension} ||
+        image.naturalWidth * image.naturalHeight > ${IMAGE_LIMITS.maxPixels}) {
       throw new Error('Rendered blob image is unavailable or invalid');
     }
     const canvas = document.createElement('canvas');
@@ -1405,7 +1883,7 @@ export function buildBlobImageChunkExpression(source, offset, chunkSize = 1024 *
     if (!context) throw new Error('Rendered blob image canvas is unavailable');
     context.drawImage(image, 0, 0);
     const dataUrl = canvas.toDataURL('image/png');
-    if (!dataUrl.startsWith('data:image/png;base64,') || dataUrl.length > 41943040 || offset >= dataUrl.length) {
+    if (!dataUrl.startsWith(${JSON.stringify(PNG_DATA_PREFIX)}) || dataUrl.length > ${MAX_RENDERED_DATA_URL_LENGTH} || offset >= dataUrl.length) {
       throw new Error('Rendered blob image export is invalid');
     }
     const nextOffset = Math.min(offset + chunkSize, dataUrl.length);
@@ -1434,31 +1912,73 @@ export function classifyJobObservation(observation) {
   return "complete";
 }
 
-async function materializeRenderedImages(session, images) {
+function reportedImageDimensions(width, height) {
+  if (Number.isInteger(width) && Number.isInteger(height) && width >= 0 && height >= 0 &&
+      width <= IMAGE_LIMITS.maxDimension && height <= IMAGE_LIMITS.maxDimension &&
+      width * height <= IMAGE_LIMITS.maxPixels) {
+    return { width, height };
+  }
+  return { width: 0, height: 0 };
+}
+
+function consumeRenderedImageBudget(budget, dataUrlLength, decodedBytes) {
+  if (!Number.isInteger(dataUrlLength) || !Number.isInteger(decodedBytes) ||
+      budget.dataUrlLength + dataUrlLength > IMAGE_LIMITS.maxAggregateDataUrlLength ||
+      budget.decodedBytes + decodedBytes > IMAGE_LIMITS.maxAggregateBytes) {
+    throw new Error("rendered image aggregate safety budget exceeded");
+  }
+  budget.dataUrlLength += dataUrlLength;
+  budget.decodedBytes += decodedBytes;
+}
+
+export async function materializeRenderedImages(session, images) {
+  if (!Array.isArray(images) || images.length > IMAGE_LIMITS.maxImages) {
+    throw new Error("rendered image count exceeds the safety limit");
+  }
+  const budget = { dataUrlLength: 0, decodedBytes: 0 };
   const materialized = [];
   for (const image of images) {
-    if (typeof image?.src === "string" && image.src.startsWith("blob:")) {
+    if (isStrictAppBlobSource(image?.src)) {
       const chunks = [];
       let offset = 0;
       let total = null;
-      for (let index = 0; index < 64; index += 1) {
+      let received = 0;
+      let completed = false;
+      const maxChunks = Math.ceil(MAX_RENDERED_DATA_URL_LENGTH / MAX_BLOB_CHUNK_SIZE);
+      for (let index = 0; index < maxChunks; index += 1) {
         const part = await session.evaluate(buildBlobImageChunkExpression(image.src, offset), false, 60000);
         if (!isPlainObject(part) || typeof part.chunk !== "string" || part.offset !== offset ||
             !Number.isInteger(part.nextOffset) || part.nextOffset <= offset ||
-            !Number.isInteger(part.total) || part.total < part.nextOffset || typeof part.done !== "boolean") {
+            !Number.isInteger(part.total) || part.total < part.nextOffset ||
+            (total !== null && part.total !== total) ||
+            part.total > MAX_RENDERED_DATA_URL_LENGTH ||
+            part.nextOffset - part.offset !== part.chunk.length ||
+            part.chunk.length < 1 || part.chunk.length > MAX_BLOB_CHUNK_SIZE ||
+            received + part.chunk.length > MAX_RENDERED_DATA_URL_LENGTH ||
+            typeof part.done !== "boolean" || part.done !== (part.nextOffset === part.total)) {
           throw new Error("Rendered blob image chunk is invalid");
         }
         chunks.push(part.chunk);
+        received += part.chunk.length;
         total = part.total;
-        if (part.done) break;
+        if (part.done) {
+          completed = true;
+          break;
+        }
         offset = part.nextOffset;
       }
       const dataUrl = chunks.join("");
-      if (!total || dataUrl.length !== total || !dataUrl.startsWith("data:image/png;base64,")) {
+      if (!completed || !total || dataUrl.length !== total || !dataUrl.startsWith(PNG_DATA_PREFIX)) {
         throw new Error("Rendered blob image chunks are incomplete");
       }
-      materialized.push({ ...image, src: dataUrl });
+      const inspected = parseStrictImageDataUrl(dataUrl);
+      consumeRenderedImageBudget(budget, dataUrl.length, inspected.bytes.length);
+      materialized.push({ ...image, src: dataUrl, [MATERIALIZED_APP_BLOB]: true });
     } else {
+      if (typeof image?.src === "string" && image.src.startsWith("data:")) {
+        const inspected = parseStrictImageDataUrl(image.src);
+        consumeRenderedImageBudget(budget, image.src.length, inspected.bytes.length);
+      }
       materialized.push(image);
     }
   }
@@ -1467,19 +1987,40 @@ async function materializeRenderedImages(session, images) {
 
 function normalizeImage(image) {
   if (!isPlainObject(image) || typeof image.src !== "string") return null;
-  let safe = false;
+  let data = null;
+  let url = null;
   try {
-    const url = new URL(image.src);
-    safe = url.protocol === "https:" || url.protocol === "http:" ||
-      (url.protocol === "data:" && /^data:image\/(?:png|jpeg|webp);base64,/i.test(image.src));
+    if (image.src.startsWith("data:")) data = parseStrictImageDataUrl(image.src);
+    else url = new URL(image.src);
   } catch {
-    safe = false;
+    return null;
   }
-  if (!safe) return null;
-  const width = Number.isFinite(image.width) && image.width >= 0 ? Number(image.width) : 0;
-  const height = Number.isFinite(image.height) && image.height >= 0 ? Number(image.height) : 0;
+  const remote = url && isMetadataOnlyImageSource(image.src);
+  if (!data && !remote) return null;
+  const dimensions = data ? data : reportedImageDimensions(image.width, image.height);
   const alt = typeof image.alt === "string" ? image.alt.slice(0, 500) : "";
-  return Object.freeze({ src: image.src, width, height, alt });
+  const normalized = { src: image.src, width: dimensions.width, height: dimensions.height, alt };
+  if (data && image[MATERIALIZED_APP_BLOB] === true) {
+    Object.defineProperty(normalized, MATERIALIZED_APP_BLOB, { value: true, enumerable: false });
+  }
+  return Object.freeze(normalized);
+}
+
+function remoteImageMetadata(image) {
+  if (!isPlainObject(image) || typeof image.src !== "string") return null;
+  let url;
+  try {
+    url = new URL(image.src);
+  } catch {
+    return null;
+  }
+  if (!isMetadataOnlyImageSource(image.src) || !url.protocol) return null;
+  const dimensions = reportedImageDimensions(image.width, image.height);
+  return Object.freeze({
+    width: dimensions.width,
+    height: dimensions.height,
+    alt: typeof image.alt === "string" ? image.alt.slice(0, 500) : "",
+  });
 }
 
 export function normalizeCollectedResult(value) {
@@ -1505,25 +2046,37 @@ export function normalizeCollectedResult(value) {
 
 export function summarizeCollectedImages(images) {
   if (!Array.isArray(images)) throw new Error("collected image list is invalid");
-  return images.map((image) => ({
-    sourceType: typeof image?.src === "string" && image.src.startsWith("data:image/") ?
-      "materialized-app-blob" : "remote-image",
-    width: Number(image?.width) || 0,
-    height: Number(image?.height) || 0,
-    alt: typeof image?.alt === "string" ? image.alt : "",
-  }));
+  return images.map((image) => {
+    const remote = isMetadataOnlyImageSource(image?.src);
+    const dimensions = reportedImageDimensions(image?.width, image?.height);
+    return {
+      sourceType: remote ? "remote-image" : image?.[MATERIALIZED_APP_BLOB] === true ?
+        "materialized-app-blob" : "renderer-data-url",
+      materializationStatus: remote ? "metadata-only" : "materialized",
+      width: dimensions.width,
+      height: dimensions.height,
+      alt: typeof image?.alt === "string" ? image.alt : "",
+    };
+  });
 }
 
-export function buildJobRouting(selectedSurface, fallbackReason = null) {
+export function buildJobRouting(
+  selectedSurface,
+  fallbackReason = null,
+  requestedSurface = "chatgpt-quick-chat",
+) {
   if (!['chatgpt-quick-chat', 'chatgpt-main-chat'].includes(selectedSurface)) {
     throw new Error("selected bridge surface is invalid");
+  }
+  if (!['chatgpt-quick-chat', 'chatgpt-main-chat'].includes(requestedSurface)) {
+    throw new Error("requested bridge surface is invalid");
   }
   if (fallbackReason !== null &&
       (typeof fallbackReason !== "string" || !fallbackReason.trim())) {
     throw new Error("bridge fallback reason is invalid");
   }
   return Object.freeze({
-    requestedSurface: "chatgpt-quick-chat",
+    requestedSurface,
     selectedSurface,
     fallbackReason,
   });
@@ -1537,6 +2090,14 @@ export function summarizeBatchSurface(jobs) {
   if (surfaces.size === 1) return [...surfaces][0];
   if (surfaces.size > 1) return "mixed";
   return "unknown";
+}
+
+export function summarizeBatchError(runError, jobs) {
+  if (!Array.isArray(jobs)) throw new Error("bridge job list is invalid");
+  const jobErrors = jobs
+    .filter((job) => job?.status !== "complete")
+    .map((job) => `${job.id}: ${job.status}${job.error ? ` (${job.error})` : ""}`);
+  return [...new Set([runError, ...jobErrors].filter((value) => typeof value === "string" && value.trim()))].join("; ") || null;
 }
 
 export function isNativeQuickChatFallbackError(error) {
@@ -1562,6 +2123,19 @@ async function readStrictJson(file) {
   return JSON.parse(source);
 }
 
+async function assertNoRunningBatchProgress(progressPath) {
+  try {
+    const progress = await readStrictJson(progressPath);
+    if (progress?.state === "running") {
+      throw new Error(`batch progress is already running: ${progress.runId || "unknown run"}`);
+    }
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    if (error instanceof SyntaxError) throw new Error(`batch progress is invalid: ${progressPath}`);
+    throw error;
+  }
+}
+
 async function fetchCdpJson(port, resource) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 2500);
@@ -1581,8 +2155,7 @@ async function verifyWindowsIdentity(state) {
   if (process.platform !== "win32") throw new Error("ChatGPT bridge is Windows-only");
   const script = `
 $port = [int]$env:CODEX_BRIDGE_PORT
-$packageFullName = $env:CODEX_BRIDGE_PACKAGE_FULL_NAME
-$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction Stop | ForEach-Object {
+$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | ForEach-Object {
   $process = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$_.OwningProcess)" -ErrorAction Stop
   [pscustomobject]@{
     localAddress = "$($_.LocalAddress)"
@@ -1592,9 +2165,10 @@ $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction 
   }
 })
 $package = Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction Stop |
-  Where-Object { "$($_.PackageFullName)" -ceq "$packageFullName" } |
+  Where-Object { "$($_.SignatureKind)" -ieq 'Store' -and -not [bool]$_.IsDevelopmentMode } |
+  Sort-Object Version -Descending |
   Select-Object -First 1
-if ($null -eq $package) { throw 'Registered OpenAI.Codex package was not found.' }
+if ($null -eq $package) { throw 'Registered Store OpenAI.Codex package was not found.' }
 [pscustomobject]@{
   listeners = $listeners
   package = [pscustomobject]@{
@@ -1602,6 +2176,7 @@ if ($null -eq $package) { throw 'Registered OpenAI.Codex package was not found.'
     packageFamilyName = "$($package.PackageFamilyName)"
     packageFullName = "$($package.PackageFullName)"
     signatureKind = "$($package.SignatureKind)"
+    version = "$($package.Version)"
   }
 } | ConvertTo-Json -Depth 6 -Compress
 `;
@@ -1621,7 +2196,7 @@ if ($null -eq $package) { throw 'Registered OpenAI.Codex package was not found.'
     },
   });
   const report = JSON.parse(stdout.trim());
-  const listeners = Array.isArray(report.listeners) ? report.listeners : [report.listeners].filter(Boolean);
+  const listeners = classifyWindowsIdentityReport(state, report);
   if (!listeners.length) throw new Error("Saved CDP port has no listener");
   for (const listener of listeners) {
     const address = String(listener.localAddress || "").toLowerCase();
@@ -1631,16 +2206,11 @@ if ($null -eq $package) { throw 'Registered OpenAI.Codex package was not found.'
         executable.toLowerCase() !== path.win32.normalize(state.codexExe).toLowerCase() ||
         !new RegExp(`(?:^|\\s)--remote-debugging-port(?:=|\\s+)${state.port}(?:$|\\s)`, "i").test(commandLine) ||
         !/(?:^|\s)--remote-debugging-address(?:=|\s+)127\.0\.0\.1(?:$|\s)/i.test(commandLine)) {
-      throw new Error("Saved CDP listener is not owned by the verified Codex process");
+      throw bridgeDiagnosticError(
+        "codex-process-identity-mismatch",
+        "Saved CDP listener is not owned by the verified Codex process",
+      );
     }
-  }
-  const registered = report.package;
-  if (!registered || registered.packageFullName !== state.codexPackageFullName ||
-      registered.packageFamilyName !== state.codexPackageFamilyName ||
-      path.win32.normalize(registered.installLocation).toLowerCase() !==
-        path.win32.normalize(state.codexPackageRoot).toLowerCase() ||
-      registered.signatureKind !== "Store") {
-    throw new Error("Saved Codex package identity no longer matches the registered Store package");
   }
   return Object.freeze({ listenerCount: listeners.length, processId: listeners[0].processId });
 }
@@ -1719,6 +2289,20 @@ class CdpSession {
     return response.result?.value;
   }
 
+  async evaluateRemoteObject(expression, userGesture = false, timeoutMs = 10000) {
+    const response = await this.send("Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: false,
+      userGesture,
+    }, timeoutMs);
+    if (response.exceptionDetails) {
+      const detail = response.exceptionDetails.exception?.description || response.exceptionDetails.text;
+      throw new Error(`Renderer evaluation failed: ${detail}`);
+    }
+    return response.result;
+  }
+
   async evaluateDetached(expression, userGesture = false, timeoutMs = 10000) {
     const response = await this.send(
       "Runtime.evaluate",
@@ -1788,6 +2372,40 @@ export function annotateBridgeStageError(stage, error) {
 async function evaluateAtStage(session, expression, stage, userGesture = false, timeoutMs = 10000) {
   try {
     return await session.evaluate(expression, userGesture, timeoutMs);
+  } catch (error) {
+    throw annotateBridgeStageError(stage, error);
+  }
+}
+
+async function testOnlyP08Discovery(options) {
+  if (process.env.CODEX_BRIDGE_P08_TEST_MODE !== "1" ||
+      process.env.CODEX_BRIDGE_P08_TEST_ENVIRONMENT !== "black-box") return null;
+  const fixturePath = process.env.CODEX_BRIDGE_P08_DISCOVERY_PATH;
+  if (typeof fixturePath !== "string" || !path.win32.isAbsolute(fixturePath)) {
+    throw new Error("P0.8 test discovery fixture path must be absolute");
+  }
+  const fixture = await readStrictJson(fixturePath);
+  assertKnownFields(fixture, new Set([
+    "statePath", "discoveryCountPath", "state", "identity", "version", "target",
+  ]), "P0.8 test discovery fixture");
+  const countPath = requireAbsolute(fixture.discoveryCountPath, "P0.8 discovery count path");
+  const count = Number.parseInt((await fs.readFile(countPath, "utf8")).trim(), 10);
+  if (!Number.isSafeInteger(count) || count < 0 || count >= 100) {
+    throw new Error("P0.8 discovery count is invalid");
+  }
+  await fs.writeFile(countPath, `${count + 1}\n`, { encoding: "utf8", flag: "w" });
+  return Object.freeze({
+    statePath: options.statePath || requireAbsolute(fixture.statePath, "P0.8 fixture state path"),
+    state: validateBridgeState(fixture.state),
+    identity: fixture.identity,
+    version: fixture.version,
+    target: fixture.target,
+  });
+}
+
+async function evaluateRemoteObjectAtStage(session, expression, stage, userGesture = false, timeoutMs = 10000) {
+  try {
+    return await session.evaluateRemoteObject(expression, userGesture, timeoutMs);
   } catch (error) {
     throw annotateBridgeStageError(stage, error);
   }
@@ -1953,7 +2571,12 @@ async function openNativeQuickChat(discovery, conversationId, index, {
         buildComposerAvailabilityExpression(requireBlank),
         "composer-readiness",
       );
-      return ready ? { url, conversationId, surface: "chatgpt-quick-chat" } : null;
+      return ready ? {
+        url,
+        conversationId,
+        surface: "chatgpt-quick-chat",
+        exactRouteVerified: requireExpectedRoute,
+      } : null;
     }, 30000, requireBlank ? "native blank ChatGPT conversation" : "native ChatGPT conversation");
     return { session, prepared };
   } catch (error) {
@@ -2003,12 +2626,28 @@ async function openMainChatSubmittedConversation(discovery, conversationId, mark
   session.ownsWindow = false;
   try {
     await evaluateAtStage(session, buildMainChatEntryExpression(), "main-chat-recovery-entry-open", true);
-    await waitFor(async () => {
-      const identity = await session.evaluate(buildMainChatConversationIdExpression());
-      if (identity !== conversationId) return null;
-      const snapshot = await session.evaluate(buildConversationSnapshotExpression(marker, "main-chat"));
-      return snapshot?.markerPresent ? snapshot : null;
-    }, 30000, "main ChatGPT submitted marker");
+    let directError = null;
+    try {
+      await waitFor(async () => {
+        const identity = await session.evaluate(buildMainChatConversationIdExpression());
+        if (identity !== conversationId) return null;
+        const snapshot = await session.evaluate(buildConversationSnapshotExpression(
+          marker,
+          conversationId,
+          "main-chat",
+        ));
+        return snapshot?.markerPresent ? snapshot : null;
+      }, 15000, "main ChatGPT submitted marker");
+    } catch (error) {
+      directError = error;
+    }
+    if (directError) {
+      await discoverHistoryConversation(session, {
+        id: "main-recovery",
+        conversationId,
+        marker,
+      }, "main-chat");
+    }
     return {
       session,
       prepared: {
@@ -2023,7 +2662,7 @@ async function openMainChatSubmittedConversation(discovery, conversationId, mark
   }
 }
 
-async function selectHistoryConversation(session, job) {
+async function selectHistoryConversation(session, job, surface = "quick-chat") {
   await waitFor(async () => session.evaluate(`(() => [...document.querySelectorAll('button')]
     .some((button) => button.getAttribute('aria-label') === ${JSON.stringify(job.title)}))()`),
   10000, `ChatGPT history title for ${job.id}`);
@@ -2036,12 +2675,20 @@ async function selectHistoryConversation(session, job) {
   })()`, true);
   if (!clicked) throw new Error(`ChatGPT history title did not open for ${job.id}`);
   return waitFor(async () => {
-    const snapshot = await session.evaluate(buildConversationSnapshotExpression(job.marker));
+    if (surface === "main-chat") {
+      const identity = await session.evaluate(buildMainChatConversationIdExpression());
+      if (identity !== job.conversationId) return null;
+    }
+    const snapshot = await session.evaluate(buildConversationSnapshotExpression(
+      job.marker,
+      job.conversationId,
+      surface,
+    ));
     return snapshot?.markerPresent ? snapshot : null;
   }, 20000, `ChatGPT history marker for ${job.id}`);
 }
 
-async function discoverHistoryConversation(session, job) {
+async function discoverHistoryConversation(session, job, surface = "quick-chat") {
   const titles = await evaluateAtStage(session, buildHistoryTitleListExpression(), "history-title-list");
   if (!Array.isArray(titles) || titles.some((title) => typeof title !== "string")) {
     throw new Error(`ChatGPT history title list is invalid for ${job.id}`);
@@ -2056,12 +2703,27 @@ async function discoverHistoryConversation(session, job) {
     })()`, `history-row-open:${title}`, true);
     if (!clicked) continue;
     try {
-      const found = await waitFor(async () => evaluateAtStage(
-        session,
-        buildMarkerPresenceExpression(job.marker),
-        `history-marker-scan:${title}`,
-      ),
-        3000, `ChatGPT history marker scan for ${job.id}`);
+      const found = await waitFor(async () => {
+        if (surface === "main-chat") {
+          const identity = await evaluateAtStage(
+            session,
+            buildMainChatConversationIdExpression(),
+            `history-conversation-identity:${title}`,
+          );
+          if (identity !== job.conversationId) return null;
+          const snapshot = await evaluateAtStage(
+            session,
+            buildConversationSnapshotExpression(job.marker, job.conversationId, "main-chat"),
+            `history-marker-scan:${title}`,
+          );
+          return snapshot?.markerPresent ? snapshot : null;
+        }
+        return evaluateAtStage(
+          session,
+          buildMarkerPresenceExpression(job.marker),
+          `history-marker-scan:${title}`,
+        );
+      }, 3000, `ChatGPT history marker scan for ${job.id}`);
       if (found) return title;
     } catch {}
   }
@@ -2083,62 +2745,379 @@ async function verifyJobReferences(job) {
   }
 }
 
-async function attachJobReferences(session, job) {
+export async function requestExactAttachmentInputNode(session, prepared) {
+  validatePreparedSubmission(prepared);
+  const remote = await evaluateRemoteObjectAtStage(
+    session,
+    buildAttachmentInputExpression(prepared.surface, prepared.conversationId),
+    "attachment-file-input-resolve",
+  );
+  const objectId = remote?.objectId;
+  if (typeof objectId !== "string" || !objectId) {
+    throw new Error("exact ChatGPT attachment file input was not resolved");
+  }
+  let requestError = null;
+  try {
+    const requested = await session.send("DOM.requestNode", { objectId });
+    if (!requested?.nodeId) throw new Error("exact ChatGPT attachment file input node is unavailable");
+    return requested.nodeId;
+  } catch (error) {
+    requestError = error;
+    throw error;
+  } finally {
+    try {
+      await session.send("Runtime.releaseObject", { objectId });
+    } catch (releaseError) {
+      if (!requestError) throw annotateBridgeStageError("attachment-file-input-release", releaseError);
+    }
+  }
+}
+
+function checkpointAuditEntries(checkpointPath) {
+  const lockPath = checkpointLockPath(checkpointPath);
+  return [
+    { role: "watch.checkpoint", path: checkpointPath, allowMissing: true },
+    { role: "watch.checkpoint-lock", path: lockPath, allowMissing: true },
+    { role: "watch.checkpoint-lock-owner", path: path.win32.join(lockPath, "owner.json"), allowMissing: true },
+  ];
+}
+
+function commandPathEntries(options, statePath) {
+  const entries = [
+    { role: "bridge.state", path: statePath, allowMissing: false },
+  ];
+  if (["plan", "batch", "resume", "watch", "approve", "cleanup"].includes(options.command)) {
+    entries.push({
+      role: options.command === "cleanup" ? "cleanup.ledger-input" : "command.input",
+      path: options.input,
+      allowMissing: false,
+    });
+    entries.push({ role: "command.output", path: options.output, allowMissing: true });
+  }
+  if (["plan", "batch", "resume", "approve", "cleanup"].includes(options.command)) {
+    entries.push({
+      role: "bridge.controller-lock",
+      path: bridgeControllerLockPath(statePath),
+      allowMissing: true,
+    });
+  }
+  if (["plan", "batch"].includes(options.command)) {
+    entries.push({
+      role: "bridge.capability-cache",
+      path: bridgeCapabilityCachePath(statePath),
+      allowMissing: true,
+    });
+  }
+  if (options.command === "batch") {
+    entries.push({ role: "batch.progress", path: batchProgressPath(options.output), allowMissing: true });
+  }
+  return entries;
+}
+
+function addBatchPathEntries(entries, batch) {
+  if (batch.schemaVersion !== 2) return;
+  entries.push({ role: "generation.lifecycle-ledger", path: batch.lifecycleLedgerPath, allowMissing: true });
+  for (const job of batch.jobs) {
+    for (let index = 0; index < (job.references || []).length; index += 1) {
+      entries.push({
+        role: `batch.job.${job.id}.reference.${index}`,
+        path: job.references[index].path,
+        allowMissing: false,
+      });
+    }
+  }
+}
+
+function addResumePathEntries(entries, manifest) {
+  if (manifest.lifecycleLedgerPath) {
+    entries.push({ role: "resume.lifecycle-ledger", path: manifest.lifecycleLedgerPath, allowMissing: true });
+  }
+}
+
+function addCleanupPathEntries(entries, cleanupManifest) {
+  for (const job of cleanupManifest.jobs) {
+    for (let index = 0; index < job.artifacts.length; index += 1) {
+      entries.push({
+        role: `cleanup.job.${job.id}.artifact.${index}`,
+        path: job.artifacts[index].path,
+        allowMissing: false,
+      });
+    }
+  }
+}
+
+export async function prepareBridgeCommand(options) {
+  if (!isPlainObject(options) || typeof options.command !== "string") {
+    throw new Error("bridge command options are invalid");
+  }
+  const statePath = options.statePath || defaultStatePath;
+  const entries = commandPathEntries(options, statePath);
+  let manifest = null;
+  let ledger = null;
+  let lifecycleLedger = null;
+  let cleanupManifest = null;
+  if (options.command === "plan" || options.command === "batch") {
+    manifest = validateBridgeBatch(await readStrictJson(options.input));
+    addBatchPathEntries(entries, manifest);
+  } else if (options.command === "resume") {
+    manifest = validateResumeManifest(await readStrictJson(options.input));
+    addResumePathEntries(entries, manifest);
+  } else if (options.command === "watch") {
+    manifest = validateHandoffWatchManifest(await readStrictJson(options.input));
+    entries.push(...checkpointAuditEntries(manifest.checkpointPath));
+  } else if (options.command === "approve") {
+    manifest = validateHandoffApprovalManifest(await readStrictJson(options.input));
+  } else if (options.command === "cleanup") {
+    ledger = validateConversationLifecycleLedger(await readStrictJson(options.input));
+    const selected = selectCleanupCandidates(ledger, new Date());
+    cleanupManifest = validateCleanupManifest({
+      schemaVersion: 1,
+      jobs: selected.map((entry) => ({
+        id: entry.jobId,
+        conversationId: entry.conversationId,
+        marker: entry.marker,
+        title: entry.historyTitle,
+        artifacts: entry.artifacts,
+      })),
+    });
+    addCleanupPathEntries(entries, cleanupManifest);
+  }
+  const pathAudit = await auditPathSet(entries);
+  if ((options.command === "plan" || options.command === "batch" || options.command === "resume") &&
+      manifest?.lifecycleLedgerPath) {
+    lifecycleLedger = await readLifecycleLedgerOrEmpty(manifest.lifecycleLedgerPath);
+  }
+  if (manifest?.schemaVersion === 2 && ["plan", "batch"].includes(options.command)) {
+    await Promise.all(manifest.jobs.map((job) => verifyJobReferences(job)));
+  }
+  return Object.freeze({
+    options,
+    statePath,
+    manifest,
+    ledger,
+    lifecycleLedger,
+    cleanupManifest,
+    pathAudit,
+  });
+}
+
+async function attachJobReferences(session, prepared, job) {
+  validatePreparedSubmission(prepared);
   if (!job.references?.length) return;
   await verifyJobReferences(job);
-  await session.evaluate(buildAttachmentButtonExpression(), true);
-  await waitFor(async () => session.evaluate("Boolean(document.querySelector('input[type=\"file\"]'))"),
-    5000, `attachment input for ${job.id}`);
-  const documentNode = await session.send("DOM.getDocument", { depth: 1, pierce: true });
-  const selected = await session.send("DOM.querySelector", {
-    nodeId: documentNode.root.nodeId,
-    selector: "input[type=file]",
-  });
-  if (!selected?.nodeId) throw new Error(`attachment input node is unavailable for ${job.id}`);
+  const buttonState = await session.evaluate(buildAttachmentButtonExpression(
+    prepared.surface,
+    prepared.conversationId,
+  ), true);
+  if (buttonState?.reason === "file-input-count") {
+    throw new Error(`ChatGPT attachment input count is ambiguous for ${job.id}: ${buttonState.inputCount}`);
+  }
+  if (!buttonState?.inputPresent && !buttonState?.clicked) {
+    throw new Error(`ChatGPT attachment control was not uniquely resolved for ${job.id}: ${buttonState?.reason || "unknown"}`);
+  }
+  const inputState = await waitFor(async () => {
+    const state = await session.evaluate(buildAttachmentInputStateExpression(
+      prepared.surface,
+      prepared.conversationId,
+    ));
+    if (state?.inputCount > 1) {
+      return { fatal: true, reason: "file-input-count", inputCount: state.inputCount };
+    }
+    return state?.inputPresent ? state : null;
+  }, 5000, `attachment input for ${job.id}`);
+  if (inputState?.fatal) {
+    throw new Error(`ChatGPT attachment input count is ambiguous for ${job.id}: ${inputState.inputCount}`);
+  }
+  const nodeId = await requestExactAttachmentInputNode(session, prepared);
   await session.send("DOM.setFileInputFiles", {
-    nodeId: selected.nodeId,
+    nodeId,
     files: job.references.map((reference) => reference.path),
   });
   const expectedNames = job.references.map((reference) => path.basename(reference.path));
-  await waitFor(async () => session.evaluate(buildAttachmentAcknowledgementExpression(expectedNames)),
+  await waitFor(async () => session.evaluate(buildAttachmentAcknowledgementExpression(
+    prepared.surface,
+    prepared.conversationId,
+    expectedNames,
+  )),
     15000, `reference attachment acknowledgement for ${job.id}`);
 }
 
+export { attachJobReferences };
+
+function validatePreparedSubmission(prepared) {
+  if (!isPlainObject(prepared)) throw new Error("prepared submission is invalid");
+  validateSubmissionExpressionInput(prepared.surface, prepared.conversationId);
+  if (prepared.surface === "chatgpt-quick-chat" && prepared.exactRouteVerified !== true) {
+    throw new Error("quick-chat submission route was not exactly verified");
+  }
+  return prepared;
+}
+
+export async function attemptExactSendClick(
+  session,
+  prepared,
+  marker,
+  now = () => new Date().toISOString(),
+) {
+  validatePreparedSubmission(prepared);
+  const expression = buildSendClickExpression(
+    prepared.surface,
+    prepared.conversationId,
+    marker,
+  );
+  const attemptedAt = now();
+  if (typeof attemptedAt !== "string" || !attemptedAt) {
+    throw new Error("submission attempt timestamp is invalid");
+  }
+  const identity = {
+    attemptedAt,
+    expectedConversationId: prepared.conversationId,
+    expectedSurface: prepared.surface,
+    marker,
+  };
+  try {
+    const result = await session.evaluate(expression, true);
+    if (result?.clicked !== true) {
+      return Object.freeze({
+        ...identity,
+        clicked: false,
+        submittedAt: null,
+        status: "not-submitted",
+        error: `ChatGPT send control rejected submission: ${result?.reason || "clicked-false"}`,
+      });
+    }
+    return Object.freeze({
+      ...identity,
+      clicked: true,
+      submittedAt: attemptedAt,
+      status: "submitted",
+      error: null,
+    });
+  } catch (error) {
+    return Object.freeze({
+      ...identity,
+      clicked: null,
+      submittedAt: attemptedAt,
+      status: "unknown-after-submit",
+      error: `send-click-attempt: ${error.message}`,
+    });
+  }
+}
+
+export async function attemptHandoffApprovalClick(
+  session,
+  prepared,
+  taskId,
+  now = () => new Date().toISOString(),
+) {
+  validatePreparedSubmission(prepared);
+  if (!ID_PATTERN.test(taskId)) throw new Error("handoff approval taskId is invalid");
+  const expression = buildHandoffApprovalSubmitExpression(
+    prepared.surface,
+    prepared.conversationId,
+    taskId,
+  );
+  const attemptedAt = now();
+  if (typeof attemptedAt !== "string" || !attemptedAt) {
+    throw new Error("approval attempt timestamp is invalid");
+  }
+  const identity = {
+    attemptedAt,
+    expectedConversationId: prepared.conversationId,
+    expectedSurface: prepared.surface,
+    taskId,
+  };
+  try {
+    const result = await session.evaluate(expression, true);
+    if (result?.ok !== true || result?.clicked !== true) {
+      return Object.freeze({
+        ...identity,
+        clicked: false,
+        submittedAt: null,
+        status: "not-submitted",
+        error: `ChatGPT approval send control rejected submission: ${result?.reason || "clicked-false"}`,
+      });
+    }
+    return Object.freeze({
+      ...identity,
+      clicked: true,
+      submittedAt: attemptedAt,
+      status: "submitted",
+      error: null,
+    });
+  } catch (error) {
+    return Object.freeze({
+      ...identity,
+      clicked: null,
+      submittedAt: attemptedAt,
+      status: "unknown-after-submit",
+      error: `handoff-approve-send-click: ${error.message}`,
+    });
+  }
+}
+
 async function submitJob(session, prepared, job, runId) {
+  validatePreparedSubmission(prepared);
   const marker = bridgeMarker(runId, job.id);
   const effectivePrompt = `${job.prompt}\n\n任务追踪标记：${marker}。不要在回答中复述该标记。`;
-  await attachJobReferences(session, job);
-  const composerFocused = await session.evaluate(buildComposerFocusExpression(), true);
-  if (!composerFocused) throw new Error("ChatGPT composer is unavailable before submission");
+  await attachJobReferences(session, prepared, job);
+  const composerFocused = await session.evaluate(buildComposerFocusExpression(
+    prepared.surface,
+    prepared.conversationId,
+  ), true);
+  if (!composerFocused?.ok) {
+    throw new Error(
+      `ChatGPT composer is unavailable before submission: ${composerFocused?.reason || "unknown"}`,
+    );
+  }
   await session.send("Input.insertText", { text: effectivePrompt });
-  const ready = await waitFor(async () => session.evaluate(
-    buildComposerReadinessExpression(marker),
-  ), 5000, `composer readiness for ${job.id}`);
+  const ready = await waitFor(async () => {
+    const result = await session.evaluate(buildComposerReadinessExpression(
+      prepared.surface,
+      prepared.conversationId,
+      marker,
+    ));
+    return result?.ok ? result : null;
+  }, 5000, `composer readiness for ${job.id}`);
   if (!ready) throw new Error(`ChatGPT composer did not accept job ${job.id}`);
 
-  const submittedAt = new Date().toISOString();
-  const clicked = await session.evaluate(buildSendClickExpression(), true);
-  if (!clicked) throw new Error(`ChatGPT send control did not submit job ${job.id}`);
-
+  const attempt = await attemptExactSendClick(session, prepared, marker);
   const submission = {
     id: job.id,
     promptHash: createHash("sha256").update(job.prompt, "utf8").digest("hex"),
     marker,
     references: job.references || [],
     conversationId: prepared.conversationId,
+    expectedConversationId: attempt.expectedConversationId,
     url: prepared.url,
-    surface: prepared.surface || "chatgpt-quick-chat",
-    submittedAt,
-    status: "submitted",
+    surface: prepared.surface,
+    attemptedAt: attempt.attemptedAt,
+    submittedAt: attempt.submittedAt,
+    status: attempt.status,
   };
+  if (attempt.status !== "submitted") {
+    return Object.freeze({
+      ...submission,
+      error: attempt.error,
+    });
+  }
   try {
     const acknowledged = await waitFor(async () => {
-      const currentId = submission.surface === "chatgpt-main-chat" ?
-        submission.conversationId : conversationIdFromAppUrl(await currentRendererUrl(session));
+      if (submission.surface === "chatgpt-main-chat") {
+        const lease = await evaluateAtStage(
+          session,
+          buildMainChatSubmissionLeaseExpression(submission.conversationId, marker),
+          "main-chat-submission-acknowledgement",
+        );
+        return lease?.conversationId === prepared.conversationId && lease.snapshot?.markerPresent ?
+          lease.snapshot : null;
+      }
+      const currentId = conversationIdFromAppUrl(await currentRendererUrl(session));
       if (currentId !== prepared.conversationId) return null;
       const snapshot = await session.evaluate(buildConversationSnapshotExpression(
         marker,
-        submission.surface === "chatgpt-main-chat" ? "main-chat" : "quick-chat",
+        prepared.conversationId,
+        "quick-chat",
       ));
       return snapshot?.markerPresent ? snapshot : null;
     }, 10000, `submission acknowledgement for ${job.id}`);
@@ -2156,11 +3135,14 @@ async function submitJob(session, prepared, job, runId) {
 async function navigateToConversation(session, submission) {
   if (submission.surface === "chatgpt-main-chat") {
     return waitFor(async () => {
-      const identity = await session.evaluate(buildMainChatConversationIdExpression());
-      if (identity !== submission.conversationId) return null;
-      const snapshot = await session.evaluate(buildConversationSnapshotExpression(submission.marker, "main-chat"));
-      return snapshot?.markerPresent ? snapshot : null;
-    }, 15000, `main ChatGPT conversation navigation for ${submission.id}`);
+      const lease = await evaluateAtStage(
+        session,
+        buildMainChatSubmissionLeaseExpression(submission.conversationId, submission.marker),
+        "main-chat-post-submit-lease-read",
+      );
+      return lease?.conversationId === submission.conversationId && lease.snapshot?.markerPresent ?
+        lease.snapshot : null;
+    }, 15000, `main-chat-post-submit-lease for ${submission.id}`);
   }
   const currentId = conversationIdFromAppUrl(await currentRendererUrl(session));
   if (currentId !== submission.conversationId) {
@@ -2174,6 +3156,7 @@ async function navigateToConversation(session, submission) {
     if (id !== submission.conversationId) return null;
     const snapshot = await session.evaluate(buildConversationSnapshotExpression(
       submission.marker,
+      submission.conversationId,
       submission.surface === "chatgpt-main-chat" ? "main-chat" : "quick-chat",
     ));
     return snapshot?.markerPresent ? snapshot : null;
@@ -2181,18 +3164,46 @@ async function navigateToConversation(session, submission) {
 }
 
 async function collectJob(session, submission, timeoutMs) {
+  if (submission.surface === "chatgpt-main-chat") {
+    const currentLease = await evaluateAtStage(
+      session,
+      buildMainChatSubmissionLeaseExpression(submission.conversationId, submission.marker),
+      "main-chat-current-submission-lease",
+    );
+    if (currentLease?.conversationId !== submission.conversationId ||
+        !currentLease.snapshot?.markerPresent) {
+      await evaluateAtStage(
+        session,
+        buildMainChatEntryExpression(),
+        "main-chat-collection-entry-open",
+        true,
+      );
+    }
+  }
   await navigateToConversation(session, submission);
   const deadline = Date.now() + timeoutMs;
   let stablePolls = 0;
   let previousSignature = null;
   while (Date.now() < deadline) {
     const currentUrl = await currentRendererUrl(session);
-    const currentConversationId = submission.surface === "chatgpt-main-chat" ?
-      submission.conversationId : conversationIdFromAppUrl(currentUrl);
-    const snapshot = await session.evaluate(buildConversationSnapshotExpression(
-      submission.marker,
-      submission.surface === "chatgpt-main-chat" ? "main-chat" : "quick-chat",
-    ));
+    let currentConversationId;
+    let snapshot;
+    if (submission.surface === "chatgpt-main-chat") {
+      const lease = await evaluateAtStage(
+        session,
+        buildMainChatSubmissionLeaseExpression(submission.conversationId, submission.marker),
+        "main-chat-collection-lease",
+      );
+      currentConversationId = lease?.conversationId || null;
+      snapshot = lease?.snapshot || null;
+    } else {
+      currentConversationId = conversationIdFromAppUrl(currentUrl);
+      snapshot = await session.evaluate(buildConversationSnapshotExpression(
+        submission.marker,
+        submission.conversationId,
+        "quick-chat",
+      ));
+    }
     const signature = JSON.stringify({ text: snapshot?.assistantText || "", images: snapshot?.images || [] });
     stablePolls = signature === previousSignature ? stablePolls + 1 : 0;
     previousSignature = signature;
@@ -2208,7 +3219,10 @@ async function collectJob(session, submission, timeoutMs) {
       stablePolls,
     });
     if (classification === "unknown-after-submit") {
-      return { ...submission, status: classification, completedAt: null, result: null };
+      const error = submission.surface === "chatgpt-main-chat" ?
+        `main-chat-collection-lease-lost for ${submission.id}` :
+        `conversation identity changed during collection for ${submission.id}`;
+      return { ...submission, status: classification, completedAt: null, result: null, error };
     }
     if (classification === "complete") {
       const images = await materializeRenderedImages(session, snapshot.images || []);
@@ -2257,61 +3271,86 @@ async function closeOwnedQuickChat(session) {
   }, 5000, "owned quick-chat target close");
 }
 
-function imageExtension(contentType) {
-  if (/image\/png/i.test(contentType)) return ".png";
-  if (/image\/(?:jpeg|jpg)/i.test(contentType)) return ".jpg";
-  if (/image\/webp/i.test(contentType)) return ".webp";
-  return null;
-}
-
-async function downloadJobImages(job, outputFile) {
+export async function materializeJobImages(job, outputFile) {
   const images = job.result?.images || [];
   if (!images.length) return [];
+  if (!Array.isArray(images) || images.length > IMAGE_LIMITS.maxImages) {
+    throw new Error("job image count exceeds the safety limit");
+  }
   const root = path.join(path.dirname(outputFile), `${path.basename(outputFile, path.extname(outputFile))}.assets`, job.id);
-  await fs.mkdir(root, { recursive: true });
+  let rootCreated = false;
+  let aggregateBytes = 0;
+  let aggregateBudgetExceeded = false;
   const artifacts = [];
   for (let index = 0; index < images.length; index += 1) {
     const image = images[index];
-    try {
-      let bytes;
-      let contentType;
-      if (image.src.startsWith("data:image/")) {
-        const match = image.src.match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/i);
-        if (!match) throw new Error("unsupported data image");
-        contentType = match[1];
-        bytes = Buffer.from(match[2], "base64");
-      } else {
-        const response = await fetch(image.src, { redirect: "follow" });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        contentType = response.headers.get("content-type") || "";
-        bytes = Buffer.from(await response.arrayBuffer());
+    const remote = remoteImageMetadata(image);
+    if (!remote) {
+      if (aggregateBudgetExceeded) {
+        artifacts.push({
+          index,
+          status: "metadata-only",
+          materializationStatus: "metadata-only",
+          sourceType: "unsupported-image",
+          ...reportedImageDimensions(image?.width, image?.height),
+          alt: typeof image?.alt === "string" ? image.alt : "",
+          error: "job image aggregate safety budget exceeded",
+        });
+        continue;
       }
-      const extension = imageExtension(contentType);
-      if (!extension || bytes.length < 100 || bytes.length > 30 * 1024 * 1024) {
-        throw new Error("downloaded image type or size is invalid");
+      try {
+        const inspected = parseStrictImageDataUrl(image?.src);
+        if (aggregateBytes + inspected.bytes.length > IMAGE_LIMITS.maxAggregateBytes) {
+          aggregateBudgetExceeded = true;
+          throw new Error("job image aggregate safety budget exceeded");
+        }
+        aggregateBytes += inspected.bytes.length;
+        if (!rootCreated) {
+          await fs.mkdir(root, { recursive: true });
+          rootCreated = true;
+        }
+        const extension = inspected.mime === "image/png" ? ".png" :
+          inspected.mime === "image/jpeg" ? ".jpg" : ".webp";
+        const file = path.join(root, `image-${index + 1}${extension}`);
+        await fs.writeFile(file, inspected.bytes, { flag: "wx" });
+        artifacts.push({
+          index,
+          status: "downloaded",
+          materializationStatus: "materialized",
+          sourceType: image?.[MATERIALIZED_APP_BLOB] === true ?
+            "materialized-app-blob" : "renderer-data-url",
+          path: file,
+          sha256: createHash("sha256").update(inspected.bytes).digest("hex"),
+          bytes: inspected.bytes.length,
+          contentType: inspected.mime,
+          width: inspected.width,
+          height: inspected.height,
+        });
+      } catch (error) {
+        artifacts.push({
+          index,
+          status: "metadata-only",
+          materializationStatus: "metadata-only",
+          sourceType: "unsupported-image",
+          ...reportedImageDimensions(image?.width, image?.height),
+          alt: typeof image?.alt === "string" ? image.alt : "",
+          error: error.message,
+        });
       }
-      const file = path.join(root, `image-${index + 1}${extension}`);
-      await fs.writeFile(file, bytes, { flag: "wx" });
-      artifacts.push({
-        index,
-        status: "downloaded",
-        path: file,
-        sha256: createHash("sha256").update(bytes).digest("hex"),
-        bytes: bytes.length,
-        contentType,
-      });
-    } catch (error) {
-      artifacts.push({ index, status: "metadata-only", error: error.message });
+      continue;
     }
+    artifacts.push({
+      index,
+      status: "metadata-only",
+      materializationStatus: "metadata-only",
+      sourceType: "remote-image",
+      width: remote.width,
+      height: remote.height,
+      alt: remote.alt,
+      error: "remote image materialization is disabled; renderer-provided data is required",
+    });
   }
   return artifacts;
-}
-
-async function writeJsonAtomically(file, value) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await fs.rename(temporary, file);
 }
 
 async function readLifecycleLedgerOrEmpty(file) {
@@ -2325,44 +3364,26 @@ async function readLifecycleLedgerOrEmpty(file) {
   }
 }
 
-async function readHandoffCheckpointOrEmpty(file, conversationId) {
-  try {
-    return validateHandoffCheckpoint(await readStrictJson(file), conversationId);
-  } catch (error) {
-    if (error?.code === "ENOENT" || /ENOENT|cannot find|not found/i.test(error?.message || "")) {
-      return createEmptyHandoffCheckpoint(conversationId);
-    }
-    throw error;
-  }
-}
-
-async function readHandoffObservation(discovery, expectedConversationId) {
+async function readHandoffObservation(discovery, expectedSurface, expectedConversationId) {
   const session = await openCdpSessionAtStage(async () => {
     const targets = await fetchCdpJson(discovery.state.port, "/json/list");
     return selectCdpPageTargetById(targets, discovery.state.port, discovery.target.id);
   }, discovery.state.port, "handoff-watch-session-open");
   session.ownsWindow = false;
   try {
-    const identity = await evaluateAtStage(
-      session,
-      buildMainChatConversationIdExpression(),
-      "handoff-watch-conversation-identity",
-    );
-    if (identity !== expectedConversationId) {
-      return { identity, units: [], active: false, readable: false };
-    }
     const rendered = await evaluateAtStage(
       session,
-      buildHandoffUnitsExpression(expectedConversationId),
+      buildHandoffUnitsExpression(expectedSurface, expectedConversationId),
       "handoff-watch-rendered-units",
     );
     if (!rendered || typeof rendered.readable !== "boolean" || !Array.isArray(rendered.units)) {
       throw new Error("handoff watch rendered units are invalid");
     }
+    const identity = rendered.readable ? rendered.conversationId : null;
     return {
       identity,
       units: rendered.units,
-      active: true,
+      active: rendered.readable,
       readable: rendered.readable,
     };
   } finally {
@@ -2370,12 +3391,7 @@ async function readHandoffObservation(discovery, expectedConversationId) {
   }
 }
 
-async function runWatch(options, discovery) {
-  const manifest = validateHandoffWatchManifest(await readStrictJson(options.input));
-  let checkpoint = await readHandoffCheckpointOrEmpty(
-    manifest.checkpointPath,
-    manifest.conversationId,
-  );
+async function runWatch(options, discovery, manifest) {
   const runId = randomUUID();
   const startedAt = new Date().toISOString();
   const deadline = Date.now() + options.timeoutMs;
@@ -2386,42 +3402,52 @@ async function runWatch(options, discovery) {
 
   while (true) {
     polls += 1;
-    const observation = await readHandoffObservation(discovery, manifest.conversationId);
+    const observation = await readHandoffObservation(
+      discovery,
+      manifest.surface,
+      manifest.conversationId,
+    );
     lastIdentity = observation.identity || null;
     lastReadable = observation.readable;
     observedUnits = observation.units.length;
     if (observation.active && observation.readable) {
-      let handoff;
+      let delivery = null;
       try {
-        handoff = selectNextApprovedHandoff(observation.units, checkpoint);
-      } catch (error) {
-        const report = {
-          schemaVersion: 1,
-          pass: false,
-          command: "watch",
-          runId,
-          startedAt,
-          completedAt: new Date().toISOString(),
-          status: "invalid-handoff",
-          conversationId: manifest.conversationId,
-          surface: manifest.surface,
+        delivery = await commitHandoffDelivery({
           checkpointPath: manifest.checkpointPath,
-          polls,
-          observedUnits,
-          error: error.message,
-          handoff: null,
-        };
-        await writeJsonAtomically(options.output, report);
-        return report;
+          conversationId: manifest.conversationId,
+          units: observation.units,
+        });
+      } catch (error) {
+        if (error?.code !== "ELOCKBUSY") {
+          const report = {
+            schemaVersion: 1,
+            pass: false,
+            command: "watch",
+            launchId: options.launchToken,
+            runId,
+            startedAt,
+            completedAt: new Date().toISOString(),
+            status: "invalid-handoff",
+            conversationId: manifest.conversationId,
+            surface: manifest.surface,
+            checkpointPath: manifest.checkpointPath,
+            polls,
+            observedUnits,
+            error: error.message,
+            handoff: null,
+          };
+          await writeJsonAtomically(options.output, report);
+          return report;
+        }
       }
-      if (handoff) {
+      if (delivery?.status === "handoff-ready") {
         const deliveredAt = new Date().toISOString();
-        checkpoint = recordDeliveredHandoff(checkpoint, handoff, deliveredAt);
-        await writeJsonAtomically(manifest.checkpointPath, checkpoint);
         const report = {
           schemaVersion: 1,
           pass: true,
           command: "watch",
+          launchId: options.launchToken,
           runId,
           startedAt,
           completedAt: deliveredAt,
@@ -2432,8 +3458,11 @@ async function runWatch(options, discovery) {
           polls,
           observedUnits,
           error: null,
-          handoff,
+          handoff: delivery.handoff,
         };
+        // This is deliberately outside the checkpoint transaction catch. If
+        // report persistence fails, the committed checkpoint still prevents a
+        // later watcher from redelivering the same handoff.
         await writeJsonAtomically(options.output, report);
         return report;
       }
@@ -2447,11 +3476,12 @@ async function runWatch(options, discovery) {
     schemaVersion: 1,
     pass: true,
     command: "watch",
+    launchId: options.launchToken,
     runId,
     startedAt,
     completedAt: new Date().toISOString(),
-    status: lastIdentity !== manifest.conversationId ? "conversation-not-active" :
-      lastReadable ? "no-handoff" : "conversation-not-readable",
+    status: !lastReadable ? "conversation-not-readable" :
+      lastIdentity !== manifest.conversationId ? "conversation-not-active" : "no-handoff",
     conversationId: manifest.conversationId,
     observedConversationId: lastIdentity,
     surface: manifest.surface,
@@ -2482,7 +3512,7 @@ async function openHandoffApprovalConversation(discovery, manifest) {
     const activeSnapshot = activeIdentity === manifest.conversationId ?
       await evaluateAtStage(
         activeMainSession,
-        buildConversationSnapshotExpression(manifest.marker, "main-chat"),
+        buildConversationSnapshotExpression(manifest.marker, manifest.conversationId, "main-chat"),
         "handoff-approve-active-main-marker",
       ) : null;
     if (activeSnapshot?.markerPresent) {
@@ -2524,22 +3554,35 @@ async function openHandoffApprovalConversation(discovery, manifest) {
   );
 }
 
-async function runApprove(options, discovery) {
-  const manifest = validateHandoffApprovalManifest(await readStrictJson(options.input));
+export function takeHandoffApprovalSession(opened) {
+  const session = opened?.session;
+  if (!session || typeof session.close !== "function" ||
+      typeof session.evaluate !== "function" || typeof session.send !== "function") {
+    throw new Error("handoff approval session is invalid");
+  }
+  return session;
+}
+
+async function runApprove(options, discovery, manifest) {
   const runId = randomUUID();
   const startedAt = new Date().toISOString();
   const approvalText = `CODEX_APPROVE ${manifest.taskId}`;
   let session = null;
+  let attemptedAt = null;
   let submittedAt = null;
   let proposal = null;
   let status = "not-submitted";
   let errorText = null;
   try {
     const opened = await openHandoffApprovalConversation(discovery, manifest);
-    session = opened.session;
+    session = takeHandoffApprovalSession(opened);
+    if (!opened?.prepared || opened.prepared.conversationId !== manifest.conversationId) {
+      throw new Error("handoff approval prepared conversation identity mismatch");
+    }
+    validateSubmissionExpressionInput(opened.prepared.surface, opened.prepared.conversationId);
     const observation = await evaluateAtStage(
       session,
-      buildHandoffUnitsExpression(manifest.conversationId),
+      buildHandoffUnitsExpression(opened.prepared.surface, manifest.conversationId),
       "handoff-approve-proposal-read",
     );
     if (!observation?.readable) throw new Error("handoff approval conversation is not readable");
@@ -2567,36 +3610,36 @@ async function runApprove(options, discovery) {
       }
       const focused = await evaluateAtStage(
         session,
-        buildHandoffApprovalFocusExpression(manifest.conversationId),
+        buildHandoffApprovalFocusExpression(opened.prepared.surface, manifest.conversationId),
         "handoff-approve-composer-focus",
         true,
       );
       if (!focused?.ok) throw new Error(`handoff approval composer rejected focus: ${focused?.reason || "unknown"}`);
       await session.send("Input.insertText", { text: approvalText });
-      submittedAt = new Date().toISOString();
-      const clicked = await evaluateAtStage(
+      const attempt = await attemptHandoffApprovalClick(
         session,
-        buildHandoffApprovalSubmitExpression(manifest.conversationId, manifest.taskId),
-        "handoff-approve-send-click",
-        true,
+        opened.prepared,
+        manifest.taskId,
       );
-      if (!clicked?.ok) throw new Error(`handoff approval was not submitted: ${clicked?.reason || "unknown"}`);
-      await waitFor(async () => {
-        const currentIdentity = await evaluateAtStage(
-          session,
-          buildMainChatConversationIdExpression(),
-          "handoff-approve-ack-identity",
-        );
-        if (currentIdentity !== manifest.conversationId) return null;
-        const current = await evaluateAtStage(
-          session,
-          buildHandoffUnitsExpression(manifest.conversationId),
-          "handoff-approve-ack-units",
-        );
-        return current?.units?.some((unit) =>
-          unit.role === "user" && unit.text.trim() === approvalText) || null;
-      }, Math.min(options.timeoutMs, 30000), `handoff approval acknowledgement for ${manifest.taskId}`);
-      status = "approved";
+      attemptedAt = attempt.attemptedAt;
+      submittedAt = attempt.submittedAt;
+      if (attempt.status !== "submitted") {
+        status = attempt.status;
+        errorText = attempt.error;
+      } else {
+        status = "submitted";
+        await waitFor(async () => {
+          const current = await evaluateAtStage(
+            session,
+            buildHandoffUnitsExpression(opened.prepared.surface, manifest.conversationId),
+            "handoff-approve-ack-units",
+          );
+          return current?.readable && current?.conversationId === manifest.conversationId &&
+            current?.units?.some((unit) =>
+            unit.role === "user" && unit.text.trim() === approvalText) || null;
+        }, Math.min(options.timeoutMs, 30000), `handoff approval acknowledgement for ${manifest.taskId}`);
+        status = "approved";
+      }
     }
   } catch (error) {
     errorText = error.message;
@@ -2612,6 +3655,7 @@ async function runApprove(options, discovery) {
     startedAt,
     completedAt: new Date().toISOString(),
     status,
+    attemptedAt,
     conversationId: manifest.conversationId,
     surface: manifest.surface,
     marker: manifest.marker,
@@ -2633,33 +3677,118 @@ async function runApprove(options, discovery) {
   return report;
 }
 
-async function recordGenerationLifecycle(batch, report, reportPath) {
+async function recordGenerationLifecycle(batch, report, reportPath, lifecycleLedgerState = null) {
   if (batch.schemaVersion !== 2) return null;
   const entries = buildLifecycleEntries(report, {
     jobType: batch.jobType,
     retentionDays: batch.retentionDays,
     reportPath,
   });
-  const existing = await readLifecycleLedgerOrEmpty(batch.lifecycleLedgerPath);
+  const existing = lifecycleLedgerState ? lifecycleLedgerState.value :
+    await readLifecycleLedgerOrEmpty(batch.lifecycleLedgerPath);
   const merged = mergeLifecycleEntries(existing, entries);
   await writeJsonAtomically(batch.lifecycleLedgerPath, merged);
+  if (lifecycleLedgerState) lifecycleLedgerState.value = merged;
   return { path: batch.lifecycleLedgerPath, recordedEntries: entries.length };
 }
 
-async function runBatch(options, discovery) {
-  const batch = validateBridgeBatch(await readStrictJson(options.input));
-  if (batch.schemaVersion === 2) {
-    await Promise.all(batch.jobs.map((job) => verifyJobReferences(job)));
+async function recordGenerationCheckpoint(batch, runId, jobs, reportPath, lifecycleLedgerState = null) {
+  if (batch.schemaVersion !== 2) return null;
+  const retainedJobs = jobs.filter((job) => job?.conversationId && job?.surface && job?.submittedAt);
+  if (!retainedJobs.length) return null;
+  return recordGenerationLifecycle(batch, {
+    runId,
+    surface: summarizeBatchSurface(retainedJobs),
+    jobs: retainedJobs,
+  }, reportPath, lifecycleLedgerState);
+}
+
+async function inspectDispatchPlan(options, discovery, batch) {
+  const probe = await probeBridge(discovery);
+  const targets = await fetchCdpJson(discovery.state.port, "/json/list");
+  const occupiedQuickChatWindows = targets.filter((target) => {
+    try { return conversationIdFromAppUrl(target.url) !== null; } catch { return false; }
+  }).length;
+  const quickChatHealth = await readQuickChatHealth(discovery.statePath, {
+    browserId: discovery.state.browserId,
+    codexVersion: discovery.state.codexVersion,
+  });
+  return buildDispatchPlan({
+    requestedJobs: batch.jobs.length,
+    timeoutMs: options.timeoutMs,
+    mainChatAvailable: Boolean(probe.probe?.chatEntry),
+    experimentalQuickChat: options.experimentalQuickChat,
+    quickChatLimit: QUICK_CHAT_WINDOW_LIMIT_BY_VERSION.get(discovery.state.codexVersion) || 0,
+    occupiedQuickChatWindows,
+    quickChatHealth,
+  });
+}
+
+async function runPlan(options, discovery, batch) {
+  const dispatchPlan = await inspectDispatchPlan(options, discovery, batch);
+  const report = {
+    schemaVersion: 1,
+    pass: dispatchPlan.selectedMode !== "unavailable",
+    command: "plan",
+    plannedAt: new Date().toISOString(),
+    codexVersion: discovery.state.codexVersion,
+    versionCompatibility: buildVersionCompatibilitySummary(discovery.state.codexVersion),
+    packageFullName: discovery.state.codexPackageFullName,
+    port: discovery.state.port,
+    browserId: discovery.state.browserId,
+    requestedJobs: batch.jobs.length,
+    timeoutMs: options.timeoutMs,
+    dispatchPlan,
+  };
+  await writeJsonAtomically(options.output, report);
+  return report;
+}
+
+async function runBatch(options, discovery, batch, preloadedLifecycleLedger = null) {
+  const dispatchPlan = await inspectDispatchPlan(options, discovery, batch);
+  if (dispatchPlan.selectedMode === "unavailable") {
+    throw new Error(dispatchPlan.userNotice);
   }
   const runId = randomUUID();
   const startedAt = new Date().toISOString();
   const jobs = [];
   let runError = null;
-  const initialTargets = await fetchCdpJson(discovery.state.port, "/json/list");
-  const occupiedWindows = initialTargets.filter((target) => {
-    try { return conversationIdFromAppUrl(target.url) !== null; } catch { return false; }
-  }).length;
-  const waveSize = quickChatWaveSize(discovery.state.codexVersion, occupiedWindows);
+  const lifecycleLedgerState = preloadedLifecycleLedger ? { value: preloadedLifecycleLedger } : null;
+  const progressPath = batchProgressPath(options.output);
+  await assertNoRunningBatchProgress(progressPath);
+  let progressJobs = batch.jobs.map((job) => ({
+    id: job.id,
+    promptHash: createHash("sha256").update(job.prompt, "utf8").digest("hex"),
+    marker: bridgeMarker(runId, job.id),
+    status: "pending",
+  }));
+  let currentJobId = null;
+  let nativeQuickChatDisabledReason = null;
+  const persistBatchProgress = async (state = "running", error = null) => {
+    await writeJsonAtomically(progressPath, buildBatchProgress({
+      runId,
+      launchId: options.launchToken,
+      reportPath: options.output,
+      startedAt,
+      updatedAt: new Date().toISOString(),
+      state,
+      requestedJobs: batch.jobs.length,
+      currentJobId,
+      dispatchPlan,
+      error,
+      jobs: progressJobs,
+    }));
+  };
+  const updateProgressJob = (job) => {
+    progressJobs = progressJobs.map((existing) => existing.id === job.id ? {
+      ...existing,
+      ...job,
+    } : existing);
+  };
+  await persistBatchProgress();
+  const waveSize = dispatchPlan.quickChat.attempt ? dispatchPlan.concurrency : 1;
+  const requestedSurface = dispatchPlan.quickChat.attempt ?
+    "chatgpt-quick-chat" : "chatgpt-main-chat";
 
   for (let offset = 0; offset < batch.jobs.length; offset += waveSize) {
     const wave = batch.jobs.slice(offset, offset + waveSize);
@@ -2669,22 +3798,66 @@ async function runBatch(options, discovery) {
       for (let localIndex = 0; localIndex < wave.length; localIndex += 1) {
         const job = wave[localIndex];
         let session = null;
+        currentJobId = job.id;
+        updateProgressJob({ id: job.id, status: "preparing" });
         try {
           const conversationId = `local-chatgpt:${randomUUID()}`;
           let opened;
           let fallbackReason = null;
-          try {
-            opened = await openNativeQuickChat(discovery, conversationId, offset + localIndex);
-          } catch (error) {
-            if (!isNativeQuickChatFallbackError(error)) throw error;
-            fallbackReason = error.message;
+          if (!dispatchPlan.quickChat.attempt) {
             opened = await openMainChatConversation(discovery, conversationId);
+          } else if (nativeQuickChatDisabledReason) {
+            fallbackReason = `${nativeQuickChatDisabledReason}; native Quick chat disabled for the remainder of this batch`;
+            opened = await openMainChatConversation(discovery, conversationId);
+          } else {
+            try {
+              opened = await openNativeQuickChat(discovery, conversationId, offset + localIndex);
+              await recordQuickChatHealth(discovery.statePath, {
+                browserId: discovery.state.browserId,
+                codexVersion: discovery.state.codexVersion,
+              }, {
+                status: "healthy",
+                reason: "owned Quick Chat target opened successfully",
+              });
+            } catch (error) {
+              if (!isNativeQuickChatFallbackError(error)) throw error;
+              nativeQuickChatDisabledReason = error.message;
+              fallbackReason = error.message;
+              await recordQuickChatHealth(discovery.statePath, {
+                browserId: discovery.state.browserId,
+                codexVersion: discovery.state.codexVersion,
+              }, {
+                status: "unhealthy",
+                reason: error.message,
+              });
+              opened = await openMainChatConversation(discovery, conversationId);
+            }
           }
           session = opened.session;
+          updateProgressJob({
+            id: job.id,
+            conversationId: opened.prepared.conversationId,
+            surface: opened.prepared.surface,
+            status: "prepared",
+            routing: buildJobRouting(opened.prepared.surface, fallbackReason, requestedSurface),
+          });
+          await persistBatchProgress();
           const submission = {
             ...(await submitJob(session, opened.prepared, job, runId)),
-            routing: buildJobRouting(opened.prepared.surface, fallbackReason),
+            routing: buildJobRouting(opened.prepared.surface, fallbackReason, requestedSurface),
           };
+          updateProgressJob(submission);
+          await persistBatchProgress();
+          try {
+            await recordGenerationCheckpoint(batch, runId, [submission], options.output, lifecycleLedgerState);
+          } catch (error) {
+            runError = `${runError ? `${runError}; ` : ""}Lifecycle checkpoint failed at ${job.id}: ${error.message}`;
+            updateProgressJob({
+              id: job.id,
+              error: `lifecycle checkpoint: ${error.message}`,
+            });
+            await persistBatchProgress("running", error.message);
+          }
           if (opened.prepared.surface === "chatgpt-main-chat") {
             let collected = submission;
             if (["submitted", "unknown-after-submit"].includes(submission.status)) {
@@ -2701,6 +3874,15 @@ async function runBatch(options, discovery) {
               }
             }
             submissions.push(collected);
+            updateProgressJob(collected);
+            await persistBatchProgress();
+            try {
+              await recordGenerationCheckpoint(batch, runId, [collected], options.output, lifecycleLedgerState);
+            } catch (error) {
+              runError = `${runError ? `${runError}; ` : ""}Lifecycle checkpoint failed at ${job.id}: ${error.message}`;
+              updateProgressJob({ id: job.id, error: `lifecycle checkpoint: ${error.message}` });
+              await persistBatchProgress("running", error.message);
+            }
             await closeOwnedQuickChat(session);
             session = null;
           } else {
@@ -2719,6 +3901,8 @@ async function runBatch(options, discovery) {
             result: null,
             error: error.message,
           });
+          updateProgressJob(submissions.at(-1));
+          await persistBatchProgress("running", error.message);
           runError = `${runError ? `${runError}; ` : ""}Submission failed at ${job.id}: ${error.message}`;
         }
       }
@@ -2739,6 +3923,17 @@ async function runBatch(options, discovery) {
         }
       }));
       jobs.push(...collected);
+      for (const collectedJob of collected) updateProgressJob(collectedJob);
+      await persistBatchProgress();
+      for (const collectedJob of collected) {
+        try {
+          await recordGenerationCheckpoint(batch, runId, [collectedJob], options.output, lifecycleLedgerState);
+        } catch (error) {
+          runError = `${runError ? `${runError}; ` : ""}Lifecycle checkpoint failed at ${collectedJob.id}: ${error.message}`;
+          updateProgressJob({ id: collectedJob.id, error: `lifecycle checkpoint: ${error.message}` });
+        }
+      }
+      await persistBatchProgress("running", runError);
     } finally {
       await Promise.all([...sessions.values()].map((session) => closeOwnedQuickChat(session)));
     }
@@ -2746,7 +3941,7 @@ async function runBatch(options, discovery) {
 
   for (let index = 0; index < jobs.length; index += 1) {
     const artifacts = jobs[index].status === "complete" ?
-      await downloadJobImages(jobs[index], options.output) : [];
+      await materializeJobImages(jobs[index], options.output) : [];
     jobs[index] = {
       ...jobs[index],
       result: jobs[index].result ? {
@@ -2755,12 +3950,15 @@ async function runBatch(options, discovery) {
       } : null,
       artifacts,
     };
+    updateProgressJob(jobs[index]);
   }
   const completedCount = jobs.filter((job) => job.status === "complete").length;
+  const reportError = summarizeBatchError(runError, jobs);
   const report = {
     schemaVersion: 1,
     pass: completedCount === batch.jobs.length,
     command: "batch",
+    launchId: options.launchToken,
     runId,
     startedAt,
     completedAt: new Date().toISOString(),
@@ -2769,9 +3967,13 @@ async function runBatch(options, discovery) {
     port: discovery.state.port,
     browserId: discovery.state.browserId,
     surface: summarizeBatchSurface(jobs),
+    runState: "complete",
+    timeoutMs: options.timeoutMs,
+    progressPath,
+    dispatchPlan,
     requestedJobs: batch.jobs.length,
     completedJobs: completedCount,
-    error: runError,
+    error: reportError,
     jobs,
     generationPolicy: batch.schemaVersion === 2 ? {
       jobType: batch.jobType,
@@ -2781,16 +3983,17 @@ async function runBatch(options, discovery) {
     } : null,
   };
   await writeJsonAtomically(options.output, report);
-  const lifecycle = await recordGenerationLifecycle(batch, report, options.output);
+  const lifecycle = await recordGenerationLifecycle(batch, report, options.output, lifecycleLedgerState);
   if (lifecycle) {
     report.lifecycle = lifecycle;
     await writeJsonAtomically(options.output, report);
   }
+  currentJobId = null;
+  await persistBatchProgress("complete", reportError);
   return report;
 }
 
-async function runResume(options, discovery) {
-  const manifest = validateResumeManifest(await readStrictJson(options.input));
+async function runResume(options, discovery, manifest, preloadedLifecycleLedger = null) {
   const runId = randomUUID();
   const startedAt = new Date().toISOString();
   const jobs = [];
@@ -2931,7 +4134,7 @@ async function runResume(options, discovery) {
 
   for (let index = 0; index < jobs.length; index += 1) {
     const artifacts = jobs[index].status === "complete" ?
-      await downloadJobImages(jobs[index], options.output) : [];
+      await materializeJobImages(jobs[index], options.output) : [];
     jobs[index] = {
       ...jobs[index],
       result: jobs[index].result ? {
@@ -2946,6 +4149,7 @@ async function runResume(options, discovery) {
     schemaVersion: 1,
     pass: completedCount === manifest.jobs.length,
     command: "resume",
+    launchId: options.launchToken,
     runId,
     startedAt,
     completedAt: new Date().toISOString(),
@@ -2967,12 +4171,13 @@ async function runResume(options, discovery) {
   };
   await writeJsonAtomically(options.output, report);
   if (manifest.jobType) {
+    const lifecycleLedgerState = preloadedLifecycleLedger ? { value: preloadedLifecycleLedger } : null;
     const lifecycle = await recordGenerationLifecycle({
       schemaVersion: 2,
       jobType: manifest.jobType,
       retentionDays: manifest.retentionDays,
       lifecycleLedgerPath: manifest.lifecycleLedgerPath,
-    }, report, options.output);
+    }, report, options.output, lifecycleLedgerState);
     report.lifecycle = lifecycle;
     await writeJsonAtomically(options.output, report);
   }
@@ -2992,19 +4197,9 @@ async function deleteHistoryConversation(session, job) {
   10000, `history removal for ${job.id}`);
 }
 
-async function runCleanup(options, discovery) {
-  const ledger = validateConversationLifecycleLedger(await readStrictJson(options.input));
-  const selected = selectCleanupCandidates(ledger, new Date());
-  const manifest = validateCleanupManifest({
-    schemaVersion: 1,
-    jobs: selected.map((entry) => ({
-      id: entry.jobId,
-      conversationId: entry.conversationId,
-      marker: entry.marker,
-      title: entry.historyTitle,
-      artifacts: entry.artifacts,
-    })),
-  });
+async function runCleanup(options, discovery, ledger, manifest) {
+  const selected = ledger.entries.filter((entry) =>
+    manifest.jobs.some((job) => job.conversationId === entry.conversationId));
   const results = [];
   for (let index = 0; index < manifest.jobs.length; index += 1) {
     const job = manifest.jobs[index];
@@ -3062,8 +4257,11 @@ async function runCleanup(options, discovery) {
 async function discoverBridge(options) {
   const statePath = options.statePath || defaultStatePath;
   const state = validateBridgeState(await readStrictJson(statePath));
-  const [identity, version, targets] = await Promise.all([
-    verifyWindowsIdentity(state),
+  // Verify the current Store package before touching the saved CDP endpoint so
+  // an upgraded client is reported as stale-after-update instead of a generic
+  // fetch failure against the old port.
+  const identity = await verifyWindowsIdentity(state);
+  const [version, targets] = await Promise.all([
     fetchCdpJson(state.port, "/json/version"),
     fetchCdpJson(state.port, "/json/list"),
   ]);
@@ -3080,6 +4278,7 @@ function publicDiscovery(discovery) {
     pass: true,
     command: "discover",
     codexVersion: discovery.state.codexVersion,
+    versionCompatibility: buildVersionCompatibilitySummary(discovery.state.codexVersion),
     packageFullName: discovery.state.codexPackageFullName,
     port: discovery.state.port,
     browserId: discovery.state.browserId,
@@ -3110,40 +4309,108 @@ async function probeBridge(discovery) {
   }
 }
 
-async function main() {
-  const options = parseBridgeArgs(process.argv.slice(2));
-  const discovery = await discoverBridge(options);
+async function runWithBridgeController(options, discovery, operation) {
+  const lease = await acquireBridgeControllerLock({
+    statePath: discovery.statePath,
+    command: options.command,
+    outputPath: options.output,
+    browserId: discovery.state.browserId,
+  });
+  try {
+    return await operation();
+  } finally {
+    await releaseBridgeControllerLock(lease);
+  }
+}
+
+export async function runBridgeMain(argv, { discover = discoverBridge } = {}) {
+  const options = parseBridgeArgs(argv);
+  const prepared = await prepareBridgeCommand(options);
+  const discovery = await discover(options);
   if (options.command === "discover") {
-    console.log(JSON.stringify(publicDiscovery(discovery), null, 2));
-    return;
+    return publicDiscovery(discovery);
   }
   if (options.command === "probe") {
-    console.log(JSON.stringify(await probeBridge(discovery), null, 2));
-    return;
+    return await probeBridge(discovery);
+  }
+  if (options.command === "plan") {
+    return await runPlan(options, discovery, prepared.manifest);
   }
   if (options.command === "resume") {
-    console.log(JSON.stringify(await runResume(options, discovery), null, 2));
-    return;
+    return await runWithBridgeController(
+      options,
+      discovery,
+      () => runResume(options, discovery, prepared.manifest, prepared.lifecycleLedger),
+    );
   }
   if (options.command === "watch") {
-    console.log(JSON.stringify(await runWatch(options, discovery), null, 2));
-    return;
+    return await runWatch(options, discovery, prepared.manifest);
   }
   if (options.command === "approve") {
-    console.log(JSON.stringify(await runApprove(options, discovery), null, 2));
-    return;
+    return await runWithBridgeController(
+      options,
+      discovery,
+      () => runApprove(options, discovery, prepared.manifest),
+    );
   }
   if (options.command === "cleanup") {
-    console.log(JSON.stringify(await runCleanup(options, discovery), null, 2));
-    return;
+    return await runWithBridgeController(
+      options,
+      discovery,
+      () => runCleanup(options, discovery, prepared.ledger, prepared.cleanupManifest),
+    );
   }
-  console.log(JSON.stringify(await runBatch(options, discovery), null, 2));
+  return await runWithBridgeController(
+    options,
+    discovery,
+    () => runBatch(options, discovery, prepared.manifest, prepared.lifecycleLedger),
+  );
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const launchLogs = launchLogPathsFromArgv(argv);
+  const testDiscovery = await testOnlyP08Discovery(parseBridgeArgs(argv));
+  const result = await runBridgeMain(argv, testDiscovery ? { discover: async () => testDiscovery } : {});
+  if (launchLogs) {
+    try {
+      appendBridgeLaunchLog(launchLogs.stdoutLogPath, {
+        pass: true,
+        command: argv[0] || null,
+        launchId: launchLogs.launchToken,
+      });
+    } catch {
+      // Launch logs are diagnostics; never replace a completed command result.
+    }
+  }
+  console.log(JSON.stringify(result, null, 2));
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 if (isMain) {
   main().catch((error) => {
-    console.error(JSON.stringify({ pass: false, error: error.message }, null, 2));
+    const argv = process.argv.slice(2);
+    let launchLogs = null;
+    try {
+      launchLogs = launchLogPathsFromArgv(argv);
+    } catch {
+      // Invalid launch arguments cannot be trusted for diagnostic output.
+    }
+    const safeError = {
+      pass: false,
+      command: argv[0] || null,
+      launchId: launchLogs?.launchToken || null,
+      ...safeBridgeDiagnosticFields(error),
+      error: safeLaunchLogError(error),
+    };
+    if (launchLogs) {
+      try {
+        appendBridgeLaunchLog(launchLogs.stderrLogPath, safeError);
+      } catch {
+        // Preserve the original stderr result if a launcher log cannot be written.
+      }
+    }
+    console.error(JSON.stringify(safeError, null, 2));
     process.exitCode = 1;
   });
 }
